@@ -1,0 +1,22 @@
+# 会议录音转写助手 v3.1.0 依赖
+# Python 3.11 required
+
+# Web 框架
+fastapi>=0.100
+uvicorn>=0.20
+
+# 音频录制
+sounddevice>=0.4
+numpy>=1.24
+
+# FunASR 语音转写
+funasr>=1.0
+modelscope>=1.0
+torch>=2.0
+torchaudio>=2.0
+
+# 讯飞 WebSocket 实时转写
+websocket-client>=1.0
+
+# 文档导出
+python-docx>=1.0
