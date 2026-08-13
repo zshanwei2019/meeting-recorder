@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>会议录音转写助手</title>
+<style>
+/* ══════════════════════════════════════════
+   Design System - Dark Pro Theme
+   ══════════════════════════════════════════ */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  font-family: "Microsoft YaHei UI", "Segoe UI", -apple-system, sans-serif;
+  background: #0f1117;
+  color: #f1f5f9;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  user-select: none;
+}
+
+/* ══════════════════════════════════════════
+   Layout
+   ══════════════════════════════════════════ */
+.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  background: #0f1117;
+}
+
+/* ══════════════════════════════════════════
+   Sidebar
+   ══════════════════════════════════════════ */
+.sidebar {
+  width: 272px;
+  min-width: 272px;
+  background: #161922;
+  border-right: 1px solid rgba(148,163,184,0.08);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 20px 16px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.12); border-radius: 4px; }
+
+/* Logo */
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  background: transparent;
+}
+.logo-icon {
+  width: 40px; height: 40px;
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; color: white;
+  box-shadow: 0 4px 12px rgba(99,102,241,0.3);
+}
+.logo-info { display: flex; flex-direction: column; gap: 2px; background: transparent; }
+.logo-title { font-size: 15px; font-weight: 700; color: #f1f5f9; background: transparent; }
+.logo-version { font-size: 11px; color: #64748b; background: transparent; }
+
+/* Status */
+.status-section {
+  background: #1c1f2e;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  border: 1px solid rgba(148,163,184,0.08);
+}
+.status-row { display: flex; align-items: center; gap: 8px; background: transparent; }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 8px rgba(34,197,94,0.5);
+  flex-shrink: 0;
+}
+.status-dot.recording { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.5); animation: pulse 1.5s infinite; }
+.status-dot.loading { background: #f59e0b; box-shadow: 0 0 8px rgba(245,158,11,0.5); animation: pulse 1s infinite; }
+.status-dot.transcribing { background: #a855f7; box-shadow: 0 0 8px rgba(168,85,247,0.5); animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.status-text { font-size: 13px; font-weight: 600; color: #f1f5f9; background: transparent; }
+
+.time-display {
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 28px; font-weight: 700; text-align: center;
+  margin-top: 10px; letter-spacing: 2px;
+  color: #f1f5f9; background: transparent;
+  display: none;
+}
+.time-display.visible { display: block; }
+
+/* Section Label */
+.section-label {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1px; color: #64748b;
+  margin-bottom: 8px; margin-top: 4px;
+  background: transparent;
+}
+
+/* Source Select */
+.source-select {
+  width: 100%;
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px;
+  padding: 9px 12px;
+  color: #f1f5f9;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  margin-bottom: 16px;
+}
+.source-select:focus { border-color: #6366f1; }
+.source-select option { background: #1c1f2e; color: #f1f5f9; }
+
+/* Buttons */
+.btn {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; padding: 12px 16px;
+  border: none; border-radius: 10px;
+  font-size: 14px; font-weight: 600; font-family: inherit;
+  cursor: pointer; outline: none;
+  color: white;
+}
+.btn:active { transform: scale(0.98); }
+
+.btn-record {
+  background: linear-gradient(135deg, #dc2626, #ef4444);
+  margin-bottom: 8px;
+  box-shadow: 0 4px 12px rgba(220,38,38,0.3);
+}
+.btn-record:hover { box-shadow: 0 4px 16px rgba(220,38,38,0.5); filter: brightness(1.1); }
+.btn-record.active {
+  background: linear-gradient(135deg, #16a34a, #22c55e);
+  box-shadow: 0 4px 12px rgba(22,163,74,0.3);
+}
+
+.btn-realtime {
+  background: linear-gradient(135deg, #d97706, #f59e0b);
+  margin-bottom: 12px;
+  box-shadow: 0 4px 12px rgba(217,119,6,0.3);
+}
+.btn-realtime:hover { box-shadow: 0 4px 16px rgba(217,119,6,0.5); filter: brightness(1.1); }
+.btn-realtime.active {
+  background: linear-gradient(135deg, #7c3aed, #a855f7);
+  box-shadow: 0 4px 12px rgba(124,58,237,0.3);
+}
+
+/* Button Row */
+.btn-row { display: flex; gap: 6px; margin-bottom: 6px; background: transparent; }
+.btn-secondary {
+  flex: 1; padding: 9px 8px;
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px;
+  color: #94a3b8;
+  font-size: 12px; font-weight: 600; font-family: inherit;
+  cursor: pointer; outline: none;
+}
+.btn-secondary:hover {
+  background: #252940;
+  color: #f1f5f9;
+  border-color: rgba(99,102,241,0.3);
+}
+
+/* Divider */
+.divider {
+  height: 1px;
+  background: rgba(148,163,184,0.08);
+  margin: 12px 0;
+}
+
+/* Settings Toggle */
+.settings-toggle {
+  display: flex; align-items: center; gap: 6px;
+  background: transparent; border: none;
+  color: #818cf8;
+  font-size: 12px; font-weight: 600; font-family: inherit;
+  cursor: pointer; padding: 4px 0;
+}
+.settings-toggle:hover { color: #6366f1; }
+.settings-toggle .arrow { transition: transform 150ms; font-size: 10px; }
+.settings-toggle .arrow.open { transform: rotate(90deg); }
+
+/* Settings Panel */
+.settings-panel {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  background: transparent;
+}
+.settings-panel.visible { display: flex; }
+
+.setting-label {
+  font-size: 11px; font-weight: 600; color: #64748b;
+  margin-bottom: 2px; background: transparent;
+}
+.setting-select, .setting-input {
+  width: 100%;
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #f1f5f9;
+  font-size: 12px; font-family: inherit;
+  outline: none;
+}
+.setting-select:focus, .setting-input:focus { border-color: #6366f1; }
+.setting-select option { background: #1c1f2e; color: #f1f5f9; }
+.setting-input::placeholder { color: #64748b; }
+
+.checkbox-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #94a3b8;
+  cursor: pointer; background: transparent;
+}
+.checkbox-row input[type="checkbox"] {
+  width: 16px; height: 16px;
+  accent-color: #6366f1;
+  cursor: pointer;
+}
+
+.sidebar-spacer { flex: 1; background: transparent; }
+.sidebar-footer {
+  text-align: center;
+  font-size: 10px;
+  color: #64748b;
+  padding-top: 8px;
+  background: transparent;
+}
+
+/* ══════════════════════════════════════════
+   Main Content
+   ══════════════════════════════════════════ */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #0f1117;
+  padding: 28px 32px 20px;
+  min-width: 0;
+}
+
+/* Header */
+.main-header {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 16px;
+  background: transparent;
+}
+.main-title {
+  font-size: 22px; font-weight: 700;
+  color: #f1f5f9;
+  background: transparent;
+}
+.realtime-badge {
+  display: none;
+  padding: 4px 12px;
+  border-radius: 9999px;
+  font-size: 11px; font-weight: 700;
+  background: rgba(168,85,247,0.15);
+  color: #c084fc;
+  border: 1px solid rgba(168,85,247,0.3);
+  animation: badge-pulse 2s infinite;
+}
+.realtime-badge.visible { display: inline-flex; align-items: center; gap: 6px; }
+@keyframes badge-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+.realtime-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #c084fc; }
+
+/* Transcript Area */
+.transcript-wrapper {
+  flex: 1;
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #161922;
+  border: 1px solid rgba(148,163,184,0.08);
+}
+.transcript-area {
+  width: 100%; height: 100%;
+  background: transparent;
+  border: none; outline: none; resize: none;
+  color: #f1f5f9;
+  font-size: 15px; line-height: 1.8;
+  padding: 24px;
+  font-family: inherit;
+}
+.transcript-area::placeholder { color: #64748b; }
+.transcript-area::-webkit-scrollbar { width: 6px; }
+.transcript-area::-webkit-scrollbar-track { background: transparent; }
+.transcript-area::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.12); border-radius: 3px; }
+
+/* Toolbar */
+.toolbar {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 12px;
+  background: transparent;
+}
+.toolbar-btn {
+  padding: 8px 20px;
+  border: none; border-radius: 6px;
+  font-size: 13px; font-weight: 600; font-family: inherit;
+  cursor: pointer; outline: none;
+}
+.toolbar-btn.primary {
+  background: #6366f1;
+  color: white;
+  box-shadow: 0 2px 8px rgba(99,102,241,0.3);
+}
+.toolbar-btn.primary:hover { background: #818cf8; }
+.toolbar-btn.outline {
+  background: transparent;
+  border: 1px solid rgba(148,163,184,0.12);
+  color: #94a3b8;
+}
+.toolbar-btn.outline:hover { border-color: rgba(99,102,241,0.3); color: #f1f5f9; background: #252940; }
+
+.format-select {
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #f1f5f9;
+  font-size: 12px; font-family: inherit;
+  outline: none;
+}
+.format-select option { background: #1c1f2e; color: #f1f5f9; }
+
+.toolbar-spacer { flex: 1; background: transparent; }
+
+.search-box {
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #f1f5f9;
+  font-size: 12px; font-family: inherit;
+  outline: none; width: 160px;
+}
+.search-box:focus { border-color: #6366f1; }
+.search-box::placeholder { color: #64748b; }
+
+.word-count {
+  font-size: 11px; color: #64748b;
+  white-space: nowrap; background: transparent;
+}
+
+/* Log Section */
+.log-section { margin-top: 12px; background: transparent; }
+.log-header {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer; padding: 4px 0;
+  background: transparent;
+}
+.log-toggle {
+  font-size: 10px; color: #64748b;
+  background: transparent;
+}
+.log-toggle.open { transform: rotate(90deg); }
+.log-title {
+  font-size: 11px; font-weight: 700; color: #64748b;
+  background: transparent;
+}
+.log-preview {
+  font-size: 11px; color: #64748b;
+  margin-left: 8px; flex: 1;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: transparent;
+}
+.log-content {
+  display: none;
+  background: #161922;
+  border: 1px solid rgba(148,163,184,0.08);
+  border-radius: 6px;
+  padding: 10px 14px;
+  max-height: 100px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.6;
+  margin-top: 4px;
+}
+.log-content.visible { display: block; }
+.log-content::-webkit-scrollbar { width: 4px; }
+.log-content::-webkit-scrollbar-track { background: transparent; }
+.log-content::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.12); border-radius: 2px; }
+
+/* Connection indicator */
+.conn-indicator {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  z-index: 9999;
+  pointer-events: none;
+}
+.conn-indicator.connected { background: rgba(34,197,94,0.2); color: #22c55e; }
+.conn-indicator.disconnected { background: rgba(239,68,68,0.2); color: #ef4444; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">M</div>
+      <div class="logo-info">
+        <div class="logo-title">会议录音转写助手</div>
+        <div class="logo-version">v3.1.0</div>
+      </div>
+    </div>
+
+    <div class="status-section">
+      <div class="status-row">
+        <div class="status-dot" id="statusDot"></div>
+        <span class="status-text" id="statusText">连接中...</span>
+      </div>
+      <div class="time-display" id="timeDisplay">00:00:00</div>
+    </div>
+
+    <div class="section-label">音源</div>
+    <select class="source-select" id="audioSource">
+      <option value="both" selected>系统 + 麦克风</option>
+      <option value="system">系统音频</option>
+      <option value="mic">麦克风</option>
+    </select>
+
+    <button class="btn btn-record" id="btnRecord" onclick="toggleRecord()">
+      <span id="recordIcon">&#9679;</span>
+      <span id="recordText">开始录音</span>
+    </button>
+    <button class="btn btn-realtime" id="btnRealtime" onclick="toggleRealtime()">
+      <span id="realtimeIcon">&#9679;</span>
+      <span id="realtimeText">实时转写</span>
+    </button>
+
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="transcribeFile()">转写文件</button>
+      <button class="btn-secondary" onclick="generateMinutes()">AI 纪要</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" id="btnMonitor" onclick="toggleMonitor()">
+        <span id="monitorIcon">&#128065;</span> 自动监控
+      </button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="saveTranscript()">保存</button>
+      <button class="btn-secondary" onclick="copyTranscript()">复制</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <button class="settings-toggle" onclick="toggleSettings()">
+      <span class="arrow" id="settingsArrow">&#9654;</span>
+      <span>设置</span>
+    </button>
+    <div class="settings-panel" id="settingsPanel">
+      <div>
+        <div class="setting-label">引擎</div>
+        <select class="setting-select" id="engineSelect" onchange="saveConfig()">
+          <option value="FunASR">FunASR</option>
+          <option value="xfyun">讯飞 API</option>
+          <option value="Whisper">Whisper</option>
+        </select>
+      </div>
+      <div>
+        <div class="setting-label">模型</div>
+        <select class="setting-select" id="modelSelect" onchange="saveConfig()">
+          <option value="paraformer-large">Paraformer-Large</option>
+          <option value="sensevoice">SenseVoice</option>
+        </select>
+      </div>
+      <div>
+        <div class="setting-label">讯飞 APP_ID</div>
+        <input class="setting-input" id="xfyunAppId" placeholder="APP_ID" oninput="saveConfig()">
+      </div>
+      <div>
+        <div class="setting-label">讯飞 API_SECRET</div>
+        <input class="setting-input" id="xfyunApiSecret" placeholder="API_SECRET" oninput="saveConfig()">
+      </div>
+      <div>
+        <div class="setting-label">讯飞 API_KEY</div>
+        <input class="setting-input" id="xfyunApiKey" placeholder="API_KEY" oninput="saveConfig()">
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="autoTranscribe" checked>
+        录音结束自动转写
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="speakerDiarization">
+        说话人分离（识别不同说话人）
+      </label>
+      <div id="spkNumRow" style="display:none; margin-left:24px; margin-top:4px;">
+        <div class="setting-label" style="font-size:12px;">预设说话人数（0=自动）</div>
+        <input class="setting-input" id="presetSpkNum" type="number" min="0" max="20" value="0" style="width:80px;" oninput="saveConfig()">
+      </div>
+      <div>
+        <div class="setting-label">AI纪要 API Key</div>
+        <input class="setting-input" id="llmKey" placeholder="对应提供商的API Key" oninput="saveConfig()">
+      </div>
+      <div>
+        <div class="setting-label">AI纪要提供商</div>
+        <select class="setting-select" id="llmProvider" onchange="saveConfig()">
+          <option value="xfyun">讯飞星火</option>
+          <option value="volcengine">火山引擎</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="qwen">通义千问</option>
+        </select>
+      </div>
+      <div>
+        <div class="setting-label">热词（用 | 分隔）</div>
+        <input class="setting-input" id="hotWords" placeholder="热词" oninput="saveConfig()">
+      </div>
+      <div>
+        <div class="setting-label">领域</div>
+        <select class="setting-select" id="domainSelect" onchange="saveConfig()">
+          <option value="通用">通用</option>
+          <option value="金融">金融</option>
+          <option value="科技">科技</option>
+          <option value="医疗">医疗</option>
+          <option value="教育">教育</option>
+          <option value="法院">法院</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-footer">会议录音转写助手 v3.1.0</div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main">
+    <div class="main-header">
+      <h1 class="main-title">转写结果</h1>
+      <span class="realtime-badge" id="realtimeBadge">
+        <span class="dot"></span>
+        <span id="realtimeBadgeText">实时转写中</span>
+      </span>
+    </div>
+
+    <div class="transcript-wrapper">
+      <textarea class="transcript-area" id="transcriptArea" placeholder="转写结果将显示在这里..." oninput="updateWordCount()"></textarea>
+    </div>
+
+    <div class="toolbar">
+      <button class="toolbar-btn primary" onclick="saveTranscript()">保存</button>
+      <select class="format-select" id="saveFormat">
+        <option value="txt">TXT</option>
+        <option value="docx">Word</option>
+        <option value="srt">SRT</option>
+        <option value="vtt">VTT</option>
+        <option value="json">JSON</option>
+      </select>
+      <button class="toolbar-btn outline" onclick="copyTranscript()">复制</button>
+      <div class="toolbar-spacer"></div>
+      <input class="search-box" id="searchBox" placeholder="搜索..." oninput="searchText()">
+      <span class="word-count" id="wordCount">字数: 0</span>
+    </div>
+
+    <div class="log-section">
+      <div class="log-header" onclick="toggleLog()">
+        <span class="log-toggle" id="logToggle">&#9654;</span>
+        <span class="log-title">日志</span>
+        <span class="log-preview" id="logPreview"></span>
+      </div>
+      <div class="log-content" id="logContent"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Connection indicator -->
+<div class="conn-indicator disconnected" id="connIndicator">未连接</div>
+
+<script>
+// ══════════════════════════════════════════
+// WebSocket Communication Layer
+// ══════════════════════════════════════════
+let ws = null;
+let wsReconnectTimer = null;
+let isRecording = false;
+let isRealtime = false;
+let isMonitoring = false;
+let recordTimer = null;
+let recordSeconds = 0;
+
+function getWsUrl() {
+  const loc = window.location;
+  const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + loc.host + '/ws';
+}
+
+function connectWs() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+
+  const url = getWsUrl();
+  console.log('[WS] Connecting to', url);
+  ws = new WebSocket(url);
+
+  ws.onopen = function() {
+    console.log('[WS] Connected');
+    updateConnIndicator(true);
+    // Request current state from server
+    sendAction('get_config');
+  };
+
+  ws.onclose = function() {
+    console.log('[WS] Disconnected');
+    updateConnIndicator(false);
+    // Auto reconnect
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(connectWs, 2000);
+  };
+
+  ws.onerror = function(err) {
+    console.error('[WS] Error', err);
+  };
+
+  ws.onmessage = function(event) {
+    try {
+      const msg = JSON.parse(event.data);
+      handleEvent(msg);
+    } catch(e) {
+      console.error('[WS] Parse error', e);
+    }
+  };
+}
+
+function sendAction(action, data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    appendLog('未连接到服务器，请稍候...');
+    return;
+  }
+  const msg = { action: action };
+  if (data !== undefined) msg.data = data;
+  ws.send(JSON.stringify(msg));
+}
+
+function updateConnIndicator(connected) {
+  const el = document.getElementById('connIndicator');
+  if (connected) {
+    el.className = 'conn-indicator connected';
+    el.textContent = '已连接';
+    setTimeout(() => { el.style.display = 'none'; }, 2000);
+  } else {
+    el.className = 'conn-indicator disconnected';
+    el.textContent = '未连接';
+    el.style.display = 'block';
+  }
+}
+
+// ══════════════════════════════════════════
+// Event Handler
+// ══════════════════════════════════════════
+function handleEvent(ev) {
+  switch(ev.type) {
+    case 'config':
+      applyConfig(ev.data);
+      break;
+    case 'config_saved':
+      appendLog('配置已保存');
+      break;
+    case 'devices':
+      // Could populate device list
+      break;
+    case 'log':
+      appendLog(ev.data.message || ev.data);
+      break;
+    case 'status':
+      updateStatus(ev.data);
+      break;
+    case 'recording_changed':
+      onRecordingChanged(ev.data.is_recording);
+      break;
+    case 'realtime_status':
+      onRealtimeStatus(ev.data);
+      break;
+    case 'transcript_partial':
+      onTranscriptPartial(ev.data);
+      break;
+    case 'transcript_ready':
+      onTranscriptReady(ev.data);
+      break;
+    case 'minutes_ready':
+      document.getElementById('transcriptArea').value = ev.data.text;
+      updateWordCount();
+      appendLog('AI纪要生成完成');
+      break;
+    case 'monitor_status':
+      onMonitorStatus(ev.data);
+      break;
+  }
+}
+
+// ══════════════════════════════════════════
+// Config
+// ══════════════════════════════════════════
+function applyConfig(config) {
+  if (!config) return;
+  const srcMap = {'system': 0, 'mic': 1, 'both': 2};
+  if (config.audio_source && srcMap[config.audio_source] !== undefined)
+    document.getElementById('audioSource').selectedIndex = srcMap[config.audio_source];
+  if (config.engine) {
+    const engMap = {'FunASR': 0, 'xfyun': 1, 'Whisper': 2};
+    const idx = engMap[config.engine];
+    if (idx !== undefined) document.getElementById('engineSelect').selectedIndex = idx;
+  }
+  if (config.funasr_model) {
+    document.getElementById('modelSelect').selectedIndex = config.funasr_model.includes('paraformer') ? 0 : 1;
+  }
+  if (config.xfyun_app_id) document.getElementById('xfyunAppId').value = config.xfyun_app_id;
+  if (config.xfyun_api_secret) document.getElementById('xfyunApiSecret').value = config.xfyun_api_secret;
+  if (config.xfyun_api_key) document.getElementById('xfyunApiKey').value = config.xfyun_api_key;
+  if (config.hot_words) document.getElementById('hotWords').value = config.hot_words;
+  if (config.domain) {
+    const dIdx = ['通用','金融','科技','医疗','教育','法院'].indexOf(config.domain);
+    if (dIdx >= 0) document.getElementById('domainSelect').selectedIndex = dIdx;
+  }
+  if (config.llm_api_key) document.getElementById('llmKey').value = config.llm_api_key;
+  if (config.llm_provider) {
+    const provMap = {'xfyun': 0, 'volcengine': 1, 'deepseek': 2, 'qwen': 3};
+    const pIdx = provMap[config.llm_provider];
+    if (pIdx !== undefined) document.getElementById('llmProvider').selectedIndex = pIdx;
+  }
+  if (config.auto_transcribe === false) document.getElementById('autoTranscribe').checked = false;
+  if (config.speaker_diarization === true) {
+    document.getElementById('speakerDiarization').checked = true;
+    document.getElementById('spkNumRow').style.display = 'block';
+  }
+  if (config.preset_spk_num) document.getElementById('presetSpkNum').value = config.preset_spk_num;
+}
+
+function saveConfig() {
+  sendAction('set_config', {
+    audio_source: document.getElementById('audioSource').value,
+    engine: document.getElementById('engineSelect').value,
+    funasr_model: document.getElementById('modelSelect').value,
+    xfyun_app_id: document.getElementById('xfyunAppId').value,
+    xfyun_api_secret: document.getElementById('xfyunApiSecret').value,
+    xfyun_api_key: document.getElementById('xfyunApiKey').value,
+    auto_transcribe: document.getElementById('autoTranscribe').checked,
+    speaker_diarization: document.getElementById('speakerDiarization').checked,
+    preset_spk_num: parseInt(document.getElementById('presetSpkNum').value) || 0,
+    llm_api_key: document.getElementById('llmKey').value,
+    llm_provider: document.getElementById('llmProvider').value,
+    hot_words: document.getElementById('hotWords').value,
+    domain: document.getElementById('domainSelect').value,
+  });
+}
+
+// ══════════════════════════════════════════
+// Actions
+// ══════════════════════════════════════════
+function toggleRecord() {
+  if (isRecording) {
+    sendAction('stop_recording');
+  } else {
+    if (isRealtime) {
+      appendLog('请先停止实时转写');
+      return;
+    }
+    const source = document.getElementById('audioSource').value;
+    sendAction('start_recording', { source: source });
+  }
+}
+
+function toggleRealtime() {
+  if (isRealtime) {
+    sendAction('stop_realtime');
+  } else {
+    // 实时转写已内置录音，无需再点录音按钮
+    if (isRecording) {
+      // 先停止纯录音，再启动实时转写
+      sendAction('stop_recording');
+      setTimeout(() => { sendAction('start_realtime'); }, 500);
+    } else {
+      sendAction('start_realtime');
+    }
+  }
+}
+
+function transcribeFile() {
+  sendAction('transcribe_file');
+}
+
+function generateMinutes() {
+  const text = document.getElementById('transcriptArea').value;
+  if (!text.trim()) { appendLog('请先转写内容'); return; }
+  sendAction('generate_minutes', {
+    text: text,
+    domain: document.getElementById('domainSelect').value
+  });
+}
+
+function saveTranscript() {
+  const text = document.getElementById('transcriptArea').value;
+  if (!text.trim()) return;
+  sendAction('save_transcript', {
+    text: text,
+    format: document.getElementById('saveFormat').value,
+    filename: 'transcript_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0,19)
+  });
+}
+
+function copyTranscript() {
+  const text = document.getElementById('transcriptArea').value;
+  if (text) {
+    navigator.clipboard.writeText(text).then(() => {
+      appendLog('已复制到剪贴板');
+    }).catch(() => {
+      // Fallback
+      const ta = document.getElementById('transcriptArea');
+      ta.select();
+      document.execCommand('copy');
+      appendLog('已复制到剪贴板');
+    });
+  }
+}
+
+// ══════════════════════════════════════════
+// UI Updates
+// ══════════════════════════════════════════
+function toggleSettings() {
+  document.getElementById('settingsPanel').classList.toggle('visible');
+  document.getElementById('settingsArrow').classList.toggle('open');
+}
+
+function toggleLog() {
+  document.getElementById('logContent').classList.toggle('visible');
+  document.getElementById('logToggle').classList.toggle('open');
+}
+
+function updateWordCount() {
+  document.getElementById('wordCount').textContent = '字数: ' + document.getElementById('transcriptArea').value.length;
+}
+
+function searchText() {
+  const q = document.getElementById('searchBox').value;
+  if (!q) return;
+  const ta = document.getElementById('transcriptArea');
+  const idx = ta.value.indexOf(q);
+  if (idx >= 0) { ta.focus(); ta.setSelectionRange(idx, idx + q.length); }
+}
+
+function appendLog(msg) {
+  const ts = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  const el = document.getElementById('logContent');
+  el.innerHTML += '<div>['+ts+'] '+msg+'</div>';
+  el.scrollTop = el.scrollHeight;
+  document.getElementById('logPreview').textContent = msg;
+}
+
+function updateStatus(status) {
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  dot.className = 'status-dot';
+  if (typeof status !== 'string') status = status.message || '就绪';
+  if (status.includes('录音')) { dot.classList.add('recording'); text.textContent = '录音中'; }
+  else if (status.includes('加载')) { dot.classList.add('loading'); text.textContent = '加载中'; }
+  else if (status.includes('转写')) { dot.classList.add('transcribing'); text.textContent = '转写中'; }
+  else if (status.includes('生成')) { dot.classList.add('loading'); text.textContent = '生成纪要中'; }
+  else if (status.includes('监控')) { dot.classList.add('loading'); text.textContent = '监控中'; }
+  else { text.textContent = '就绪'; }
+}
+
+function onRecordingChanged(recording) {
+  isRecording = recording;
+  const btn = document.getElementById('btnRecord');
+  const timeEl = document.getElementById('timeDisplay');
+  if (recording) {
+    btn.classList.add('active');
+    document.getElementById('recordText').textContent = '停止录音';
+    document.getElementById('recordIcon').innerHTML = '&#9632;';
+    timeEl.classList.add('visible');
+    recordSeconds = 0;
+    recordTimer = setInterval(() => {
+      recordSeconds++;
+      const h=Math.floor(recordSeconds/3600).toString().padStart(2,'0');
+      const m=Math.floor((recordSeconds%3600)/60).toString().padStart(2,'0');
+      const s=(recordSeconds%60).toString().padStart(2,'0');
+      timeEl.textContent = h+':'+m+':'+s;
+    }, 1000);
+  } else {
+    btn.classList.remove('active');
+    document.getElementById('recordText').textContent = '开始录音';
+    document.getElementById('recordIcon').innerHTML = '&#9679;';
+    timeEl.classList.remove('visible');
+    if (recordTimer) { clearInterval(recordTimer); recordTimer=null; }
+  }
+  // 实时转写运行时禁用录音按钮
+  btn.disabled = isRealtime;
+  btn.style.opacity = isRealtime ? '0.4' : '';
+}
+
+function onRealtimeStatus(data) {
+  const btn = document.getElementById('btnRealtime');
+  const badge = document.getElementById('realtimeBadge');
+  const status = data.status;
+  const message = data.message || '';
+
+  if (status === 'loading' || status === 'recording') {
+    isRealtime = true;
+    btn.classList.add('active');
+    document.getElementById('realtimeText').textContent = message || '加载中...';
+    if (status === 'recording') {
+      badge.classList.add('visible');
+      document.getElementById('realtimeBadgeText').textContent = message || '实时转写中';
+    }
+    // 禁用录音按钮
+    document.getElementById('btnRecord').disabled = true;
+    document.getElementById('btnRecord').style.opacity = '0.4';
+  } else if (status === 'ready') {
+    isRealtime = true;
+    btn.classList.add('active');
+    document.getElementById('realtimeText').textContent = '停止转写';
+    badge.classList.add('visible');
+    document.getElementById('realtimeBadgeText').textContent = '实时转写中';
+    // 禁用录音按钮
+    document.getElementById('btnRecord').disabled = true;
+    document.getElementById('btnRecord').style.opacity = '0.4';
+  } else if (status === 'diarizing') {
+    // 说话人分离中：保持按钮active但更新文字提示
+    isRealtime = true;
+    btn.classList.add('active');
+    document.getElementById('realtimeText').textContent = '说话人分离中...';
+    badge.classList.add('visible');
+    document.getElementById('realtimeBadgeText').textContent = message || '说话人分离中';
+  } else if (status === 'stopped' || status === 'error') {
+    isRealtime = false;
+    btn.classList.remove('active');
+    document.getElementById('realtimeText').textContent = '实时转写';
+    badge.classList.remove('visible');
+    if (status === 'error') {
+      appendLog('实时转写错误: ' + message);
+    }
+    // 恢复录音按钮
+    document.getElementById('btnRecord').disabled = false;
+    document.getElementById('btnRecord').style.opacity = '';
+  }
+  // loading时禁用实时转写按钮防止重复点击，其他状态均启用
+  btn.disabled = (status === 'loading');
+}
+
+function onTranscriptPartial(data) {
+  const ta = document.getElementById('transcriptArea');
+  ta.value = data.full_text || (ta.value + data.text);
+  updateWordCount();
+  // Auto scroll
+  ta.scrollTop = ta.scrollHeight;
+}
+
+// 说话人颜色（与后端SPEAKER_COLORS一致）
+const SPEAKER_COLORS = ['#4472C4', '#ED7D31', '#70AD47', '#FFC000', '#5B9BD5', '#A5A5A5', '#7030A0', '#C00000'];
+
+function onTranscriptReady(data) {
+  const ta = document.getElementById('transcriptArea');
+
+  // 判断是否为结构化结果（含sentence_info）
+  if (data && typeof data === 'object' && data.sentence_info && data.sentence_info.length > 0) {
+    // 说话人分离模式：格式化显示
+    const sentenceInfo = data.sentence_info;
+    const speakerCount = data.speaker_count || 0;
+
+    // 智能分段：合并同一说话人连续短句
+    const paragraphs = [];
+    let currentPara = null;
+    for (const s of sentenceInfo) {
+      const spk = s.spk || 0;
+      const text = s.sentence || s.text || '';
+      const start = s.start || 0;
+      const end = s.end || 0;
+
+      if (!currentPara || spk !== currentPara.spk || start - currentPara.end > 3000) {
+        if (currentPara) paragraphs.push(currentPara);
+        currentPara = { spk, start, end, texts: [text] };
+      } else {
+        currentPara.end = end;
+        currentPara.texts.push(text);
+      }
+    }
+    if (currentPara) paragraphs.push(currentPara);
+
+    // 格式化为带说话人标签的文本
+    let formatted = '';
+    for (const para of paragraphs) {
+      const color = SPEAKER_COLORS[para.spk % SPEAKER_COLORS.length];
+      const timeStr = formatMs(para.start);
+      const mergedText = para.texts.join('');
+      formatted += `【说话人${para.spk + 1}】 ${timeStr}\n${mergedText}\n\n`;
+    }
+
+    ta.value = formatted.trim();
+    updateWordCount();
+
+    const spkInfo = speakerCount > 0 ? `，识别${speakerCount}位说话人` : '';
+    appendLog(`转写完成${spkInfo}`);
+  } else {
+    // 纯文本模式
+    ta.value = (typeof data === 'object' ? data.text : data) || '';
+    updateWordCount();
+    appendLog('转写完成');
+  }
+}
+
+function formatMs(ms) {
+  const s = ms / 1000;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (h > 0) return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${sec.toString().padStart(2,'0')}`;
+  return `${m.toString().padStart(2,'0')}:${sec.toString().padStart(2,'0')}`;
+}
+
+function toggleMonitor() {
+  if (isMonitoring) {
+    sendAction('stop_monitor');
+  } else {
+    sendAction('start_monitor');
+  }
+}
+
+function onMonitorStatus(data) {
+  const btn = document.getElementById('btnMonitor');
+  const status = data.status;
+  const message = data.message || '';
+
+  if (status === 'monitoring' || status === 'detected' || status === 'recording') {
+    isMonitoring = true;
+    btn.style.borderColor = 'rgba(99,102,241,0.5)';
+    btn.style.color = '#818cf8';
+    btn.style.background = '#252940';
+    if (status === 'monitoring') {
+      document.getElementById('monitorIcon').textContent = '👁';
+      btn.innerHTML = '<span id="monitorIcon">👁</span> 监控中...';
+    } else if (status === 'detected') {
+      btn.innerHTML = '<span id="monitorIcon">🎯</span> 检测到会议!';
+    } else if (status === 'recording') {
+      btn.innerHTML = '<span id="monitorIcon">🔴</span> 自动录音中';
+    }
+    if (message) appendLog(message);
+  } else if (status === 'stopped') {
+    isMonitoring = false;
+    btn.style.borderColor = '';
+    btn.style.color = '';
+    btn.style.background = '';
+    btn.innerHTML = '<span id="monitorIcon">👁‍🗨</span> 自动监控';
+  }
+}
+
+// ══════════════════════════════════════════
+// Init
+// ══════════════════════════════════════════
+window.addEventListener('load', function() {
+  connectWs();
+});
+</script>
+</body>
+</html>
