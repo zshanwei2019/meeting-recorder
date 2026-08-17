@@ -1781,6 +1781,7 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
             last_text_time = time.time()    # 上次收到新文字时间
             punc_interval = 2.0     # 每2秒做一次标点恢复
             pause_threshold = 1.5   # 停顿超过1.5秒自动分段
+            punc_cursor = 0         # 增量标点：已标点处理到的位置
 
             while state.is_realtime:
                 audio_data = state.recorder.get_audio_chunk(timeout=0.5)
@@ -1803,10 +1804,14 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                                     last_text_time = time.time()
                         except Exception as e:
                             push("log", {"message": f"FunASR处理错误: {str(e)}"})
-                    # 定时标点恢复
+                    # 定时标点恢复（增量：只处理新增文本）
                     now = time.time()
                     if raw_text and now - last_punc_time >= punc_interval:
-                        display_text = state.funasr.add_punctuation(raw_text)
+                        new_text = raw_text[punc_cursor:]
+                        if new_text:
+                            punctuated_new = state.funasr.add_punctuation(new_text)
+                            display_text += punctuated_new
+                            punc_cursor = len(raw_text)
                         # 停顿分段：如果距上次收到新文字超过阈值，加换行
                         if now - last_text_time >= pause_threshold and not display_text.endswith("\n"):
                             display_text += "\n"
@@ -1840,10 +1845,14 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                 except Exception as e:
                     push("log", {"message": f"FunASR处理错误: {str(e)}"})
 
-                # 定时标点恢复
+                # 定时标点恢复（增量：只处理新增文本）
                 now = time.time()
                 if raw_text and now - last_punc_time >= punc_interval:
-                    display_text = state.funasr.add_punctuation(raw_text)
+                    new_text = raw_text[punc_cursor:]
+                    if new_text:
+                        punctuated_new = state.funasr.add_punctuation(new_text)
+                        display_text += punctuated_new
+                        punc_cursor = len(raw_text)
                     if now - last_text_time >= pause_threshold and not display_text.endswith("\n"):
                         display_text += "\n"
                     last_punc_time = now
