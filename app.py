@@ -2145,6 +2145,40 @@ def _build_final_prompt(content, domain, is_summary=False):
 
 # ─── 启动 ───
 def main():
+    # 错误日志（打包后无控制台，错误写入文件便于排查）
+    log_file = DATA_DIR / "startup_error.log"
+    try:
+        log_file.write_text("", encoding="utf-8")  # 清空旧日志
+    except:
+        pass
+
+    def log_error(msg):
+        import traceback
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = f"[{ts}] {msg}\n"
+        try:
+            log_file.write_text(text, encoding="utf-8")
+        except:
+            pass
+        print(text)
+
+    try:
+        _main_inner(log_error)
+    except Exception as e:
+        import traceback
+        log_error(f"启动失败:\n{traceback.format_exc()}")
+        # 弹窗提示用户查看日志
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, f"启动失败，请查看日志：\n{log_file}\n\n错误：{e}", "会议录音转写助手", 0x10
+            )
+        except:
+            pass
+        sys.exit(1)
+
+
+def _main_inner(log_error):
     ensure_dirs()
 
     # Check if FastAPI is installed
