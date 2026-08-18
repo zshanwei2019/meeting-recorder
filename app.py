@@ -1777,11 +1777,9 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
             # 标点恢复 + 智能分段状态
             raw_text = ""           # 原始无标点文本
             display_text = ""       # 带标点+分段的展示文本
-            last_punc_time = time.time()    # 上次标点恢复时间
             last_text_time = time.time()    # 上次收到新文字时间
-            punc_interval = 2.0     # 每2秒做一次标点恢复
             pause_threshold = 1.5   # 停顿超过1.5秒自动分段
-            punc_cursor = 0         # 增量标点：已标点处理到的位置
+            punc_running = False    # 标点线程是否正在运行
 
             while state.is_realtime:
                 audio_data = state.recorder.get_audio_chunk(timeout=0.5)
@@ -1804,19 +1802,24 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                                     last_text_time = time.time()
                         except Exception as e:
                             push("log", {"message": f"FunASR处理错误: {str(e)}"})
-                    # 定时标点恢复（增量：只处理新增文本）
+                    # 定时标点恢复（异步线程，不阻塞主循环）
+                    def _async_punctuate(text_to_punctuate):
+                        nonlocal display_text, punc_running
+                        try:
+                            punctuated = state.funasr.add_punctuation(text_to_punctuate)
+                            # 停顿分段
+                            if time.time() - last_text_time >= pause_threshold and not punctuated.endswith("\n"):
+                                punctuated += "\n"
+                            display_text = punctuated
+                            push("transcript_partial", {"full_text": display_text})
+                        finally:
+                            punc_running = False
+
                     now = time.time()
-                    if raw_text and now - last_punc_time >= punc_interval:
-                        new_text = raw_text[punc_cursor:]
-                        if new_text:
-                            punctuated_new = state.funasr.add_punctuation(new_text)
-                            display_text += punctuated_new
-                            punc_cursor = len(raw_text)
-                        # 停顿分段：如果距上次收到新文字超过阈值，加换行
-                        if now - last_text_time >= pause_threshold and not display_text.endswith("\n"):
-                            display_text += "\n"
-                        last_punc_time = now
-                        push("transcript_partial", {"full_text": display_text})
+                    if raw_text and now - last_text_time >= 1.5 and not punc_running:
+                        punc_running = True
+                        t = time.time() - last_text_time
+                        threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True).start()
                     continue
 
                 try:
@@ -1845,18 +1848,11 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                 except Exception as e:
                     push("log", {"message": f"FunASR处理错误: {str(e)}"})
 
-                # 定时标点恢复（增量：只处理新增文本）
+                # 定时标点恢复（异步线程，不阻塞主循环）
                 now = time.time()
-                if raw_text and now - last_punc_time >= punc_interval:
-                    new_text = raw_text[punc_cursor:]
-                    if new_text:
-                        punctuated_new = state.funasr.add_punctuation(new_text)
-                        display_text += punctuated_new
-                        punc_cursor = len(raw_text)
-                    if now - last_text_time >= pause_threshold and not display_text.endswith("\n"):
-                        display_text += "\n"
-                    last_punc_time = now
-                    push("transcript_partial", {"full_text": display_text})
+                if raw_text and now - last_text_time >= 1.5 and not punc_running:
+                    punc_running = True
+                    threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True).start()
 
             # 最终flush - 处理buffer中剩余数据
             try:
