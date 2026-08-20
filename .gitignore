@@ -4,3 +4,13 @@ __pycache__/
 *.bak
 build/
 dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 本地配置与运行产物
+config.json
+*.log
+*.wav
