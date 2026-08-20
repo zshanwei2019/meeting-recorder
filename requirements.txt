@@ -15,6 +15,11 @@ modelscope>=1.0
 torch>=2.0
 torchaudio>=2.0
 
+# 拼音级热词纠正（FunASR postprocess_hotwords 依赖）
+# 缺失时程序自动降级为仅解码期热词偏置，不会报错
+pypinyin>=0.50
+rapidfuzz>=3.0
+
 # 讯飞 WebSocket 实时转写
 websocket-client>=1.0
 

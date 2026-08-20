@@ -8,6 +8,7 @@
 import sys
 import os
 import json
+import re
 import time
 import wave
 import queue
@@ -16,6 +17,14 @@ import subprocess
 import traceback
 from pathlib import Path
 from datetime import datetime
+
+# 拼音级热词纠正依赖 pypinyin + rapidfuzz，缺失时自动降级为仅解码期热词偏置
+try:
+    import pypinyin  # noqa: F401
+    import rapidfuzz  # noqa: F401
+    _POSTPROCESS_HOTWORDS_AVAILABLE = True
+except ImportError:
+    _POSTPROCESS_HOTWORDS_AVAILABLE = False
 
 # ─── 配置 ───
 APP_NAME = "会议录音转写助手"
@@ -417,6 +426,40 @@ class FunASRTranscriber:
         self._stream_ready = False
         self._diarization_loading = False
 
+    @staticmethod
+    def _parse_hot_words(raw):
+        """把配置里的热词字符串解析为列表。支持逗号/顿号/空格/换行分隔。"""
+        if not raw:
+            return []
+        if isinstance(raw, (list, tuple)):
+            items = [str(w).strip() for w in raw]
+        else:
+            items = re.split(r"[,，、;；\s\n]+", str(raw))
+        seen, out = set(), []
+        for w in items:
+            w = w.strip()
+            if w and w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out
+
+    def build_hotword_kwargs(self, hot_words=None):
+        """构造 FunASR 热词参数。
+
+        FunASR 提供两层热词能力，这里同时启用：
+        - hotword: 解码期偏置，对模型支持的场景直接提高召回
+        - postprocess_hotwords: 解码后基于拼音的文本纠正，覆盖模型未偏置到的情况
+          （依赖 pypinyin + rapidfuzz，缺失时自动跳过而不报错）
+        """
+        words = self._parse_hot_words(hot_words)
+        if not words:
+            return {}
+        kwargs = {"hotword": " ".join(words)}
+        if _POSTPROCESS_HOTWORDS_AVAILABLE:
+            kwargs["postprocess_hotwords"] = words
+            kwargs["postprocess_hotword_threshold"] = 0.85
+        return kwargs
+
     def add_punctuation(self, text):
         """用标点模型给文本加标点"""
         if not self.punc_model or not text or not text.strip():
@@ -529,18 +572,19 @@ class FunASRTranscriber:
             return self.load_stream_model(model_name, status_callback)
         return self.load_file_model(model_name, status_callback)
 
-    def transcribe_file(self, filepath, status_callback=None):
+    def transcribe_file(self, filepath, status_callback=None, hot_words=None):
         """转写音频文件（使用SenseVoiceSmall模型）"""
         if not self.load_model(model_name="iic/SenseVoiceSmall", status_callback=status_callback):
             return None
         try:
             if status_callback:
                 status_callback("transcribing", "正在转写...")
-            result = self.file_model.generate(input=filepath, batch_size_s=300)
+            kwargs = dict(input=filepath, batch_size_s=300, use_itn=True)
+            kwargs.update(self.build_hotword_kwargs(hot_words))
+            result = self.file_model.generate(**kwargs)
             if result and len(result) > 0:
                 text = result[0].get("text", "")
                 # Clean up SenseVoice special tokens like <|zh|>, < | zh | >, <|NEUTRAL|>, etc.
-                import re
                 text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', text).strip()
                 return text
             return ""
@@ -549,7 +593,7 @@ class FunASRTranscriber:
                 status_callback("error", f"转写失败: {str(e)}")
             return None
 
-    def transcribe_file_with_diarization(self, filepath, status_callback=None, preset_spk_num=None):
+    def transcribe_file_with_diarization(self, filepath, status_callback=None, preset_spk_num=None, hot_words=None):
         """转写音频文件并做说话人分离（使用paraformer-large-vad-punc + ERes2NetV2）"""
         # 加载带说话人分离的pipeline（需要支持timestamp的ASR模型）
         if not self._load_diarization_model(status_callback):
@@ -560,11 +604,11 @@ class FunASRTranscriber:
             kwargs = dict(input=filepath, batch_size_s=300, return_spk_res=True)
             if preset_spk_num:
                 kwargs["preset_spk_num"] = preset_spk_num
+            kwargs.update(self.build_hotword_kwargs(hot_words))
             result = self.diarization_model.generate(**kwargs)
             if result and len(result) > 0:
                 item = result[0]
                 text = item.get("text", "")
-                import re
                 text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', text).strip()
                 sentence_info = item.get("sentence_info", [])
                 # 构建结构化结果
@@ -1635,12 +1679,14 @@ def _transcribe_file_task(filepath, ws):
 
             speaker_diary = state.config.get("speaker_diarization", False)
             preset_spk = state.config.get("preset_spk_num", 0) or None
+            hot_words = state.config.get("hot_words", "")
 
             if speaker_diary:
                 # 说话人分离模式
                 state.push_from_thread("log", {"message": "正在加载说话人分离模型..."})
                 result = state.funasr.transcribe_file_with_diarization(
-                    filepath, status_callback=status_cb, preset_spk_num=preset_spk
+                    filepath, status_callback=status_cb, preset_spk_num=preset_spk,
+                    hot_words=hot_words
                 )
                 if result is not None:
                     state.set_transcript(result.get("text", ""))
@@ -1661,7 +1707,7 @@ def _transcribe_file_task(filepath, ws):
             else:
                 # 普通转写模式
                 state.push_from_thread("log", {"message": "正在加载FunASR模型..."})
-                result = state.funasr.transcribe_file(filepath, status_callback=status_cb)
+                result = state.funasr.transcribe_file(filepath, status_callback=status_cb, hot_words=hot_words)
                 if result is not None:
                     state.set_transcript(result)
                     state.sentence_info = []
@@ -1958,10 +2004,10 @@ def _generate_minutes_task(text, domain, ws):
     def call_llm(prompt_text, cfg, llm_key, max_tokens=8192):
         """调用LLM API，返回文本结果"""
         body = cfg["body"]()
-        # 覆盖prompt和max_tokens
-        body["messages"] = [{"role": "user", "content": prompt_text}]
-        if "max_tokens" in body:
-            body["max_tokens"] = max_tokens
+        messages = [{"role": "user", "content": prompt_text}]
+        # 不同厂商的请求体层级不同（如 DashScope 将 messages 嵌在 input 下），
+        # 由 cfg["inject"] 负责写到正确位置，不能一律写 body["messages"]
+        cfg["inject"](body, messages, max_tokens)
         resp = requests.post(
             cfg["url"],
             headers=cfg["headers"](llm_key),
@@ -1973,9 +2019,14 @@ def _generate_minutes_task(text, domain, ws):
         else:
             error_detail = ""
             try:
-                error_detail = resp.json().get("error", {}).get("message", "")[:100]
-            except:
-                pass
+                payload = resp.json()
+                # OpenAI 兼容格式：{"error": {"message": ...}}；DashScope：{"message": ...}
+                error_detail = (
+                    payload.get("error", {}).get("message", "")
+                    or payload.get("message", "")
+                )[:200]
+            except Exception:
+                error_detail = resp.text[:200]
             raise Exception(f"API返回{resp.status_code}: {error_detail}")
 
     try:
@@ -1988,12 +2039,23 @@ def _generate_minutes_task(text, domain, ws):
         provider = state.config.get("llm_provider", "xfyun")
         import requests
 
+        # 将 messages / max_tokens 写入 OpenAI 兼容格式的请求体顶层
+        def _inject_openai(body, messages, max_tokens):
+            body["messages"] = messages
+            body["max_tokens"] = max_tokens
+
+        # DashScope 原生格式：messages 在 input 下，max_tokens 在 parameters 下
+        def _inject_dashscope(body, messages, max_tokens):
+            body.setdefault("input", {})["messages"] = messages
+            body.setdefault("parameters", {})["max_tokens"] = max_tokens
+
         # API配置
         api_configs = {
             "xfyun": {
                 "url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
                 "headers": lambda key: {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 "body": lambda: {"model": "astron-code-latest", "messages": [], "temperature": 0.3, "max_tokens": 8192},
+                "inject": _inject_openai,
                 "extract": lambda data: data["choices"][0]["message"]["content"],
                 "name": "讯飞星火",
                 "timeout": 180,
@@ -2002,6 +2064,7 @@ def _generate_minutes_task(text, domain, ws):
                 "url": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
                 "headers": lambda key: {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 "body": lambda: {"model": "ark-code-latest", "messages": [], "temperature": 0.3, "max_tokens": 8192},
+                "inject": _inject_openai,
                 "extract": lambda data: data["choices"][0]["message"]["content"],
                 "name": "火山引擎",
                 "timeout": 180,
@@ -2010,6 +2073,7 @@ def _generate_minutes_task(text, domain, ws):
                 "url": "https://api.deepseek.com/v1/chat/completions",
                 "headers": lambda key: {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 "body": lambda: {"model": "deepseek-chat", "messages": [], "temperature": 0.3, "max_tokens": 8192},
+                "inject": _inject_openai,
                 "extract": lambda data: data["choices"][0]["message"]["content"],
                 "name": "DeepSeek",
                 "timeout": 120,
@@ -2017,8 +2081,13 @@ def _generate_minutes_task(text, domain, ws):
             "qwen": {
                 "url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
                 "headers": lambda key: {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                "body": lambda: {"model": "qwen-turbo", "input": {"messages": []}, "parameters": {"temperature": 0.3}},
-                "extract": lambda data: data["output"]["text"],
+                "body": lambda: {
+                    "model": "qwen-plus",
+                    "input": {"messages": []},
+                    "parameters": {"temperature": 0.3, "result_format": "message"},
+                },
+                "inject": _inject_dashscope,
+                "extract": lambda data: data["output"]["choices"][0]["message"]["content"],
                 "name": "通义千问",
                 "timeout": 120,
             },
