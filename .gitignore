@@ -4,13 +4,40 @@ __pycache__/
 *.bak
 build/
 dist/
+# ── 音频/转写产物：绝不可入库 ──
+# 本仓库为 public，真实会议录音与转写文本属敏感内容，
+# 一次误 `git add .` 即可能推上公网，故在此显式拦截。
+# 做模型 A/B 时样本音频常被临时放进仓库目录，这条是最后一道防线。
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.opus
+*.wma
+*.amr
+*.mp4
+*.mkv
+*.mov
+
+# 转写/纪要产物
+*.srt
+*.vtt
+transcripts/
+recordings/
+samples/
+audio/
+benchmark/
+*.docx
+
+# 本地配置（可能含 API key）
+config.json
+# 日志：startup_error.log 由启动脚本写在仓库外，
+# 但开发时常在仓库内产生临时日志，一并拦掉。
+*.log
 
 # 虚拟环境
 .venv/
 venv/
 env/
-
-# 本地配置与运行产物
-config.json
-*.log
-*.wav
