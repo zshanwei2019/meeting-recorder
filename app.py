@@ -28,6 +28,42 @@ except ImportError:
     _rf_fuzz = None
     _POSTPROCESS_HOTWORDS_AVAILABLE = False
 
+# ─── PyInstaller + FunASR 兼容补丁 ───
+# funasr/register.py 在每个类注册时调用 inspect.getfile() 和
+# inspect.getsourcelines() 来记录类位置元数据。PyInstaller 打包后
+# 没有 .py 源文件，这两个调用抛 OSError，导致 import_submodules()
+# 捕获异常后跳过整个模块，所有模型类注册失败。
+# 在 import funasr 之前 patch inspect，让 frozen 环境下返回安全值。
+if getattr(sys, "frozen", False):
+    import inspect as _inspect
+    _orig_getfile = _inspect.getfile
+    _orig_getsourcelines = _inspect.getsourcelines
+    def _safe_getfile(obj):
+        try:
+            return _orig_getfile(obj)
+        except (OSError, TypeError):
+            return getattr(obj, "__module__", "<frozen>")
+    def _safe_getsourcelines(obj):
+        try:
+            return _orig_getsourcelines(obj)
+        except (OSError, TypeError):
+            return ([], 0)
+    _inspect.getfile = _safe_getfile
+    _inspect.getsourcelines = _safe_getsourcelines
+
+    # cif_predictor.py 用 @torch.jit.script 装饰导出辅助函数，
+    # torch.jit.script 在 import 时通过 inspect.getsourcelines 读源码
+    # 编译 TorchScript。frozen 下没有 .py 源文件会报
+    # "Expected a single top-level function"，导致整个
+    # bicif_paraformer / paraformer / paraformer_streaming 模块
+    # 导入失败、模型类不注册。这些 scripted 函数仅用于模型导出，
+    # 推理路径不需要，替换为 no-op 即可。
+    try:
+        import torch as _torch_frozen
+        _torch_frozen.jit.script = lambda f=None, *a, **kw: f if f is not None else (lambda fn: fn)
+    except Exception:
+        pass
+
 # ─── 配置 ───
 APP_NAME = "会议录音转写助手"
 APP_VERSION = "3.1.0"
@@ -97,6 +133,76 @@ def _resolve_output_path(base_dir, filename, ext, fallback="transcript"):
     if path.parent != base:
         raise ValueError(f"非法输出路径: {filename!r}")
     return path
+
+# ─── PyInstaller + FunASR 兼容补丁 ───
+# 打包后 CharTokenizer.__init__ 抛 NameError: name 'load_seg_dict'
+# is not defined。下面在 import funasr 前诊断 + 无条件注入。
+def _patch_funasr_char_tokenizer():
+    try:
+        import re as _re
+        import sys as _sys
+        def _load_seg_dict(seg_dict_file):
+            seg_dict = {}
+            assert isinstance(seg_dict_file, str)
+            with open(seg_dict_file, "r", encoding="utf8") as f:
+                for line in f.readlines():
+                    s = line.strip().split()
+                    if not s:
+                        continue
+                    seg_dict[s[0]] = " ".join(s[1:])
+            return seg_dict
+        def _seg_tokenize(txt, seg_dict):
+            pattern = _re.compile(r"([\u4E00-\u9FA5A-Za-z0-9])")
+            out_txt = ""
+            for word in txt:
+                word = word.lower()
+                if word in seg_dict:
+                    out_txt += seg_dict[word] + " "
+                elif pattern.match(word):
+                    for char in word:
+                        out_txt += (seg_dict[char] + " ") if char in seg_dict else "<unk> "
+                else:
+                    out_txt += "<unk> "
+            return out_txt.strip().split()
+
+        # 诊断并注入所有 sys.modules 中的 char_tokenizer 模块副本
+        found = []
+        for _mname, _mod in list(_sys.modules.items()):
+            if _mname and _mname.endswith("char_tokenizer") and _mod is not None:
+                found.append(_mname)
+                _g = getattr(_mod, "__dict__", None)
+                if _g is None:
+                    continue
+                if "load_seg_dict" not in _g:
+                    _g["load_seg_dict"] = _load_seg_dict
+                if "seg_tokenize" not in _g:
+                    _g["seg_tokenize"] = _seg_tokenize
+                # 类的 __globals__ 可能是另一个 dict
+                _cls = getattr(_mod, "CharTokenizer", None)
+                if _cls is not None:
+                    _cg = _cls.__init__.__globals__
+                    if "load_seg_dict" not in _cg:
+                        _cg["load_seg_dict"] = _load_seg_dict
+                    if "seg_tokenize" not in _cg:
+                        _cg["seg_tokenize"] = _seg_tokenize
+
+        # 从 tables 拿实际注册的类，直接注入其 __globals__（AutoModel 真正用的）
+        try:
+            from funasr.register import tables as _tables
+            _cls = _tables.tokenizer_classes.get("CharTokenizer")
+            if _cls is not None:
+                _cg = _cls.__init__.__globals__
+                _cg["load_seg_dict"] = _load_seg_dict
+                _cg["seg_tokenize"] = _seg_tokenize
+                found.append("tables:" + _cls.__module__)
+        except Exception:
+            pass
+
+        print(f"[补丁] char_tokenizer 副本: {found}", flush=True)
+    except Exception as _e:
+        import traceback as _tb
+        print("[补丁] 失败:\n" + _tb.format_exc(), flush=True)
+
 
 # ─── 文件转写模型 ───
 # 文件转写（非实时）使用的 ASR 模型。实测在中文多说话人 / 带背景音的
@@ -838,6 +944,7 @@ class FunASRTranscriber:
                 if status_callback:
                     status_callback("loading", "导入FunASR...")
                 from funasr import AutoModel
+                _patch_funasr_char_tokenizer()
                 if status_callback:
                     status_callback("loading", "加载文件转写模型（首次需下载）...")
                 self.file_model = AutoModel(
@@ -858,6 +965,8 @@ class FunASRTranscriber:
             return False
         except Exception as e:
             self.file_model = None
+            _tb = traceback.format_exc()
+            print("[文件模型加载失败]\n" + _tb, flush=True)
             if status_callback:
                 status_callback("error", f"文件转写模型加载失败: {str(e)}")
             return False
@@ -883,6 +992,7 @@ class FunASRTranscriber:
                 if status_callback:
                     status_callback("loading", "加载实时转写模型...")
                 from funasr import AutoModel
+                _patch_funasr_char_tokenizer()
                 # 实时流式ASR模型（不带VAD和标点，加载快）
                 self.stream_model = AutoModel(
                     model=model_name,
@@ -909,6 +1019,8 @@ class FunASRTranscriber:
             return False
         except Exception as e:
             self.stream_model = None
+            _tb = traceback.format_exc()
+            print("[实时模型加载失败]\n" + _tb, flush=True)
             if status_callback:
                 status_callback("error", f"实时转写模型加载失败: {str(e)}")
             return False
@@ -998,6 +1110,7 @@ class FunASRTranscriber:
                 if status_callback:
                     status_callback("loading", "加载说话人分离模型（首次较慢）...")
                 from funasr import AutoModel
+                _patch_funasr_char_tokenizer()
                 self.diarization_model = AutoModel(
                     model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
                     spk_model="iic/speech_eres2netv2_sv_zh-cn_16k-common",
