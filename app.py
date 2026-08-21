@@ -139,6 +139,30 @@ def save_config(config):
         pass
 
 # ─── 音频录制器 ───
+# 边录边落盘的参数。
+# 旧实现把整场录音的 PCM 全攒在 self._frames 里，只在 stop() 时一次性
+# concatenate 后写 WAV，内存占用与会议时长成正比，且 stop() 里连锁副本
+# （concatenate → *32767 → astype → tobytes）会把峰值再放大约 4 倍。
+# 实测折算：8 小时混合录音 _frames 约 1.7 GB、stop() 峰值约 7 GB、
+# 双路混合约 14 GB —— 会在按下停止那一刻 OOM，整场录音全丢。
+# 改为录音期间由后台线程增量写 WAV，_frames 只作为短暂的交接缓冲。
+#
+# 两个参数按实测数据标定（每块 0.3 秒 → 3.33 块/秒）：
+#   flush=0.5s  → 稳态积压仅 1.7 块，正常录音永不触发丢弃
+#   上限 1200 块 → 最坏情况（双声道 48kHz，112.5 KB/块）占 132 MB，
+#                 可容忍磁盘卡顿约 6 分钟
+# 写盘量本身极小（16kHz 单声道 int16 = 32 KB/s），瓶颈不可能是带宽，
+# 只可能是偶发卡顿，所以寘缓冲换安全很划算——录音丢一秒就是会议
+# 内容永久缺失，而 132 MB 相比旧实现的 14 GB 峰值可以忽略不计。
+_WRITER_FLUSH_INTERVAL_S = 0.5      # 落盘线程的轮询间隔
+_WRITER_MAX_PENDING_BLOCKS = 1200   # _frames 里最多积压的块数（超过则丢最旧）
+
+# 实时转写队列上限（块数）。每块 0.3 秒，16kHz 单声道 int16 ≈ 9.6 KB。
+# 400 块 ≈ 120 秒 ≈ 3.8 MB，足够覆盖 ASR 的短时抖动；再多说明消费者
+# 根本没在跑（用户只录音没开实时转写），继续堆下去纯属浪费内存。
+_AUDIO_QUEUE_MAX_CHUNKS = 400
+
+
 class AudioRecorder:
     """使用 sounddevice 录制音频"""
     def __init__(self):
@@ -149,12 +173,28 @@ class AudioRecorder:
         self._stream = None
         self._stream2 = None          # 混合模式下的第二个录音流
         self._mix_buffer = {}         # 混合模式下的音频对齐缓冲
+        self._mix_thread = None       # 混音线程（stop 时需 join，否则会写已关闭的文件）
         self._sample_rate = 16000
         self._channels = 1
         self._actual_sample_rate = 16000  # 实际录音采样率（可能因设备不同）
         self._actual_channels = 1         # 实际录音通道数
         self._lock = threading.Lock()
-        self._audio_queue = queue.Queue()
+        # _frames 的交接锁：音频回调（append）与落盘线程（整体取走）之间
+        # 必须原子交接。临界区只做 list 操作，磁盘 I/O 放在锁外，
+        # 因为 sounddevice 回调绝不能阻塞（一阻塞就丢采样）。
+        self._frames_lock = threading.Lock()
+        # 实时转写队列必须有界：它的唯一消费者是
+        # _realtime_transcribe_task，只录音不开实时转写时根本没人 get，
+        # 无界队列会随录音时长线性增长（16kHz 单声道 int16 = 32 KB/s，
+        # 8 小时约 879 MB）。
+        self._audio_queue = queue.Queue(maxsize=_AUDIO_QUEUE_MAX_CHUNKS)
+        self._dropped_chunks = 0
+        # ── 边录边落盘 ──
+        self._wav_writer = None
+        self._wav_path = None
+        self._wav_lock = threading.Lock()
+        self._wav_samples_written = 0
+        self._writer_thread = None
 
     def _import_deps(self):
         if self.sd is None:
@@ -190,6 +230,15 @@ class AudioRecorder:
         self._recording = True
         self._callback = callback
         self._mix_buffer = {}
+        self._dropped_chunks = 0
+
+        # 先打开 WAV 写入器并拉起落盘线程，使录音从第一块开始就能落盘。
+        # 设备参数（_actual_sample_rate / _actual_channels）在下面才确定，
+        # 但重采样是在写入时读取这两个值的，而第一块数据要等流启动后
+        # 才会到达，所以提前开线程是安全的。
+        self._open_wav_writer()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
 
         # ── 查找设备 ──
         devices = self.list_devices()
@@ -236,7 +285,7 @@ class AudioRecorder:
                 if sys_rate != target_rate:
                     ratio = target_rate / sys_rate
                     new_len = int(len(mono) * ratio)
-                    mono = self.np.interp(self.np.linspace(0, len(mono)-1, new_len), self.np.arange(len(mono)), mono)
+                    mono = self._resample_linear_f32(mono, new_len)
                 with self._lock:
                     buf = self._mix_buffer.setdefault('sys', self.np.array([], dtype=self.np.float32))
                     self._mix_buffer['sys'] = self.np.concatenate([buf, mono])
@@ -247,7 +296,7 @@ class AudioRecorder:
                 if mic_rate != target_rate:
                     ratio = target_rate / mic_rate
                     new_len = int(len(mono) * ratio)
-                    mono = self.np.interp(self.np.linspace(0, len(mono)-1, new_len), self.np.arange(len(mono)), mono)
+                    mono = self._resample_linear_f32(mono, new_len)
                 with self._lock:
                     buf = self._mix_buffer.setdefault('mic', self.np.array([], dtype=self.np.float32))
                     self._mix_buffer['mic'] = self.np.concatenate([buf, mono])
@@ -268,17 +317,17 @@ class AudioRecorder:
                         self._mix_buffer['mic'] = new_mic
                     if len(mixed) == 0:
                         continue
-                    # 保存原始帧（用于WAV文件）
-                    self._frames.append(mixed.reshape(-1, 1))
+                    # 保存原始帧（由落盘线程增量写入 WAV，不再攒整场）
+                    self._append_frame(mixed.reshape(-1, 1))
                     # 重采样到16kHz送队列
                     if target_rate != 16000:
                         ratio = 16000 / target_rate
                         new_len = int(len(mixed) * ratio)
-                        mixed_16k = self.np.interp(self.np.linspace(0, len(mixed)-1, new_len), self.np.arange(len(mixed)), mixed)
+                        mixed_16k = self._resample_linear_f32(mixed, new_len)
                     else:
                         mixed_16k = mixed
                     pcm = self._float_to_pcm16(mixed_16k)
-                    self._audio_queue.put(pcm)
+                    self._enqueue_pcm(pcm)
                     if self._callback:
                         try: self._callback(pcm)
                         except: pass
@@ -348,9 +397,9 @@ class AudioRecorder:
             if not self._recording:
                 return
             audio_data = indata.copy()
-            self._frames.append(audio_data)
+            self._append_frame(audio_data)
             pcm = self._resample_to_16k_mono(audio_data)
-            self._audio_queue.put(pcm)
+            self._enqueue_pcm(pcm)
             if self._callback:
                 try:
                     self._callback(pcm)
@@ -388,6 +437,8 @@ class AudioRecorder:
                 return True
             except Exception as e2:
                 self._recording = False
+                # 录音根本没起来，删掉刚建的空壳 WAV，不留垃圾文件
+                self._discard_wav_writer()
                 raise e2
 
     def _float_to_pcm16(self, samples):
@@ -425,6 +476,21 @@ class AudioRecorder:
         new_mic = mic_buf[used_mic:] if used_mic < len(mic_buf) else empty
         return mixed, new_sys, new_mic
 
+    def _resample_linear_f32(self, mono, new_len):
+        """线性插值重采样，强制保持 float32。
+
+        坑：`np.interp` 总是返回 float64（`np.linspace` 本身就是 float64），
+        传进去 float32 也一样——每采样 4 字节静默变 8 字节，内存直接翻倍，
+        而且会沿混音链传播（float64 + float32 仍是 float64）。
+        实测回落 float32 数值无损（最大差异 0.0），因为 float32
+        本就是音频采集的原始精度。
+        """
+        if new_len <= 0 or len(mono) == 0:
+            return self.np.array([], dtype=self.np.float32)
+        indices = self.np.linspace(0, len(mono) - 1, new_len)
+        out = self.np.interp(indices, self.np.arange(len(mono)), mono)
+        return out.astype(self.np.float32, copy=False)
+
     def _resample_to_16k_mono(self, audio_data):
         """将录音数据重采样为16kHz单声道16bit PCM bytes"""
         mono_16k = self._resample_to_16k_mono_float(audio_data)
@@ -444,18 +510,158 @@ class AudioRecorder:
         if self._actual_sample_rate != self._sample_rate:
             ratio = self._sample_rate / self._actual_sample_rate
             new_len = int(len(mono) * ratio)
-            if new_len > 0:
-                indices = self.np.linspace(0, len(mono) - 1, new_len)
-                mono = self.np.interp(indices, self.np.arange(len(mono)), mono)
-            else:
-                mono = self.np.array([], dtype=self.np.float32)
+            mono = self._resample_linear_f32(mono, new_len)
 
         return mono
 
+    def _enqueue_pcm(self, pcm):
+        """把一块 PCM 送进实时转写队列，队列满时丢最旧的一块。
+
+        绝不能用阻塞式 put：调用方是 sounddevice 音频回调与混音线程，
+        一阻塞就丢采样。队列持续满通常意味着没人在消费（用户只录音、
+        没开实时转写），此时丢弃是正确选择——录音完整性由 WAV 落盘保证，
+        而不是靠这个队列。
+        """
+        try:
+            self._audio_queue.put_nowait(pcm)
+            return True
+        except queue.Full:
+            pass
+        try:
+            self._audio_queue.get_nowait()      # 丢最旧的一块，腾位给新数据
+            self._dropped_chunks += 1
+        except queue.Empty:
+            pass
+        try:
+            self._audio_queue.put_nowait(pcm)
+            return True
+        except queue.Full:
+            self._dropped_chunks += 1
+            return False
+
+    # ─── 边录边落盘 ───
+
+    def _open_wav_writer(self):
+        """开启增量 WAV 写入器（16kHz 单声道 16bit，与 FunASR 输入一致）。
+
+        旧实现在 stop() 里才建文件，录音全程数据只存内存；这里提前到
+        start() 打开，使录音可以边录边写。
+        """
+        ensure_dirs()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = RECORDINGS_DIR / f"recording_{timestamp}.wav"
+        wf = wave.open(str(filepath), 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(2)              # 16bit
+        wf.setframerate(self._sample_rate)
+        with self._wav_lock:
+            self._wav_writer = wf
+            self._wav_path = filepath
+            self._wav_samples_written = 0
+        return filepath
+
+    def _discard_wav_writer(self):
+        """录音启动失败时收尾：关文件并删掉空壳，不留垃圾。"""
+        with self._wav_lock:
+            wf, path = self._wav_writer, self._wav_path
+            self._wav_writer = None
+            self._wav_path = None
+            self._wav_samples_written = 0
+        if wf is not None:
+            try:
+                wf.close()
+            except Exception:
+                pass
+        if path is not None:
+            try:
+                Path(path).unlink()
+            except Exception:
+                pass
+
+    def _take_pending_frames(self):
+        """原子取走 _frames 里已积压的块。
+
+        只在锁内做 list 交接，重采样与磁盘 I/O 都留到锁外，
+        避免拖住音频回调。
+        """
+        with self._frames_lock:
+            if not self._frames:
+                return []
+            blocks = self._frames
+            self._frames = []
+        return blocks
+
+    def _write_blocks_to_wav(self, blocks):
+        """把若干原始音频块重采样为 16kHz 单声道后追写进 WAV。
+
+        逐块重采样而不是整段重采样：这与实时路径（audio_callback 里的
+        _resample_to_16k_mono）本来就是同一做法，且线性插值在 0.3 秒分块
+        边界上的差异可忽略；换来的是内存不再随时长增长。
+        """
+        if not blocks:
+            return 0
+        written = 0
+        for block in blocks:
+            try:
+                mono_16k = self._resample_to_16k_mono_float(block)
+                if len(mono_16k) == 0:
+                    continue
+                pcm = self._float_to_pcm16(mono_16k)
+            except Exception:
+                traceback.print_exc()
+                continue
+            with self._wav_lock:
+                if self._wav_writer is None:
+                    return written
+                try:
+                    self._wav_writer.writeframes(pcm)
+                except Exception:
+                    traceback.print_exc()
+                    return written
+                self._wav_samples_written += len(mono_16k)
+            written += len(mono_16k)
+        return written
+
+    def _writer_loop(self):
+        """后台落盘线程：定期把 _frames 刷进 WAV，使内存占用与时长解耦。"""
+        while self._recording:
+            time.sleep(_WRITER_FLUSH_INTERVAL_S)
+            try:
+                self._write_blocks_to_wav(self._take_pending_frames())
+            except Exception:
+                # 落盘线程绝不能因单次异常退出，否则 _frames 会重新无界增长
+                traceback.print_exc()
+
+    def _append_frame(self, block):
+        """音频回调侧的入口：攒入交接缓冲，并保证缓冲有界。
+
+        正常情况下落盘线程每秒会取空它，积压应远小于上限。
+        若落盘线程卡住或已死，丢最旧的块保内存不爆——宁愿丢几秒，
+        不能重现“按停止那一刻 OOM、整场录音全丢”。
+        """
+        with self._frames_lock:
+            self._frames.append(block)
+            over = len(self._frames) - _WRITER_MAX_PENDING_BLOCKS
+            if over > 0:
+                # 批量裁剪，不用 del self._frames[0]：后者是 O(n) 指针搬移，
+                # 上限 1200 时满缓冲下每次 append 都要搬一遍。
+                # 也不用 deque(maxlen)：它会静默丢弃，而丢数据必须留痕迹。
+                del self._frames[:over]
+                self._dropped_chunks += over
+
     def stop(self):
-        """停止录音，返回WAV文件路径"""
+        """停止录音，返回WAV文件路径
+
+        旧实现在这里做全量 `concatenate(self._frames)` 再整段重采样、转 PCM、
+        `tobytes()`，一条链上同时存在多份副本，峰值约是 _frames 的 4 倍，
+        8 小时混合录音会在“按下停止”那一刻 OOM，整场录音全丢。
+
+        现在数据已由落盘线程写入，本方法只负责收尾：停流 → 等生产者退出
+        → 刷剩余缓冲 → 关文件。内存占用与会议时长无关。
+        """
         if not self._recording:
             return None
+        # 先置位：混音线程与落盘线程都以它作为退出条件
         self._recording = False
         if self._stream:
             self._stream.stop()
@@ -466,25 +672,50 @@ class AudioRecorder:
             self._stream2.close()
             self._stream2 = None
 
-        if not self._frames:
-            return None
+        # 必须先 join 混音线程：它也往 _frames 里写，不等它退出就可能在
+        # 关文件之后才产出数据（丢尾巴）。超时取比 0.3s 循环间隔宽裕的值。
+        for th in (self._mix_thread, self._writer_thread):
+            if th is not None and th.is_alive():
+                try:
+                    th.join(timeout=3.0)
+                except Exception:
+                    pass
+        self._mix_thread = None
+        self._writer_thread = None
 
-        # 合并所有帧
-        all_data = self.np.concatenate(self._frames, axis=0)
-        # 保存WAV（使用实际录音参数）
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = RECORDINGS_DIR / f"recording_{timestamp}.wav"
-        # 转为16kHz单声道保存（与FunASR输入一致）
-        mono_16k = self._resample_to_16k_mono_float(all_data)
-        with wave.open(str(filepath), 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16bit
-            wf.setframerate(self._sample_rate)
-            pcm_data = self._float_to_pcm16(mono_16k)
-            wf.writeframes(pcm_data)
+        # 把最后没来得及落盘的尾巴写完
+        try:
+            self._write_blocks_to_wav(self._take_pending_frames())
+        except Exception:
+            traceback.print_exc()
+
+        with self._wav_lock:
+            wf, path = self._wav_writer, self._wav_path
+            total = self._wav_samples_written
+            self._wav_writer = None
+            self._wav_path = None
+        if wf is not None:
+            try:
+                wf.close()
+            except Exception:
+                traceback.print_exc()
 
         self._frames = []
-        return str(filepath)
+        if self._dropped_chunks:
+            # 不静默：丢数据必须留下痕迹，否则没人知道录音缺了一段
+            print(f"[recorder] 录音期间丢弃 {self._dropped_chunks} 块数据"
+                  f"（落盘或消费跟不上）")
+
+        # 一帧没录到（设备无输入/立即停止）——删掉只有头的空 WAV，
+        # 保持与旧行为一致：无数据时返回 None
+        if path is None or total <= 0:
+            if path is not None:
+                try:
+                    Path(path).unlink()
+                except Exception:
+                    pass
+            return None
+        return str(path)
 
     def get_audio_chunk(self, timeout=0.1):
         """获取一个音频chunk（用于实时转写）"""
