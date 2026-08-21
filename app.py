@@ -195,17 +195,11 @@ class AudioRecorder:
                         mic_buf = self._mix_buffer.get('mic', self.np.array([], dtype=self.np.float32))
                         if len(sys_buf) == 0 and len(mic_buf) == 0:
                             continue
-                        # 对齐到最短长度
-                        mix_len = min(len(sys_buf), len(mic_buf))
-                        if mix_len > 0:
-                            mixed = sys_buf[:mix_len] * 0.7 + mic_buf[:mix_len] * 0.7  # 各降0.7避免削波
-                        elif len(mic_buf) > 0:
-                            mixed = mic_buf
-                        else:
-                            mixed = sys_buf
-                        # 保留未消费的数据
-                        self._mix_buffer['sys'] = sys_buf[mix_len:] if len(sys_buf) > mix_len else self.np.array([], dtype=self.np.float32)
-                        self._mix_buffer['mic'] = mic_buf[mix_len:] if len(mic_buf) > mix_len else self.np.array([], dtype=self.np.float32)
+                        mixed, new_sys, new_mic = self._drain_mix_buffers(sys_buf, mic_buf)
+                        self._mix_buffer['sys'] = new_sys
+                        self._mix_buffer['mic'] = new_mic
+                    if len(mixed) == 0:
+                        continue
                     # 保存原始帧（用于WAV文件）
                     self._frames.append(mixed.reshape(-1, 1))
                     # 重采样到16kHz送队列
@@ -215,7 +209,7 @@ class AudioRecorder:
                         mixed_16k = self.np.interp(self.np.linspace(0, len(mixed)-1, new_len), self.np.arange(len(mixed)), mixed)
                     else:
                         mixed_16k = mixed
-                    pcm = (mixed_16k * 32767).astype(self.np.int16).tobytes()
+                    pcm = self._float_to_pcm16(mixed_16k)
                     self._audio_queue.put(pcm)
                     if self._callback:
                         try: self._callback(pcm)
@@ -328,11 +322,45 @@ class AudioRecorder:
                 self._recording = False
                 raise e2
 
+    def _float_to_pcm16(self, samples):
+        """float32 [-1,1] → 16bit PCM bytes
+
+        必须先 clip：混音后幅度可能 >1.0（两路各 *0.7 相加最大 1.4），
+        直接 astype(np.int16) 是**整数回绕**而非饱和，0.9+0.9 会变成 -24250，
+        最响处翻转成反相尖峰（爆音），同时污染 ASR 输入。
+        """
+        clipped = self.np.clip(samples, -1.0, 1.0)
+        return (clipped * 32767).astype(self.np.int16).tobytes()
+
+    def _drain_mix_buffers(self, sys_buf, mic_buf):
+        """混合两路缓冲，返回 (mixed, 剩余sys, 剩余mic)
+
+        关键：**输出多少就必须消费多少**。旧实现在只有单路有数据时
+        （mix_len==0）整段输出了该路，却按 mix_len==0 回写缓冲，
+        等于一个采样都没消费 → 缓冲无限增长、同段音频每 300ms 重复输出
+        一次（500 采样进、1500 采样出），转写结果出现大段复读。
+        """
+        empty = self.np.array([], dtype=self.np.float32)
+        mix_len = min(len(sys_buf), len(mic_buf))
+        if mix_len > 0:
+            # 两路都有：对齐到最短长度叠加，各降 0.7 压低削波概率
+            mixed = sys_buf[:mix_len] * 0.7 + mic_buf[:mix_len] * 0.7
+            used_sys = used_mic = mix_len
+        elif len(mic_buf) > 0:
+            # 只有麦克风有数据（系统未播放声音时很常见）
+            mixed = mic_buf
+            used_sys, used_mic = 0, len(mic_buf)
+        else:
+            mixed = sys_buf
+            used_sys, used_mic = len(sys_buf), 0
+        new_sys = sys_buf[used_sys:] if used_sys < len(sys_buf) else empty
+        new_mic = mic_buf[used_mic:] if used_mic < len(mic_buf) else empty
+        return mixed, new_sys, new_mic
+
     def _resample_to_16k_mono(self, audio_data):
         """将录音数据重采样为16kHz单声道16bit PCM bytes"""
         mono_16k = self._resample_to_16k_mono_float(audio_data)
-        pcm = (mono_16k * 32767).astype(self.np.int16).tobytes()
-        return pcm
+        return self._float_to_pcm16(mono_16k)
 
     def _resample_to_16k_mono_float(self, audio_data):
         """将录音数据重采样为16kHz单声道float32 numpy array"""
@@ -384,7 +412,7 @@ class AudioRecorder:
             wf.setnchannels(1)
             wf.setsampwidth(2)  # 16bit
             wf.setframerate(self._sample_rate)
-            pcm_data = (mono_16k * 32767).astype(self.np.int16).tobytes()
+            pcm_data = self._float_to_pcm16(mono_16k)
             wf.writeframes(pcm_data)
 
         self._frames = []
