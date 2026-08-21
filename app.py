@@ -2395,6 +2395,7 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
             last_text_time = time.time()    # 上次收到新文字时间
             pause_threshold = 1.5   # 停顿超过1.5秒自动分段
             punc_running = False    # 标点线程是否正在运行
+            punc_thread = None      # 标点线程引用，停止时 join 避免并发 add_punctuation
 
             # 实时热词：流式模型不吃 hotword 参数，只能在文本层纠
             hot_words = state.config.get("hot_words", "")
@@ -2420,7 +2421,9 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                     if time.time() - last_text_time >= pause_threshold and not punctuated.endswith("\n"):
                         punctuated += "\n"
                     display_text = punctuated
-                    push("transcript_partial", {"full_text": display_text})
+                    # 停止后不再推送，避免用旧文本覆盖最终结果
+                    if state.is_realtime:
+                        push("transcript_partial", {"full_text": display_text})
                 finally:
                     punc_running = False
 
@@ -2456,7 +2459,8 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                     now = time.time()
                     if raw_text and now - last_text_time >= 1.5 and not punc_running:
                         punc_running = True
-                        threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True).start()
+                        punc_thread = threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True)
+                        punc_thread.start()
                     continue
 
                 try:
@@ -2492,7 +2496,12 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                 now = time.time()
                 if raw_text and now - last_text_time >= 1.5 and not punc_running:
                     punc_running = True
-                    threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True).start()
+                    punc_thread = threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True)
+                    punc_thread.start()
+
+            # 等标点线程结束，避免与最终 flush 并发调 add_punctuation（非线程安全）
+            if punc_thread is not None and punc_thread.is_alive():
+                punc_thread.join(timeout=10)
 
             # 最终flush - 处理buffer中剩余数据
             try:
