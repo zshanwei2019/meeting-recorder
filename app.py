@@ -21,10 +21,12 @@ from datetime import datetime
 
 # 拼音级热词纠正依赖 pypinyin + rapidfuzz，缺失时自动降级为仅解码期热词偏置
 try:
-    import pypinyin  # noqa: F401
-    import rapidfuzz  # noqa: F401
+    from pypinyin import lazy_pinyin
+    from rapidfuzz import fuzz as _rf_fuzz
     _POSTPROCESS_HOTWORDS_AVAILABLE = True
 except ImportError:
+    lazy_pinyin = None
+    _rf_fuzz = None
     _POSTPROCESS_HOTWORDS_AVAILABLE = False
 
 # ─── 配置 ───
@@ -1961,6 +1963,34 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
             pause_threshold = 1.5   # 停顿超过1.5秒自动分段
             punc_running = False    # 标点线程是否正在运行
 
+            # 实时热词：流式模型不吃 hotword 参数，只能在文本层纠
+            hot_words = state.config.get("hot_words", "")
+            hot_word_list = FunASRTranscriber._parse_hot_words(hot_words)
+            if hot_word_list:
+                if _POSTPROCESS_HOTWORDS_AVAILABLE:
+                    push("log", {"message": f"实时热词纠正已启用（{len(hot_word_list)}个）"})
+                else:
+                    push("log", {"message": "已填热词但未安装 pypinyin/rapidfuzz，实时热词纠正已跳过"})
+
+            # 定时标点恢复（异步线程，不阻塞主循环）
+            # 必须定义在循环外：旧代码把它定在 `if audio_data is None:` 分支内，
+            # 却在分支外调用 —— 若首次循环就取到音频（不进那个分支），
+            # 会直接 NameError。
+            def _async_punctuate(text_to_punctuate):
+                nonlocal display_text, punc_running
+                try:
+                    punctuated = state.funasr.add_punctuation(text_to_punctuate)
+                    # 热词纠正放在加标点之后：标点能隔开句子，避免跨句误匹配
+                    if hot_word_list:
+                        punctuated = correct_hotwords_by_pinyin(punctuated, hot_word_list)
+                    # 停顿分段
+                    if time.time() - last_text_time >= pause_threshold and not punctuated.endswith("\n"):
+                        punctuated += "\n"
+                    display_text = punctuated
+                    push("transcript_partial", {"full_text": display_text})
+                finally:
+                    punc_running = False
+
             while state.is_realtime:
                 audio_data = state.recorder.get_audio_chunk(timeout=0.5)
                 if audio_data is None:
@@ -1982,23 +2012,9 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                                     last_text_time = time.time()
                         except Exception as e:
                             push("log", {"message": f"FunASR处理错误: {str(e)}"})
-                    # 定时标点恢复（异步线程，不阻塞主循环）
-                    def _async_punctuate(text_to_punctuate):
-                        nonlocal display_text, punc_running
-                        try:
-                            punctuated = state.funasr.add_punctuation(text_to_punctuate)
-                            # 停顿分段
-                            if time.time() - last_text_time >= pause_threshold and not punctuated.endswith("\n"):
-                                punctuated += "\n"
-                            display_text = punctuated
-                            push("transcript_partial", {"full_text": display_text})
-                        finally:
-                            punc_running = False
-
                     now = time.time()
                     if raw_text and now - last_text_time >= 1.5 and not punc_running:
                         punc_running = True
-                        t = time.time() - last_text_time
                         threading.Thread(target=_async_punctuate, args=(raw_text,), daemon=True).start()
                     continue
 
@@ -2072,6 +2088,8 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
             # 最终标点恢复 + 分段
             if raw_text:
                 display_text = state.funasr.add_punctuation(raw_text)
+                if hot_word_list:
+                    display_text = correct_hotwords_by_pinyin(display_text, hot_word_list)
                 state.set_transcript(display_text)
             else:
                 state.set_transcript("")
@@ -2128,6 +2146,119 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
         push("status", "就绪")
         state.is_realtime = False
         traceback.print_exc()
+
+
+# 实时流式模型（paraformer-online）不支持 hotword 参数，只能在文本层做热词纠正。
+# 单字热词歧义太大（任意同音字都会命中），不参与拼音纠正。
+_HOTWORD_MIN_LEN = 2
+_CHAR_PINYIN_CACHE = {}
+
+
+def _char_pinyin(ch):
+    """单字拼音（带缓存）。
+
+    不能直接对整段文本调 lazy_pinyin：它会把连续非汉字合并成一项
+    （"abc中文" -> ['abc','zhong','wen']），导致字与音节不再一一对应，
+    后续按下标切窗全会错位。改为逐字求拼音，结果缓存复用。
+    """
+    if ch in _CHAR_PINYIN_CACHE:
+        return _CHAR_PINYIN_CACHE[ch]
+    try:
+        got = lazy_pinyin(ch)
+        syl = (got[0] if got else ch).lower()
+    except Exception:
+        syl = ch.lower()
+    _CHAR_PINYIN_CACHE[ch] = syl
+    return syl
+
+
+def _pinyin_syllables(s):
+    """逐字拼音音节列表，与字符一一对应。"""
+    return [_char_pinyin(c) for c in s]
+
+
+# 不允许跨过这些字符做纠正（跨句纠正几乎必然是误匹配）
+_HOTWORD_STOP_CHARS = set(" \t\r\n。！？，、；：…—“”‘’（）.!?,;:")
+
+
+def correct_hotwords_by_pinyin(text, hot_words, threshold=0.85):
+    """基于拼音相似度把转写文本里的近音错词纠正为热词。
+
+    用于实时转写：paraformer-online 本身不接受 hotword 解码偏置，
+    FunASR 的 postprocess_hotwords 也只在 AutoModel.generate 路径上生效，
+    流式逐块 generate 拿不到。因此在文本层自己做一层。
+
+    算法：建"音节 -> 出现位置"倒排，只在热词某个音节真实出现过的位置
+    尝试开窗，避免对全文每个位置 x 每个热词暴力比对（长会议几万字会卡）。
+    窗长取 len(w)、len(w)±1，容忍 ASR 多字/少字。命中后取不重叠区间，
+    精确匹配优先于模糊匹配，长热词优先于短热词。
+
+    依赖缺失（pypinyin/rapidfuzz）或无热词时原文返回，不报错。
+    """
+    words = FunASRTranscriber._parse_hot_words(hot_words)
+    if not text or not words or not _POSTPROCESS_HOTWORDS_AVAILABLE:
+        return text
+    words = [w for w in words if len(w) >= _HOTWORD_MIN_LEN]
+    if not words:
+        return text
+
+    text_syls = _pinyin_syllables(text)
+    n = len(text)
+
+    # 音节倒排：只在可能命中的位置尝试，把复杂度从 O(n×|words|) 降下来
+    syl_positions = {}
+    for idx, syl in enumerate(text_syls):
+        syl_positions.setdefault(syl, []).append(idx)
+
+    # 长热词优先，防止短热词先吃掉长热词的一部分
+    words.sort(key=len, reverse=True)
+
+    matches = []  # (start, end, word, score, word_len)
+    seen_spans = set()
+    for w in words:
+        w_syls = _pinyin_syllables(w)
+        w_key = "".join(w_syls)
+        wl = len(w)
+        starts = set()
+        for k, syl in enumerate(w_syls):
+            for p in syl_positions.get(syl, ()):
+                s = p - k
+                if 0 <= s < n:
+                    starts.add(s)
+        for s in sorted(starts):
+            for span in (wl, wl + 1, wl - 1):
+                if span < _HOTWORD_MIN_LEN or s + span > n:
+                    continue
+                key = (s, span, w)
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+                seg = text[s:s + span]
+                if any(c in _HOTWORD_STOP_CHARS for c in seg):
+                    continue
+                if seg == w:
+                    matches.append((s, s + span, w, 1.0, wl))
+                    break
+                score = _rf_fuzz.ratio("".join(text_syls[s:s + span]), w_key) / 100.0
+                if score >= threshold:
+                    matches.append((s, s + span, w, score, wl))
+                    break
+
+    if not matches:
+        return text
+
+    # 精确匹配 > 高分 > 长热词；同位置只采纳一个，区间不重叠
+    matches.sort(key=lambda m: (m[0], -m[3], -m[4]))
+    out = []
+    cursor = 0
+    for start, end, word, _score, _wl in matches:
+        if start < cursor:
+            continue
+        out.append(text[cursor:start])
+        out.append(word)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 # ─── 领域化处理 ───
