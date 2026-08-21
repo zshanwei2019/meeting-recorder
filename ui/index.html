@@ -1013,9 +1013,9 @@ function onRealtimeStatus(data) {
     // 禁用录音按钮
     document.getElementById('btnRecord').disabled = true;
     document.getElementById('btnRecord').style.opacity = '0.4';
-    pauseBtn.style.display = '';
-    pauseBtn.dataset.paused = '0';
-    document.getElementById('pauseText').textContent = '暂停';
+    // ready 时模型刚加载完、录音还没启动，不显示暂停按钮；
+    // 等 recording 状态再显示，否则 start() 会重置 _paused 导致暂停白按
+    pauseBtn.style.display = 'none';
   } else if (status === 'diarizing') {
     // 说话人分离中：保持按钮active但更新文字提示
     isRealtime = true;
