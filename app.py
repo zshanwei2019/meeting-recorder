@@ -432,7 +432,6 @@ class AudioRecorder:
                     self._mix_buffer['mic'] = self.np.concatenate([buf, mono])
 
             # 混音线程：定期从两个buffer取数据叠加
-            import threading
             def mix_worker():
                 import time as _time
                 while self._recording:
