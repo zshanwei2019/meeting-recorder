@@ -7,6 +7,7 @@
 """
 import sys
 import os
+import re
 import json
 import time
 import wave
@@ -30,6 +31,62 @@ TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 def ensure_dirs():
     for d in [DATA_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
+
+# ─── 输出路径安全 ───
+# 可保存的转写格式，与前端 saveFormat 下拉保持一致。
+# fmt 直接拼进文件后缀，不限定白名单就能落盘 .bat / .ps1 / .html 等
+# 可执行或可被双击打开的文件。
+ALLOWED_SAVE_FORMATS = ("txt", "docx", "srt", "vtt", "json")
+
+# 文件名字符白名单：中文、大小写字母、数字、点、下划线、连字符。
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff._-]")
+_MAX_FILENAME_LEN = 120
+# Windows 盘符前缀（仅开头单字母 + 冒号，如 "C:"）
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+# Windows 保留设备名（带任意扩展名也不可用）
+_WIN_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+
+def _sanitize_filename(filename, fallback="transcript"):
+    """把前端传来的文件名压成纯文件名，杜绝路径穿越。
+
+    前端传什么都不能影响落盘位置：目录成分、盘符、`..` 全部丢掉。
+    """
+    name = str(filename or "").strip()
+    # 只取最后一段，丢掉任何目录成分（同时兼容 / 与 \）
+    name = name.replace("\\", "/").split("/")[-1]
+    # 剔掉盘符前缀（"C:evil" 这种相对盘符引用）。
+    # 注意不能用 split(":")[-1]：那会把所有冒号都当盘符处理，
+    # "10:30会议" 会静默丢成 "30会议"。其余冒号交给字符白名单换成 _。
+    name = _DRIVE_PREFIX.sub("", name)
+    name = _UNSAFE_FILENAME_CHARS.sub("_", name)
+    # 前导点会产生隐藏文件；"." / ".." 必须拒掉
+    name = name.lstrip(".").strip("_ ")
+    if not name or set(name) <= {"."}:
+        name = fallback
+    if len(name) > _MAX_FILENAME_LEN:
+        name = name[:_MAX_FILENAME_LEN]
+    if name.split(".")[0].upper() in _WIN_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
+
+
+def _resolve_output_path(base_dir, filename, ext, fallback="transcript"):
+    """在 base_dir 下构造安全输出路径。
+
+    除了净化文件名，还对 resolve 后的结果做一次归属校验——净化函数
+    万一有缺口，这里仍能拦住，而不是默默写到目录外。
+    """
+    safe = _sanitize_filename(filename, fallback)
+    base = Path(base_dir).resolve()
+    path = (base / f"{safe}.{ext}").resolve()
+    if path.parent != base:
+        raise ValueError(f"非法输出路径: {filename!r}")
+    return path
 
 # ─── 默认配置 ───
 DEFAULT_CONFIG = {
@@ -1143,9 +1200,22 @@ def create_app():
             if not text.strip():
                 await state.push_event_sync(ws, "log", {"message": "没有内容可保存"})
                 return
+            # 格式白名单：fmt 直接做文件后缀，不限定就能落盘 .bat/.ps1/.html
+            if fmt not in ALLOWED_SAVE_FORMATS:
+                await state.push_event_sync(ws, "log", {
+                    "message": f"不支持的保存格式: {fmt}（可选 {'/'.join(ALLOWED_SAVE_FORMATS)}）"
+                })
+                return
+            # 文件名来自前端，必须净化 + 归属校验，否则 "../../../evil"
+            # 会直接写到 transcripts 目录外
+            try:
+                filepath = _resolve_output_path(TRANSCRIPTS_DIR, filename, fmt)
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                await state.push_event_sync(ws, "log", {"message": f"保存路径无效: {e}"})
+                return
             if fmt == "docx":
                 # Word格式输出
-                filepath = TRANSCRIPTS_DIR / f"{filename}.docx"
                 try:
                     # 计算录音时长：优先从sentence_info推算，否则从录音时间
                     recording_duration_s = None
@@ -1161,9 +1231,14 @@ def create_app():
                 except Exception as e:
                     await state.push_event_sync(ws, "log", {"message": f"Word保存失败: {str(e)}"})
             else:
-                filepath = TRANSCRIPTS_DIR / f"{filename}.{fmt}"
-                filepath.write_text(text, encoding="utf-8")
-                await state.push_event_sync(ws, "log", {"message": f"已保存到 {filepath}"})
+                # 这里原本没有 try/except：磁盘满、权限不足、非法文件名都会抛
+                # 异常，而它会一路冒泡到 websocket_endpoint 的兜底 except，
+                # 把 state.websocket 置空 → UI 直接失联，用户只看到连接断。
+                try:
+                    filepath.write_text(text, encoding="utf-8")
+                    await state.push_event_sync(ws, "log", {"message": f"已保存到 {filepath}"})
+                except Exception as e:
+                    await state.push_event_sync(ws, "log", {"message": f"保存失败: {str(e)}"})
 
         elif action == "copy_transcript":
             await state.push_event_sync(ws, "log", {"message": "已复制到剪贴板"})
