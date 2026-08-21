@@ -7,6 +7,7 @@
 """
 import sys
 import os
+import re
 import json
 import re
 import time
@@ -41,6 +42,62 @@ TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 def ensure_dirs():
     for d in [DATA_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
+
+# ─── 输出路径安全 ───
+# 可保存的转写格式，与前端 saveFormat 下拉保持一致。
+# fmt 直接拼进文件后缀，不限定白名单就能落盘 .bat / .ps1 / .html 等
+# 可执行或可被双击打开的文件。
+ALLOWED_SAVE_FORMATS = ("txt", "docx", "srt", "vtt", "json")
+
+# 文件名字符白名单：中文、大小写字母、数字、点、下划线、连字符。
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff._-]")
+_MAX_FILENAME_LEN = 120
+# Windows 盘符前缀（仅开头单字母 + 冒号，如 "C:"）
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+# Windows 保留设备名（带任意扩展名也不可用）
+_WIN_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+
+def _sanitize_filename(filename, fallback="transcript"):
+    """把前端传来的文件名压成纯文件名，杜绝路径穿越。
+
+    前端传什么都不能影响落盘位置：目录成分、盘符、`..` 全部丢掉。
+    """
+    name = str(filename or "").strip()
+    # 只取最后一段，丢掉任何目录成分（同时兼容 / 与 \）
+    name = name.replace("\\", "/").split("/")[-1]
+    # 剔掉盘符前缀（"C:evil" 这种相对盘符引用）。
+    # 注意不能用 split(":")[-1]：那会把所有冒号都当盘符处理，
+    # "10:30会议" 会静默丢成 "30会议"。其余冒号交给字符白名单换成 _。
+    name = _DRIVE_PREFIX.sub("", name)
+    name = _UNSAFE_FILENAME_CHARS.sub("_", name)
+    # 前导点会产生隐藏文件；"." / ".." 必须拒掉
+    name = name.lstrip(".").strip("_ ")
+    if not name or set(name) <= {"."}:
+        name = fallback
+    if len(name) > _MAX_FILENAME_LEN:
+        name = name[:_MAX_FILENAME_LEN]
+    if name.split(".")[0].upper() in _WIN_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
+
+
+def _resolve_output_path(base_dir, filename, ext, fallback="transcript"):
+    """在 base_dir 下构造安全输出路径。
+
+    除了净化文件名，还对 resolve 后的结果做一次归属校验——净化函数
+    万一有缺口，这里仍能拦住，而不是默默写到目录外。
+    """
+    safe = _sanitize_filename(filename, fallback)
+    base = Path(base_dir).resolve()
+    path = (base / f"{safe}.{ext}").resolve()
+    if path.parent != base:
+        raise ValueError(f"非法输出路径: {filename!r}")
+    return path
 
 # ─── 默认配置 ───
 DEFAULT_CONFIG = {
@@ -206,17 +263,11 @@ class AudioRecorder:
                         mic_buf = self._mix_buffer.get('mic', self.np.array([], dtype=self.np.float32))
                         if len(sys_buf) == 0 and len(mic_buf) == 0:
                             continue
-                        # 对齐到最短长度
-                        mix_len = min(len(sys_buf), len(mic_buf))
-                        if mix_len > 0:
-                            mixed = sys_buf[:mix_len] * 0.7 + mic_buf[:mix_len] * 0.7  # 各降0.7避免削波
-                        elif len(mic_buf) > 0:
-                            mixed = mic_buf
-                        else:
-                            mixed = sys_buf
-                        # 保留未消费的数据
-                        self._mix_buffer['sys'] = sys_buf[mix_len:] if len(sys_buf) > mix_len else self.np.array([], dtype=self.np.float32)
-                        self._mix_buffer['mic'] = mic_buf[mix_len:] if len(mic_buf) > mix_len else self.np.array([], dtype=self.np.float32)
+                        mixed, new_sys, new_mic = self._drain_mix_buffers(sys_buf, mic_buf)
+                        self._mix_buffer['sys'] = new_sys
+                        self._mix_buffer['mic'] = new_mic
+                    if len(mixed) == 0:
+                        continue
                     # 保存原始帧（用于WAV文件）
                     self._frames.append(mixed.reshape(-1, 1))
                     # 重采样到16kHz送队列
@@ -226,7 +277,7 @@ class AudioRecorder:
                         mixed_16k = self.np.interp(self.np.linspace(0, len(mixed)-1, new_len), self.np.arange(len(mixed)), mixed)
                     else:
                         mixed_16k = mixed
-                    pcm = (mixed_16k * 32767).astype(self.np.int16).tobytes()
+                    pcm = self._float_to_pcm16(mixed_16k)
                     self._audio_queue.put(pcm)
                     if self._callback:
                         try: self._callback(pcm)
@@ -339,11 +390,45 @@ class AudioRecorder:
                 self._recording = False
                 raise e2
 
+    def _float_to_pcm16(self, samples):
+        """float32 [-1,1] → 16bit PCM bytes
+
+        必须先 clip：混音后幅度可能 >1.0（两路各 *0.7 相加最大 1.4），
+        直接 astype(np.int16) 是**整数回绕**而非饱和，0.9+0.9 会变成 -24250，
+        最响处翻转成反相尖峰（爆音），同时污染 ASR 输入。
+        """
+        clipped = self.np.clip(samples, -1.0, 1.0)
+        return (clipped * 32767).astype(self.np.int16).tobytes()
+
+    def _drain_mix_buffers(self, sys_buf, mic_buf):
+        """混合两路缓冲，返回 (mixed, 剩余sys, 剩余mic)
+
+        关键：**输出多少就必须消费多少**。旧实现在只有单路有数据时
+        （mix_len==0）整段输出了该路，却按 mix_len==0 回写缓冲，
+        等于一个采样都没消费 → 缓冲无限增长、同段音频每 300ms 重复输出
+        一次（500 采样进、1500 采样出），转写结果出现大段复读。
+        """
+        empty = self.np.array([], dtype=self.np.float32)
+        mix_len = min(len(sys_buf), len(mic_buf))
+        if mix_len > 0:
+            # 两路都有：对齐到最短长度叠加，各降 0.7 压低削波概率
+            mixed = sys_buf[:mix_len] * 0.7 + mic_buf[:mix_len] * 0.7
+            used_sys = used_mic = mix_len
+        elif len(mic_buf) > 0:
+            # 只有麦克风有数据（系统未播放声音时很常见）
+            mixed = mic_buf
+            used_sys, used_mic = 0, len(mic_buf)
+        else:
+            mixed = sys_buf
+            used_sys, used_mic = len(sys_buf), 0
+        new_sys = sys_buf[used_sys:] if used_sys < len(sys_buf) else empty
+        new_mic = mic_buf[used_mic:] if used_mic < len(mic_buf) else empty
+        return mixed, new_sys, new_mic
+
     def _resample_to_16k_mono(self, audio_data):
         """将录音数据重采样为16kHz单声道16bit PCM bytes"""
         mono_16k = self._resample_to_16k_mono_float(audio_data)
-        pcm = (mono_16k * 32767).astype(self.np.int16).tobytes()
-        return pcm
+        return self._float_to_pcm16(mono_16k)
 
     def _resample_to_16k_mono_float(self, audio_data):
         """将录音数据重采样为16kHz单声道float32 numpy array"""
@@ -395,7 +480,7 @@ class AudioRecorder:
             wf.setnchannels(1)
             wf.setsampwidth(2)  # 16bit
             wf.setframerate(self._sample_rate)
-            pcm_data = (mono_16k * 32767).astype(self.np.int16).tobytes()
+            pcm_data = self._float_to_pcm16(mono_16k)
             wf.writeframes(pcm_data)
 
         self._frames = []
@@ -1192,9 +1277,22 @@ def create_app():
             if not text.strip():
                 await state.push_event_sync(ws, "log", {"message": "没有内容可保存"})
                 return
+            # 格式白名单：fmt 直接做文件后缀，不限定就能落盘 .bat/.ps1/.html
+            if fmt not in ALLOWED_SAVE_FORMATS:
+                await state.push_event_sync(ws, "log", {
+                    "message": f"不支持的保存格式: {fmt}（可选 {'/'.join(ALLOWED_SAVE_FORMATS)}）"
+                })
+                return
+            # 文件名来自前端，必须净化 + 归属校验，否则 "../../../evil"
+            # 会直接写到 transcripts 目录外
+            try:
+                filepath = _resolve_output_path(TRANSCRIPTS_DIR, filename, fmt)
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                await state.push_event_sync(ws, "log", {"message": f"保存路径无效: {e}"})
+                return
             if fmt == "docx":
                 # Word格式输出
-                filepath = TRANSCRIPTS_DIR / f"{filename}.docx"
                 try:
                     # 计算录音时长：优先从sentence_info推算，否则从录音时间
                     recording_duration_s = None
@@ -1210,9 +1308,14 @@ def create_app():
                 except Exception as e:
                     await state.push_event_sync(ws, "log", {"message": f"Word保存失败: {str(e)}"})
             else:
-                filepath = TRANSCRIPTS_DIR / f"{filename}.{fmt}"
-                filepath.write_text(text, encoding="utf-8")
-                await state.push_event_sync(ws, "log", {"message": f"已保存到 {filepath}"})
+                # 这里原本没有 try/except：磁盘满、权限不足、非法文件名都会抛
+                # 异常，而它会一路冒泡到 websocket_endpoint 的兜底 except，
+                # 把 state.websocket 置空 → UI 直接失联，用户只看到连接断。
+                try:
+                    filepath.write_text(text, encoding="utf-8")
+                    await state.push_event_sync(ws, "log", {"message": f"已保存到 {filepath}"})
+                except Exception as e:
+                    await state.push_event_sync(ws, "log", {"message": f"保存失败: {str(e)}"})
 
         elif action == "copy_transcript":
             await state.push_event_sync(ws, "log", {"message": "已复制到剪贴板"})
@@ -1306,6 +1409,25 @@ def _format_timestamp_compact(ms):
     if h > 0:
         return f"{h:02d}:{m:02d}:{sec:02d}"
     return f"{m:02d}:{sec:02d}"
+
+def _format_duration_cn(total_seconds):
+    """秒转中文时长：'1时2分3秒' / '2分3秒' / '3秒'
+
+    说话人发言时长动辄几十分钟，裸秒数（如 '2400.0秒'）无法快速判读。
+    """
+    if total_seconds is None:
+        return ""
+    total = int(total_seconds)
+    if total < 0:
+        total = 0
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h}时{m}分{s}秒"
+    if m > 0:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
 
 def _smart_paragraph_segment(sentence_info, gap_threshold=1500, long_pause_threshold=3000):
     """智能分段：将sentence_info合并为段落结构
@@ -1445,15 +1567,7 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
     cell_right.text = ""
     p_right = cell_right.paragraphs[0]
     if recording_duration_s is not None:
-        dur_h = int(recording_duration_s // 3600)
-        dur_m = int((recording_duration_s % 3600) // 60)
-        dur_s = int(recording_duration_s % 60)
-        if dur_h > 0:
-            dur_str = f"{dur_h}时{dur_m}分{dur_s}秒"
-        elif dur_m > 0:
-            dur_str = f"{dur_m}分{dur_s}秒"
-        else:
-            dur_str = f"{dur_s}秒"
+        dur_str = _format_duration_cn(recording_duration_s)
         run_l1 = p_right.add_run("录音时长：")
         run_l1.font.size = Pt(10)
         run_l1.font.name = "宋体"
@@ -1493,9 +1607,13 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
         run_v2.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
     # 去掉表格边框
+    # 注意：OOXML 规定 w:tblPr 的子元素**必须有序**，w:tblBorders 要排在
+    # w:tblLayout / w:tblLook 之前。直接 append 会得到
+    # [tblW, tblLayout, tblLook, tblBorders] 这种非法顺序，Word 可能直接
+    # 忽略该元素，甚至提示文档需要修复。改用 insert_element_before 按
+    # schema 顺序插入。
     from docx.oxml import OxmlElement
-    tbl = meta_table._tbl
-    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement('w:tblPr')
+    tblPr = meta_table._tbl.tblPr
     borders = OxmlElement('w:tblBorders')
     for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
         border = OxmlElement(f'w:{border_name}')
@@ -1504,7 +1622,9 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
         border.set(qn('w:space'), '0')
         border.set(qn('w:color'), 'auto')
         borders.append(border)
-    tblPr.append(borders)
+    tblPr.insert_element_before(
+        borders, 'w:shd', 'w:tblLayout', 'w:tblCellMar', 'w:tblLook'
+    )
 
     doc.add_paragraph()  # 空行
 
@@ -1565,7 +1685,7 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
                         r.font.name = "宋体"
                         r._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
                 dur = spk_stats[spk_id]["duration_ms"] / 1000
-                row[2].text = f"{dur:.1f}秒"
+                row[2].text = _format_duration_cn(dur)
                 for p in row[2].paragraphs:
                     for r in p.runs:
                         r.font.size = Pt(10)
@@ -1597,8 +1717,16 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
                 int(color_hex[:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
             )
             
-            # 合并同一段内的句子文本
-            merged_text = "".join(s["text"] for s in sentences)
+            # 段落文本直接用 _smart_paragraph_segment 拼好的结果。
+            # 不能在这里重新 join sentences：分段函数会在前句末尾无标点时
+            # 补上“，”衔接，重新 join 会把这层处理全部丢掉，
+            # 得到“今天讨论三件事第一是回款”这种粘连的句子。
+            merged_text = para.get("text") or "".join(s["text"] for s in sentences)
+
+            # 词级时间戳模式：逐句分行列出，与整段正文**二选一**。
+            # 旧写法先输出整段正文、又附一行逐句带时间戳的文本，
+            # 导致每句话在文档里**出现两次**（已实测确认）。
+            per_sentence = timestamp_precision == "word" and len(sentences) > 1
             
             # 创建段落
             p = doc.add_paragraph()
@@ -1626,28 +1754,31 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
             time_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
             time_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
             
-            # 发言内容（首行缩进）
-            text_run = p.add_run(f"  {merged_text}")
-            text_run.font.size = Pt(12)
-            text_run.font.name = "宋体"
-            text_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-            p.paragraph_format.first_line_indent = Cm(0.74)  # 两字符缩进
+            # 发言内容（首行缩进）。词级模式下改为逐句分行，不在此处输出整段。
+            if not per_sentence:
+                text_run = p.add_run(f"  {merged_text}")
+                text_run.font.size = Pt(12)
+                text_run.font.name = "宋体"
+                text_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+                p.paragraph_format.first_line_indent = Cm(0.74)  # 两字符缩进
             p.paragraph_format.space_after = Pt(6)
-            
-            # 词级时间戳模式：在段落后附加每句时间戳
-            if timestamp_precision == "word" and len(sentences) > 1:
-                ts_p = doc.add_paragraph()
-                ts_p.paragraph_format.space_before = Pt(0)
-                ts_p.paragraph_format.space_after = Pt(6)
-                ts_parts = []
+
+            # 词级时间戳模式：每句单独一行，行首带时间戳
+            if per_sentence:
                 for s in sentences:
-                    ts_parts.append(f"[{_format_timestamp(s['start'])}] {s['text']}")
-                ts_run = ts_p.add_run("　　".join(ts_parts))
-                ts_run.font.size = Pt(9)
-                ts_run.font.name = "宋体"
-                ts_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-                ts_run.font.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
-                ts_run.font.italic = True
+                    sp = doc.add_paragraph()
+                    sp.paragraph_format.space_before = Pt(0)
+                    sp.paragraph_format.space_after = Pt(2)
+                    sp.paragraph_format.left_indent = Cm(0.74)
+                    ts_run = sp.add_run(f"[{_format_timestamp(s['start'])}] ")
+                    ts_run.font.size = Pt(9)
+                    ts_run.font.name = "宋体"
+                    ts_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+                    ts_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                    body_run = sp.add_run(s["text"])
+                    body_run.font.size = Pt(12)
+                    body_run.font.name = "宋体"
+                    body_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
     else:
         # ── 普通模式：纯文本分段输出 ──
