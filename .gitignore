@@ -33,8 +33,11 @@ benchmark/
 
 # 本地配置（可能含 API key）
 config.json
-startup_error.log
+# 日志：startup_error.log 由启动脚本写在仓库外，
+# 但开发时常在仓库内产生临时日志，一并拦掉。
+*.log
 
 # 虚拟环境
 .venv/
 venv/
+env/
