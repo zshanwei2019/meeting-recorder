@@ -2210,20 +2210,21 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
 
         else:
             # FunASR 实时转写
-            # 捕获底层回调发出的具体错误（模型加载失败原因），
-            # 不要再用泛化的“FunASR模型加载失败”覆盖掉详情。
-            load_error = {"msg": None}
+            # 模型加载失败的具体原因由底层回调（funasr_status）直接 push 给前端，
+            # 这里不再重复 push，否则错误信息会被层层包裹成三层前缀。
+            load_cb_state = {"error_emitted": False}
 
             def funasr_status(status, msg):
                 if status == "error":
-                    load_error["msg"] = msg
+                    load_cb_state["error_emitted"] = True
                 push("realtime_status", {"status": status, "message": msg})
                 if status == "ready":
                     push("status", "实时转写中")
 
             if not state.funasr.load_model("iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online", status_callback=funasr_status):
-                detail = load_error["msg"] or "未知原因（请查看控制台日志）"
-                push("realtime_status", {"status": "error", "message": f"实时模型加载失败：{detail}"})
+                # 回调已经 push 过带详情的 error；若回调没给（极端情况），兜底一条。
+                if not load_cb_state["error_emitted"]:
+                    push("realtime_status", {"status": "error", "message": "实时模型加载失败，请查看控制台日志"})
                 push("status", "就绪")
                 state.is_realtime = False
                 return
