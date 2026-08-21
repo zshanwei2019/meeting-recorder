@@ -9,7 +9,6 @@ import sys
 import os
 import re
 import json
-import re
 import time
 import wave
 import queue
@@ -1420,28 +1419,35 @@ def create_app():
                 await state.push_event_sync(ws, "status", "就绪")
 
         elif action == "stop_recording":
+            filepath = None
             try:
                 filepath = state.recorder.stop()
+            except Exception as e:
+                await state.push_event_sync(ws, "log", {"message": f"停止录音失败: {str(e)}"})
+            finally:
+                # 必须无条件复位：旧实现把这两行放在 stop() 之后的 try 体内，
+                # recorder.stop() 一抛异常就全部跳过，而 except 分支也不复位
+                # → is_recording 永久卡在 True，前端按钮死在「录音中」，只能重启进程。
+                # 录音确实已停（流已关或已不可用），状态就必须跟上。
                 state.is_recording = False
                 state.recording_start = None
                 await state.push_event_sync(ws, "recording_changed", {"is_recording": False})
                 await state.push_event_sync(ws, "status", "就绪")
-                if filepath:
-                    await state.push_event_sync(ws, "log", {"message": f"录音已保存: {filepath}"})
-                    # 自动转写
-                    if state.config.get("auto_transcribe", True):
-                        await state.push_event_sync(ws, "status", "转写中")
-                        await state.push_event_sync(ws, "log", {"message": "开始转写录音文件..."})
-                        # 在后台线程转写
-                        threading.Thread(
-                            target=_transcribe_file_task,
-                            args=(filepath, ws),
-                            daemon=True
-                        ).start()
-                else:
-                    await state.push_event_sync(ws, "log", {"message": "没有录到音频数据"})
-            except Exception as e:
-                await state.push_event_sync(ws, "log", {"message": f"停止录音失败: {str(e)}"})
+
+            if filepath:
+                await state.push_event_sync(ws, "log", {"message": f"录音已保存: {filepath}"})
+                # 自动转写
+                if state.config.get("auto_transcribe", True):
+                    await state.push_event_sync(ws, "status", "转写中")
+                    await state.push_event_sync(ws, "log", {"message": "开始转写录音文件..."})
+                    # 在后台线程转写
+                    threading.Thread(
+                        target=_transcribe_file_task,
+                        args=(filepath, ws),
+                        daemon=True
+                    ).start()
+            else:
+                await state.push_event_sync(ws, "log", {"message": "没有录到音频数据"})
 
         elif action == "start_realtime":
             if state.is_realtime:
@@ -1574,26 +1580,31 @@ def create_app():
 
             def on_meeting_stop(meeting_name):
                 """会议软件退出，自动停止录音"""
+                filepath = None
                 try:
                     filepath = state.recorder.stop()
+                except Exception as e:
+                    state.push_from_thread("log", {"message": f"自动停止录音失败: {str(e)}"})
+                finally:
+                    # 同上：复位不能依赖 stop() 成功，否则自动监控路径下
+                    # 也会把 is_recording 永久卡成 True
                     state.is_recording = False
                     state.recording_start = None
                     state.push_from_thread("recording_changed", {"is_recording": False})
                     state.push_from_thread("status", "就绪")
-                    if filepath:
-                        state.push_from_thread("log", {"message": f"{meeting_name}已退出，录音已保存: {filepath}"})
-                        if state.config.get("auto_transcribe", True):
-                            state.push_from_thread("status", "转写中")
-                            state.push_from_thread("log", {"message": "开始转写录音文件..."})
-                            threading.Thread(
-                                target=_transcribe_file_task,
-                                args=(filepath, ws),
-                                daemon=True
-                            ).start()
-                    else:
-                        state.push_from_thread("log", {"message": f"{meeting_name}已退出，但未录到音频"})
-                except Exception as e:
-                    state.push_from_thread("log", {"message": f"自动停止录音失败: {str(e)}"})
+
+                if filepath:
+                    state.push_from_thread("log", {"message": f"{meeting_name}已退出，录音已保存: {filepath}"})
+                    if state.config.get("auto_transcribe", True):
+                        state.push_from_thread("status", "转写中")
+                        state.push_from_thread("log", {"message": "开始转写录音文件..."})
+                        threading.Thread(
+                            target=_transcribe_file_task,
+                            args=(filepath, ws),
+                            daemon=True
+                        ).start()
+                else:
+                    state.push_from_thread("log", {"message": f"{meeting_name}已退出，但未录到音频"})
 
             def on_monitor_status(status, msg):
                 state.push_from_thread("monitor_status", {"status": status, "message": msg})
@@ -2013,7 +2024,6 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
 
     else:
         # ── 普通模式：纯文本分段输出 ──
-        import re
         paragraphs = re.split(r'([。！？\n])', text)
         combined = []
         buffer = ""
