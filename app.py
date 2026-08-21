@@ -98,11 +98,36 @@ def _resolve_output_path(base_dir, filename, ext, fallback="transcript"):
         raise ValueError(f"非法输出路径: {filename!r}")
     return path
 
+# ─── 文件转写模型 ───
+# 文件转写（非实时）使用的 ASR 模型。实测在中文多说话人 / 带背景音的
+# 场景下，paraformer-large-vad-punc 的同音字、数字处理、语种漂移均
+# 优于 SenseVoiceSmall，且 CPU RTF 更低（约 0.12 vs 0.13），故设为
+# 默认。SenseVoiceSmall 保留为可选项（多语种场景可能用得上），但不再
+# 默认加载。
+FILE_MODEL_PARAFORMER_LARGE = "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+FILE_MODEL_SENSEVOICE = "iic/SenseVoiceSmall"
+_FILE_MODEL_ALIASES = {
+    "paraformer-large": FILE_MODEL_PARAFORMER_LARGE,
+    "sensevoice": FILE_MODEL_SENSEVOICE,
+}
+
+
+def _resolve_file_model(name):
+    """把前端短名 / 配置值归一化为完整 FunASR 模型 ID。
+
+    兼容历史配置：前端下拉传的是 "paraformer-large" / "sensevoice" 短名，
+    旧默认值是完整 ID。未知值原样返回（假定已是完整 ID）。
+    """
+    if not name:
+        return FILE_MODEL_PARAFORMER_LARGE
+    return _FILE_MODEL_ALIASES.get(str(name).strip().lower(), name)
+
+
 # ─── 默认配置 ───
 DEFAULT_CONFIG = {
     "audio_source": "both",
     "engine": "FunASR",
-    "funasr_model": "iic/SenseVoiceSmall",
+    "funasr_model": FILE_MODEL_PARAFORMER_LARGE,
     "auto_transcribe": True,
     "xfyun_app_id": "",
     "xfyun_api_key": "",
@@ -731,7 +756,7 @@ class AudioRecorder:
 # ─── FunASR 实时转写 ───
 class FunASRTranscriber:
     def __init__(self):
-        self.file_model = None       # 文件转写模型 (SenseVoiceSmall)
+        self.file_model = None       # 文件转写模型 (默认 paraformer-large-vad-punc)
         self.stream_model = None     # 实时流式模型 (paraformer-online)
         self.punc_model = None       # 标点恢复模型 (punc_ct-transformer)
         self.diarization_model = None  # 说话人分离pipeline (paraformer-large-vad-punc + ERes2NetV2)
@@ -790,8 +815,8 @@ class FunASRTranscriber:
         except Exception:
             return text
 
-    def load_file_model(self, model_name="iic/SenseVoiceSmall", status_callback=None):
-        """加载文件转写模型（SenseVoiceSmall + VAD + 标点）"""
+    def load_file_model(self, model_name=FILE_MODEL_PARAFORMER_LARGE, status_callback=None):
+        """加载文件转写模型（默认 paraformer-large-vad-punc + VAD + 标点）"""
         if self._file_ready and self._file_model_name == model_name:
             return True
         if self._file_loading:
@@ -883,15 +908,20 @@ class FunASRTranscriber:
             self._stream_loading = False
 
     # 兼容旧接口
-    def load_model(self, model_name="iic/SenseVoiceSmall", status_callback=None):
+    def load_model(self, model_name=FILE_MODEL_PARAFORMER_LARGE, status_callback=None):
         """兼容接口：根据模型名自动选择加载方法"""
         if "online" in model_name or "streaming" in model_name:
             return self.load_stream_model(model_name, status_callback)
         return self.load_file_model(model_name, status_callback)
 
-    def transcribe_file(self, filepath, status_callback=None, hot_words=None):
-        """转写音频文件（使用SenseVoiceSmall模型）"""
-        if not self.load_model(model_name="iic/SenseVoiceSmall", status_callback=status_callback):
+    def transcribe_file(self, filepath, status_callback=None, hot_words=None, model_name=None):
+        """转写音频文件（默认 paraformer-large-vad-punc）。
+
+        model_name 可传完整 FunASR 模型 ID 或前端短名
+        （paraformer-large / sensevoice）；None 时用默认模型。
+        """
+        model_name = _resolve_file_model(model_name)
+        if not self.load_model(model_name=model_name, status_callback=status_callback):
             return None
         try:
             if status_callback:
@@ -901,7 +931,8 @@ class FunASRTranscriber:
             result = self.file_model.generate(**kwargs)
             if result and len(result) > 0:
                 text = result[0].get("text", "")
-                # Clean up SenseVoice special tokens like <|zh|>, < | zh | >, <|NEUTRAL|>, etc.
+                # 去掉模型输出里的特殊 token（如 SenseVoice 的
+                # <|zh|>/<|NEUTRAL|> 等）；paraformer 无此类 token，此处理无害。
                 text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', text).strip()
                 return text
             return ""
@@ -2084,7 +2115,11 @@ def _transcribe_file_task(filepath, ws):
             else:
                 # 普通转写模式
                 state.push_from_thread("log", {"message": "正在加载FunASR模型..."})
-                result = state.funasr.transcribe_file(filepath, status_callback=status_cb, hot_words=hot_words)
+                file_model = state.config.get("funasr_model")
+                result = state.funasr.transcribe_file(
+                    filepath, status_callback=status_cb, hot_words=hot_words,
+                    model_name=file_model,
+                )
                 if result is not None:
                     state.set_transcript(result)
                     state.sentence_info = []
@@ -2941,7 +2976,12 @@ def _main_inner(log_error):
 
     # Pre-load FunASR model in background (saves 60+ seconds on first use)
     print("预加载语音模型...")
-    threading.Thread(target=lambda: state.funasr.load_file_model("iic/SenseVoiceSmall"), daemon=True).start()
+    threading.Thread(
+        target=lambda: state.funasr.load_file_model(
+            _resolve_file_model(state.config.get("funasr_model"))
+        ),
+        daemon=True,
+    ).start()
 
     # Open Edge browser
     url = f"http://127.0.0.1:{port}/"
