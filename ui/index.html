@@ -156,6 +156,13 @@ html, body {
   box-shadow: 0 4px 12px rgba(124,58,237,0.3);
 }
 
+.btn-pause {
+  background: linear-gradient(135deg, #475569, #64748b);
+  margin-bottom: 12px;
+  box-shadow: 0 4px 12px rgba(71,85,105,0.3);
+}
+.btn-pause:hover { box-shadow: 0 4px 16px rgba(100,116,139,0.5); filter: brightness(1.1); }
+
 /* Button Row */
 .btn-row { display: flex; gap: 6px; margin-bottom: 6px; background: transparent; }
 .btn-secondary {
@@ -470,6 +477,10 @@ html, body {
     <button class="btn btn-realtime" id="btnRealtime" onclick="toggleRealtime()">
       <span id="realtimeIcon">&#9679;</span>
       <span id="realtimeText">实时转写</span>
+    </button>
+    <button class="btn btn-pause" id="btnPause" onclick="togglePause()" style="display:none;">
+      <span id="pauseIcon">&#10074;&#10074;</span>
+      <span id="pauseText">暂停</span>
     </button>
 
     <div class="btn-row">
@@ -802,6 +813,15 @@ function toggleRecord() {
   }
 }
 
+function togglePause() {
+  const btn = document.getElementById('btnPause');
+  if (btn.dataset.paused === '1') {
+    sendAction('resume_realtime');
+  } else {
+    sendAction('pause_realtime');
+  }
+}
+
 function toggleRealtime() {
   if (isRealtime) {
     sendAction('stop_realtime');
@@ -956,6 +976,8 @@ function onRealtimeStatus(data) {
   const status = data.status;
   const message = data.message || '';
 
+  const pauseBtn = document.getElementById('btnPause');
+
   if (status === 'loading' || status === 'recording') {
     isRealtime = true;
     btn.classList.add('active');
@@ -967,6 +989,21 @@ function onRealtimeStatus(data) {
     // 禁用录音按钮
     document.getElementById('btnRecord').disabled = true;
     document.getElementById('btnRecord').style.opacity = '0.4';
+    // 暂停按钮：loading 时不显示，recording 时显示
+    if (status === 'recording') {
+      pauseBtn.style.display = '';
+      pauseBtn.dataset.paused = '0';
+      document.getElementById('pauseText').textContent = '暂停';
+    } else {
+      pauseBtn.style.display = 'none';
+    }
+  } else if (status === 'paused') {
+    isRealtime = true;
+    badge.classList.add('visible');
+    document.getElementById('realtimeBadgeText').textContent = '已暂停';
+    pauseBtn.style.display = '';
+    pauseBtn.dataset.paused = '1';
+    document.getElementById('pauseText').textContent = '继续';
   } else if (status === 'ready') {
     isRealtime = true;
     btn.classList.add('active');
@@ -976,6 +1013,9 @@ function onRealtimeStatus(data) {
     // 禁用录音按钮
     document.getElementById('btnRecord').disabled = true;
     document.getElementById('btnRecord').style.opacity = '0.4';
+    pauseBtn.style.display = '';
+    pauseBtn.dataset.paused = '0';
+    document.getElementById('pauseText').textContent = '暂停';
   } else if (status === 'diarizing') {
     // 说话人分离中：保持按钮active但更新文字提示
     isRealtime = true;
@@ -983,11 +1023,13 @@ function onRealtimeStatus(data) {
     document.getElementById('realtimeText').textContent = '说话人分离中...';
     badge.classList.add('visible');
     document.getElementById('realtimeBadgeText').textContent = message || '说话人分离中';
+    pauseBtn.style.display = 'none';
   } else if (status === 'stopped' || status === 'error') {
     isRealtime = false;
     btn.classList.remove('active');
     document.getElementById('realtimeText').textContent = '实时转写';
     badge.classList.remove('visible');
+    pauseBtn.style.display = 'none';
     if (status === 'error') {
       appendLog('实时转写错误: ' + message);
     }

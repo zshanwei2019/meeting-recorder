@@ -299,6 +299,7 @@ class AudioRecorder:
         self.sd = None
         self.np = None
         self._recording = False
+        self._paused = False          # 暂停标志：暂停时回调丢弃音频，不关流不丢WAV
         self._frames = []
         self._stream = None
         self._stream2 = None          # 混合模式下的第二个录音流
@@ -358,6 +359,7 @@ class AudioRecorder:
 
         self._frames = []
         self._recording = True
+        self._paused = False
         self._callback = callback
         self._mix_buffer = {}
         self._dropped_chunks = 0
@@ -409,7 +411,7 @@ class AudioRecorder:
             self._actual_channels = 1  # 混合后输出单声道
 
             def sys_callback(indata, frames, time_info, status):
-                if not self._recording: return
+                if not self._recording or self._paused: return
                 mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
                 # 重采样到target_rate
                 if sys_rate != target_rate:
@@ -421,7 +423,7 @@ class AudioRecorder:
                     self._mix_buffer['sys'] = self.np.concatenate([buf, mono])
 
             def mic_callback(indata, frames, time_info, status):
-                if not self._recording: return
+                if not self._recording or self._paused: return
                 mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
                 if mic_rate != target_rate:
                     ratio = target_rate / mic_rate
@@ -436,6 +438,8 @@ class AudioRecorder:
                 import time as _time
                 while self._recording:
                     _time.sleep(0.3)  # 每300ms混一次
+                    if self._paused:
+                        continue
                     with self._lock:
                         sys_buf = self._mix_buffer.get('sys', self.np.array([], dtype=self.np.float32))
                         mic_buf = self._mix_buffer.get('mic', self.np.array([], dtype=self.np.float32))
@@ -523,7 +527,7 @@ class AudioRecorder:
 
         # ── 单流模式（mic / system / both回退） ──
         def audio_callback(indata, frames, time_info, status):
-            if not self._recording:
+            if not self._recording or self._paused:
                 return
             audio_data = indata.copy()
             self._append_frame(audio_data)
@@ -778,6 +782,17 @@ class AudioRecorder:
                 del self._frames[:over]
                 self._dropped_chunks += over
 
+    def pause(self):
+        """暂停录音：回调丢弃数据，不关流不丢WAV文件。"""
+        self._paused = True
+
+    def resume(self):
+        """恢复录音。"""
+        self._paused = False
+
+    def is_paused(self):
+        return self._paused
+
     def stop(self):
         """停止录音，返回WAV文件路径
 
@@ -792,6 +807,7 @@ class AudioRecorder:
             return None
         # 先置位：混音线程与落盘线程都以它作为退出条件
         self._recording = False
+        self._paused = False
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -1639,6 +1655,18 @@ def create_app():
             # 清理完成后会发送 transcript_ready 和最终的 realtime_status:stopped（幂等）
             # 不阻塞事件循环；start_realtime 会检查线程是否还在运行
 
+        elif action == "pause_realtime":
+            if state.is_realtime and state.recorder and not state.recorder.is_paused():
+                state.recorder.pause()
+                await state.push_event_sync(ws, "realtime_status", {"status": "paused", "message": "已暂停"})
+                await state.push_event_sync(ws, "status", "已暂停")
+
+        elif action == "resume_realtime":
+            if state.is_realtime and state.recorder and state.recorder.is_paused():
+                state.recorder.resume()
+                await state.push_event_sync(ws, "realtime_status", {"status": "recording", "message": "实时转写中"})
+                await state.push_event_sync(ws, "status", "实时转写中")
+
         elif action == "transcribe_file":
             # 前端选择文件转写
             await state.push_event_sync(ws, "log", {"message": "请在设置中选择文件，或先录音再转写"})
@@ -2397,6 +2425,11 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                     punc_running = False
 
             while state.is_realtime:
+                # 暂停时不消费音频、不送转写；流仍开着但回调已丢弃数据，
+                # 队列里也不会有新块，这里简单 sleep 等恢复/停止。
+                if state.recorder.is_paused():
+                    time.sleep(0.2)
+                    continue
                 audio_data = state.recorder.get_audio_chunk(timeout=0.5)
                 if audio_data is None:
                     # 没有新数据，但buffer中有数据时也尝试处理
@@ -2415,6 +2448,9 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                                 if text:
                                     raw_text += text
                                     last_text_time = time.time()
+                                    # 立即推送无标点原文，不等标点线程，用户说话时能实时看到字
+                                    if not punc_running:
+                                        push("transcript_partial", {"full_text": raw_text})
                         except Exception as e:
                             push("log", {"message": f"FunASR处理错误: {str(e)}"})
                     now = time.time()
@@ -2446,6 +2482,9 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                             if text:
                                 raw_text += text
                                 last_text_time = time.time()
+                                # 立即推送无标点原文
+                                if not punc_running:
+                                    push("transcript_partial", {"full_text": raw_text})
                 except Exception as e:
                     push("log", {"message": f"FunASR处理错误: {str(e)}"})
 
