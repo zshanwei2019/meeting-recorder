@@ -391,6 +391,29 @@ html, body {
   color: #94a3b8;
   line-height: 1.6;
   margin-top: 4px;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.log-content > div {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.log-copy-btn {
+  margin-left: auto;
+  font-size: 10px;
+  color: #64748b;
+  background: transparent;
+  border: 1px solid rgba(148,163,184,0.15);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.log-copy-btn:hover {
+  color: #94a3b8;
+  border-color: rgba(148,163,184,0.3);
+  background: rgba(148,163,184,0.06);
 }
 .log-content.visible { display: block; }
 .log-content::-webkit-scrollbar { width: 4px; }
@@ -577,6 +600,7 @@ html, body {
         <span class="log-toggle" id="logToggle">&#9654;</span>
         <span class="log-title">日志</span>
         <span class="log-preview" id="logPreview"></span>
+        <button class="log-copy-btn" onclick="event.stopPropagation(); copyLog()" title="复制全部日志">复制</button>
       </div>
       <div class="log-content" id="logContent"></div>
     </div>
@@ -842,6 +866,26 @@ function toggleSettings() {
 function toggleLog() {
   document.getElementById('logContent').classList.toggle('visible');
   document.getElementById('logToggle').classList.toggle('open');
+}
+
+function copyLog() {
+  const el = document.getElementById('logContent');
+  const text = el.innerText || el.textContent || '';
+  if (!text.trim()) { appendLog('日志为空'); return; }
+  navigator.clipboard.writeText(text).then(() => {
+    appendLog('日志已复制到剪贴板');
+  }).catch(() => {
+    // Fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); appendLog('日志已复制到剪贴板'); }
+    catch (e) { appendLog('复制失败，请手动选择'); }
+    document.body.removeChild(ta);
+  });
 }
 
 function updateWordCount() {
