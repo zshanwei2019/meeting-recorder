@@ -1259,9 +1259,12 @@ def create_app():
                 await state.push_event_sync(ws, "log", {"message": "请先转写内容"})
                 return
             await state.push_event_sync(ws, "status", "生成纪要中")
+            # 说话人分离结果一并传入：带说话人/时间标签的转写对纪要质量帮助很大
+            # （谁做的决策、谁认领的待办，纯文本里全丢了）
             threading.Thread(
                 target=_generate_minutes_task,
                 args=(text, domain, ws),
+                kwargs={"sentence_info": list(state.sentence_info or [])},
                 daemon=True
             ).start()
 
@@ -2127,7 +2130,118 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
         traceback.print_exc()
 
 
-def _generate_minutes_task(text, domain, ws):
+# ─── 领域化处理 ───
+# 旧实现里 domain 只是被塞进 prompt 的一个词（"领域：金融"），
+# 模型无从知道该领域要重点抓什么、术语怎么写，等于没做领域化。
+# 这里给每个领域补上关注点 + 易错术语提示。
+DOMAIN_PROFILES = {
+    "通用": {
+        "focus": "决策结论、责任人、时限、未解决的分歧",
+        "terms": "",
+    },
+    "金融": {
+        "focus": "金额与币种、利率与费率、期限、授信与风控条件、合规要求、审批层级",
+        "terms": "注意区分：本金/利息/罚息，授信/放款，年化/月化，基点(BP)与百分点",
+    },
+    "科技": {
+        "focus": "技术方案取舍、架构与依赖、排期与里程碑、技术风险与兼容性",
+        "terms": "英文缩写与产品名保持原文大小写（如 API、SDK、Kubernetes），不要译成中文",
+    },
+    "医疗": {
+        "focus": "诊断结论、用药与剂量、检查检验指标、随访安排、知情同意与风险告知",
+        "terms": "药名、剂量单位（mg/ml/IU）、指标数值必须与原文完全一致，绝不可推测或换算",
+    },
+    "教育": {
+        "focus": "教学目标、课程与课时安排、考核评价方式、学生与家长诉求、师资安排",
+        "terms": "注意区分学期/学年、必修/选修、学分与课时",
+    },
+    "法院": {
+        "focus": "当事人主张、争议焦点、证据与举证责任、法律依据、程序节点与期限",
+        "terms": "严格区分原告/被告/第三人，上诉/申诉/再审，事实认定与法律适用；"
+                 "法条引用（如《民法典》第X条）须与原文一致",
+    },
+}
+
+
+def _domain_guidance(domain):
+    """生成领域化提示块。未知领域退化为通用，不抛异常。"""
+    profile = DOMAIN_PROFILES.get(domain) or DOMAIN_PROFILES["通用"]
+    lines = [f"【领域：{domain}】", f"本领域需重点抓取：{profile['focus']}"]
+    if profile["terms"]:
+        lines.append(f"术语规范：{profile['terms']}")
+    return "\n".join(lines)
+
+
+# 句末标点：分段时优先在这些位置切开，避免把一句话劈成两段
+_SENTENCE_END_PUNCTS = "。！？；!?;\n"
+
+
+def _split_text_for_llm(text, chunk_size, min_ratio=0.6):
+    """按句子边界切分长文本，避免旧实现 text[i:i+CHUNK_SIZE] 的硬切。
+
+    硬切会把一句话、一个数字、甚至一个说话人轮次劈到两段，
+    两段各自摘要时都拿到残句 → 语义丢失、数据错配。
+
+    策略：在 [chunk_size*min_ratio, chunk_size] 窗口内回溯找最后一个句末标点；
+    找不到（如整段无标点）则退化为硬切，保证一定能推进不死循环。
+    """
+    if not text:
+        return []
+    if chunk_size <= 0:
+        return [text]
+
+    chunks = []
+    start = 0
+    total = len(text)
+    min_len = max(1, int(chunk_size * min_ratio))
+
+    while start < total:
+        if total - start <= chunk_size:
+            chunks.append(text[start:])
+            break
+
+        window_end = start + chunk_size
+        cut = -1
+        for i in range(window_end - 1, start + min_len - 1, -1):
+            if text[i] in _SENTENCE_END_PUNCTS:
+                cut = i + 1  # 标点归前一段
+                break
+        if cut <= start:
+            cut = window_end  # 无标点可切，退化硬切
+        chunks.append(text[start:cut])
+        start = cut
+
+    return [c for c in (c.strip() for c in chunks) if c]
+
+
+def _build_annotated_transcript(sentence_info, max_chars=None):
+    """把说话人分离结果渲染成带 [时间 说话人N] 标签的转写文本。
+
+    说话人分离早就跑出了 spk 标签，但纪要 prompt 只吃纯文本，
+    导致模型无法判断"谁说的" → 决策归属、待办负责人只能靠猜。
+    复用 _smart_paragraph_segment 的分段结果，保证与 Word 导出一致。
+    """
+    if not sentence_info:
+        return ""
+    paragraphs = _smart_paragraph_segment(sentence_info)
+    if not paragraphs:
+        return ""
+
+    lines = []
+    used = 0
+    for p in paragraphs:
+        body = (p.get("text") or "").strip()
+        if not body:
+            continue
+        line = f"[{_format_timestamp_compact(p.get('start', 0))} 说话人{p.get('spk', 0) + 1}] {body}"
+        if max_chars is not None and used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
+def _generate_minutes_task(text, domain, ws, sentence_info=None):
     """后台线程：AI生成会议纪要（支持超长会议，分段摘要+汇总）"""
     def push(event_type, data=None):
         state.push_from_thread(event_type, data)
@@ -2226,15 +2340,30 @@ def _generate_minutes_task(text, domain, ws):
 
         cfg = api_configs.get(provider, api_configs["xfyun"])
 
+        # ── 说话人标注 ──
+        # 有说话人分离结果时，用带 [时间 说话人N] 标签的文本喂模型，
+        # 决策归属和待办负责人才有据可依；否则退回纯文本。
+        annotated = _build_annotated_transcript(sentence_info)
+        speaker_count = 0
+        if sentence_info:
+            speaker_count = max((s.get("spk", 0) for s in sentence_info), default=0) + 1
+        if annotated:
+            source_text = annotated
+            push("log", {"message": f"已启用说话人标注纪要（{speaker_count}位说话人）"})
+        else:
+            source_text = text
+        has_speakers = bool(annotated)
+
         # ── 分段策略 ──
         # 每段约6000字（留空间给prompt模板），4小时会议约3-4万字 → 5-7段
         CHUNK_SIZE = 6000
-        text_len = len(text)
+        text_len = len(source_text)
+        domain_block = _domain_guidance(domain)
 
         if text_len <= CHUNK_SIZE:
             # 短会议：直接一次生成
             push("log", {"message": f"正在调用{cfg['name']}API生成纪要（全文{ text_len}字）..."})
-            final_prompt = _build_final_prompt(text, domain)
+            final_prompt = _build_final_prompt(source_text, domain, has_speakers=has_speakers)
             result = call_llm(final_prompt, cfg, llm_key)
             push("minutes_ready", {"text": result})
             push("status", "就绪")
@@ -2242,21 +2371,24 @@ def _generate_minutes_task(text, domain, ws):
             return
 
         # 长会议：分段摘要 → 汇总
-        chunks = []
-        for i in range(0, text_len, CHUNK_SIZE):
-            chunks.append(text[i:i+CHUNK_SIZE])
+        # 按句末标点切，不再 text[i:i+CHUNK_SIZE] 硬切断句
+        chunks = _split_text_for_llm(source_text, CHUNK_SIZE)
 
         push("log", {"message": f"长会议纪要：全文{text_len}字，分{len(chunks)}段处理..."})
 
         # 第一阶段：逐段生成摘要
         summaries = []
+        speaker_hint = (
+            "\n转写中的 [时间 说话人N] 是说话人标签，请据此判断观点、决策、待办分别属于谁，"
+            "并在摘要中保留说话人标注。\n" if has_speakers else ""
+        )
         for idx, chunk in enumerate(chunks):
             push("log", {"message": f"正在处理第{idx+1}/{len(chunks)}段..."})
             chunk_prompt = f"""你是一位资深会议秘书，请对以下会议转写片段提取关键信息。
 
-领域：{domain}
+{domain_block}
 这是会议的第{idx+1}段（共{len(chunks)}段）。
-
+{speaker_hint}
 请提取：
 1. 本段讨论的议题（如有新议题出现，明确标注）
 2. 各方核心观点和争论焦点
@@ -2288,7 +2420,9 @@ def _generate_minutes_task(text, domain, ws):
         push("log", {"message": f"分段摘要完成，正在汇总生成完整纪要..."})
         combined_summaries = "\n\n".join([f"【第{i+1}段摘要】\n{s}" for i, s in enumerate(summaries)])
 
-        final_prompt = _build_final_prompt(combined_summaries, domain, is_summary=True)
+        final_prompt = _build_final_prompt(
+            combined_summaries, domain, is_summary=True, has_speakers=has_speakers
+        )
         result = call_llm(final_prompt, cfg, llm_key, max_tokens=8192)
 
         push("minutes_ready", {"text": result})
@@ -2300,13 +2434,23 @@ def _generate_minutes_task(text, domain, ws):
         push("status", "就绪")
 
 
-def _build_final_prompt(content, domain, is_summary=False):
+def _build_final_prompt(content, domain, is_summary=False, has_speakers=False):
     """构建最终纪要生成的prompt"""
     content_label = "各段摘要" if is_summary else "转写内容"
+    speaker_block = ""
+    if has_speakers:
+        speaker_block = (
+            "\n【说话人信息】\n"
+            "内容中的 [时间 说话人N] 为自动说话人分离结果。请充分利用：\n"
+            "- 参会人员按说话人编号列出；如转写中出现自我介绍或被称呼的姓名，则标注为“说话人1（张三）”\n"
+            "- 各方观点需标明出自哪位说话人\n"
+            "- 待办事项的负责人优先填说话人标识，不得根据猜测填写\n"
+            "- 说话人编号与真实身份的对应关系不确定时，保留编号并注“（待确认）”\n"
+        )
     return f"""你是一位资深会议秘书，请根据以下{content_label}撰写正式会议纪要。
 
-领域：{domain}
-
+{_domain_guidance(domain)}
+{speaker_block}
 【格式要求】
 - 使用纯文本，禁止使用Markdown格式（不要用**、##、-等符号）
 - 用中文数字编号（一、二、三...）标示大项，阿拉伯数字（1. 2. 3.）标示小项
@@ -2326,7 +2470,6 @@ def _build_final_prompt(content, domain, is_summary=False):
 
 三、关键决策
 （明确记录达成的共识和决定，逐条列出）
-
 四、待办事项
 （需跟进的工作，格式：事项内容 → 负责人 → 完成时限，如未提及则写"无"）
 
