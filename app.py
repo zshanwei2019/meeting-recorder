@@ -767,6 +767,10 @@ class FunASRTranscriber:
         self._file_ready = False
         self._stream_ready = False
         self._diarization_loading = False
+        # 全局模型加载锁：避免启动预加载和用户点击实时转写同时加载
+        # 多个大模型（可能触发 modelscope 并发下载同一份权重 / 文件锁冲突 /
+        # 内存峰值），统一串行化。所有 load_*_model 都走这把锁。
+        self._model_load_lock = threading.Lock()
 
     @staticmethod
     def _parse_hot_words(raw):
@@ -830,19 +834,20 @@ class FunASRTranscriber:
         self._file_loading = True
         self._file_ready = False
         try:
-            if status_callback:
-                status_callback("loading", "导入FunASR...")
-            from funasr import AutoModel
-            if status_callback:
-                status_callback("loading", "加载文件转写模型（首次需下载）...")
-            self.file_model = AutoModel(
-                model=model_name,
-                vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-                punc_model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
-                disable_update=True,
-            )
-            self._file_model_name = model_name
-            self._file_ready = True
+            with self._model_load_lock:
+                if status_callback:
+                    status_callback("loading", "导入FunASR...")
+                from funasr import AutoModel
+                if status_callback:
+                    status_callback("loading", "加载文件转写模型（首次需下载）...")
+                self.file_model = AutoModel(
+                    model=model_name,
+                    vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                    punc_model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+                    disable_update=True,
+                )
+                self._file_model_name = model_name
+                self._file_ready = True
             if status_callback:
                 status_callback("ready", "文件转写模型就绪")
             return True
@@ -874,23 +879,26 @@ class FunASRTranscriber:
         self._stream_loading = True
         self._stream_ready = False
         try:
-            if status_callback:
-                status_callback("loading", "加载实时转写模型...")
-            from funasr import AutoModel
-            # 实时流式ASR模型（不带VAD和标点，加载快）
-            self.stream_model = AutoModel(
-                model=model_name,
-                disable_update=True,
-            )
-            # 独立加载标点模型，用于实时转写文本的后处理
-            if status_callback:
-                status_callback("loading", "加载标点模型...")
-            self.punc_model = AutoModel(
-                model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
-                disable_update=True,
-            )
-            self._stream_model_name = model_name
-            self._stream_ready = True
+            with self._model_load_lock:
+                if status_callback:
+                    status_callback("loading", "加载实时转写模型...")
+                from funasr import AutoModel
+                # 实时流式ASR模型（不带VAD和标点，加载快）
+                self.stream_model = AutoModel(
+                    model=model_name,
+                    disable_update=True,
+                )
+                # 标点模型：文件转写可能已加载过同一个，复用避免重复加载
+                # （重复构造会再读一次 1.1GB 权重，是并发加载时的主要冲突源）。
+                if self.punc_model is None:
+                    if status_callback:
+                        status_callback("loading", "加载标点模型...")
+                    self.punc_model = AutoModel(
+                        model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+                        disable_update=True,
+                    )
+                self._stream_model_name = model_name
+                self._stream_ready = True
             if status_callback:
                 status_callback("ready", "实时转写模型就绪")
             return True
@@ -986,14 +994,15 @@ class FunASRTranscriber:
             return self.diarization_model is not None
         self._diarization_loading = True
         try:
-            if status_callback:
-                status_callback("loading", "加载说话人分离模型（首次较慢）...")
-            from funasr import AutoModel
-            self.diarization_model = AutoModel(
-                model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-                spk_model="iic/speech_eres2netv2_sv_zh-cn_16k-common",
-                disable_update=True,
-            )
+            with self._model_load_lock:
+                if status_callback:
+                    status_callback("loading", "加载说话人分离模型（首次较慢）...")
+                from funasr import AutoModel
+                self.diarization_model = AutoModel(
+                    model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+                    spk_model="iic/speech_eres2netv2_sv_zh-cn_16k-common",
+                    disable_update=True,
+                )
             if status_callback:
                 status_callback("ready", "说话人分离模型就绪")
             return True
@@ -2201,13 +2210,20 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
 
         else:
             # FunASR 实时转写
+            # 捕获底层回调发出的具体错误（模型加载失败原因），
+            # 不要再用泛化的“FunASR模型加载失败”覆盖掉详情。
+            load_error = {"msg": None}
+
             def funasr_status(status, msg):
+                if status == "error":
+                    load_error["msg"] = msg
                 push("realtime_status", {"status": status, "message": msg})
                 if status == "ready":
                     push("status", "实时转写中")
 
             if not state.funasr.load_model("iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online", status_callback=funasr_status):
-                push("realtime_status", {"status": "error", "message": "FunASR模型加载失败"})
+                detail = load_error["msg"] or "未知原因（请查看控制台日志）"
+                push("realtime_status", {"status": "error", "message": f"实时模型加载失败：{detail}"})
                 push("status", "就绪")
                 state.is_realtime = False
                 return
