@@ -510,6 +510,7 @@ html, body {
           <option value="FunASR">FunASR</option>
           <option value="xfyun">讯飞 API</option>
           <option value="Whisper">Whisper</option>
+          <option value="Qwen3">Qwen3-ASR（中英混合）</option>
         </select>
       </div>
       <div id="funasrModelRow">
@@ -527,6 +528,13 @@ html, body {
           <option value="small">small</option>
           <option value="medium">medium</option>
           <option value="large-v3" selected>large-v3（最准，推荐）</option>
+        </select>
+      </div>
+      <div id="qwen3ModelRow" style="display:none;">
+        <div class="setting-label">Qwen3-ASR 模型</div>
+        <select class="setting-select" id="qwen3ModelSelect" onchange="saveConfig()">
+          <option value="Qwen/Qwen3-ASR-0.6B-hf" selected>0.6B（快，推荐）</option>
+          <option value="Qwen/Qwen3-ASR-1.7B-hf">1.7B（更准，慢一倍）</option>
         </select>
       </div>
       <div>
@@ -760,7 +768,7 @@ function applyConfig(config) {
   if (config.audio_source && srcMap[config.audio_source] !== undefined)
     document.getElementById('audioSource').selectedIndex = srcMap[config.audio_source];
   if (config.engine) {
-    const engMap = {'FunASR': 0, 'xfyun': 1, 'Whisper': 2};
+    const engMap = {'FunASR': 0, 'xfyun': 1, 'Whisper': 2, 'Qwen3': 3};
     const idx = engMap[config.engine];
     if (idx !== undefined) document.getElementById('engineSelect').selectedIndex = idx;
   }
@@ -768,6 +776,7 @@ function applyConfig(config) {
   const eng = document.getElementById('engineSelect').value;
   document.getElementById('funasrModelRow').style.display = (eng === 'FunASR') ? '' : 'none';
   document.getElementById('whisperModelRow').style.display = (eng === 'Whisper') ? '' : 'none';
+  document.getElementById('qwen3ModelRow').style.display = (eng === 'Qwen3') ? '' : 'none';
   if (config.funasr_model) {
     document.getElementById('modelSelect').selectedIndex = config.funasr_model.includes('paraformer') ? 0 : 1;
   }
@@ -775,6 +784,12 @@ function applyConfig(config) {
     const wSel = document.getElementById('whisperModelSelect');
     for (let i = 0; i < wSel.options.length; i++) {
       if (wSel.options[i].value === config.whisper_model) { wSel.selectedIndex = i; break; }
+    }
+  }
+  if (config.qwen3_model) {
+    const qSel = document.getElementById('qwen3ModelSelect');
+    for (let i = 0; i < qSel.options.length; i++) {
+      if (qSel.options[i].value === config.qwen3_model) { qSel.selectedIndex = i; break; }
     }
   }
   if (config.xfyun_app_id) document.getElementById('xfyunAppId').value = config.xfyun_app_id;
@@ -803,6 +818,7 @@ function onEngineChange() {
   const eng = document.getElementById('engineSelect').value;
   document.getElementById('funasrModelRow').style.display = (eng === 'FunASR') ? '' : 'none';
   document.getElementById('whisperModelRow').style.display = (eng === 'Whisper') ? '' : 'none';
+  document.getElementById('qwen3ModelRow').style.display = (eng === 'Qwen3') ? '' : 'none';
 }
 
 function saveConfig() {
@@ -812,6 +828,7 @@ function saveConfig() {
     engine: eng,
     funasr_model: document.getElementById('modelSelect').value,
     whisper_model: document.getElementById('whisperModelSelect').value,
+    qwen3_model: document.getElementById('qwen3ModelSelect').value,
     xfyun_app_id: document.getElementById('xfyunAppId').value,
     xfyun_api_secret: document.getElementById('xfyunApiSecret').value,
     xfyun_api_key: document.getElementById('xfyunApiKey').value,
