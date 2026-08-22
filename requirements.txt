@@ -25,3 +25,6 @@ websocket-client>=1.0
 
 # 文档导出
 python-docx>=1.0
+
+# Whisper 本地转写（中英混合 / 多语种文件转写）
+faster-whisper>=1.0

@@ -506,17 +506,27 @@ html, body {
     <div class="settings-panel" id="settingsPanel">
       <div>
         <div class="setting-label">引擎</div>
-        <select class="setting-select" id="engineSelect" onchange="saveConfig()">
+        <select class="setting-select" id="engineSelect" onchange="onEngineChange(); saveConfig()">
           <option value="FunASR">FunASR</option>
           <option value="xfyun">讯飞 API</option>
           <option value="Whisper">Whisper</option>
         </select>
       </div>
-      <div>
-        <div class="setting-label">模型</div>
+      <div id="funasrModelRow">
+        <div class="setting-label">FunASR 模型</div>
         <select class="setting-select" id="modelSelect" onchange="saveConfig()">
-          <option value="paraformer-large">Paraformer-Large</option>
-          <option value="sensevoice">SenseVoice</option>
+          <option value="paraformer-large">Paraformer-Large（中文，默认）</option>
+          <option value="sensevoice">SenseVoice（多语种）</option>
+        </select>
+      </div>
+      <div id="whisperModelRow" style="display:none;">
+        <div class="setting-label">Whisper 模型</div>
+        <select class="setting-select" id="whisperModelSelect" onchange="saveConfig()">
+          <option value="tiny">tiny（最快，低精度）</option>
+          <option value="base">base</option>
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="large-v3" selected>large-v3（最准，推荐）</option>
         </select>
       </div>
       <div>
@@ -754,8 +764,18 @@ function applyConfig(config) {
     const idx = engMap[config.engine];
     if (idx !== undefined) document.getElementById('engineSelect').selectedIndex = idx;
   }
+  // 根据引擎显示对应模型选择
+  const eng = document.getElementById('engineSelect').value;
+  document.getElementById('funasrModelRow').style.display = (eng === 'FunASR') ? '' : 'none';
+  document.getElementById('whisperModelRow').style.display = (eng === 'Whisper') ? '' : 'none';
   if (config.funasr_model) {
     document.getElementById('modelSelect').selectedIndex = config.funasr_model.includes('paraformer') ? 0 : 1;
+  }
+  if (config.whisper_model) {
+    const wSel = document.getElementById('whisperModelSelect');
+    for (let i = 0; i < wSel.options.length; i++) {
+      if (wSel.options[i].value === config.whisper_model) { wSel.selectedIndex = i; break; }
+    }
   }
   if (config.xfyun_app_id) document.getElementById('xfyunAppId').value = config.xfyun_app_id;
   if (config.xfyun_api_secret) document.getElementById('xfyunApiSecret').value = config.xfyun_api_secret;
@@ -779,11 +799,19 @@ function applyConfig(config) {
   if (config.preset_spk_num) document.getElementById('presetSpkNum').value = config.preset_spk_num;
 }
 
+function onEngineChange() {
+  const eng = document.getElementById('engineSelect').value;
+  document.getElementById('funasrModelRow').style.display = (eng === 'FunASR') ? '' : 'none';
+  document.getElementById('whisperModelRow').style.display = (eng === 'Whisper') ? '' : 'none';
+}
+
 function saveConfig() {
+  const eng = document.getElementById('engineSelect').value;
   sendAction('set_config', {
     audio_source: document.getElementById('audioSource').value,
-    engine: document.getElementById('engineSelect').value,
+    engine: eng,
     funasr_model: document.getElementById('modelSelect').value,
+    whisper_model: document.getElementById('whisperModelSelect').value,
     xfyun_app_id: document.getElementById('xfyunAppId').value,
     xfyun_api_secret: document.getElementById('xfyunApiSecret').value,
     xfyun_api_key: document.getElementById('xfyunApiKey').value,
