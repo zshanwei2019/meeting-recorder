@@ -217,6 +217,19 @@ _FILE_MODEL_ALIASES = {
     "sensevoice": FILE_MODEL_SENSEVOICE,
 }
 
+# Whisper 模型选项（faster-whisper 后端，用于中英混合 / 英文文件转写）
+WHISPER_MODELS = [
+    "tiny", "base", "small", "medium", "large-v3",
+]
+WHISPER_DEFAULT_MODEL = "large-v3"
+
+# Qwen3-ASR 模型选项（transformers 后端，支持 52 语种自动检测）
+QWEN3_MODELS = [
+    {"value": "Qwen/Qwen3-ASR-0.6B-hf", "label": "0.6B（快，推荐）"},
+    {"value": "Qwen/Qwen3-ASR-1.7B-hf", "label": "1.7B（更准，慢一倍）"},
+]
+QWEN3_DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
+
 
 def _resolve_file_model(name):
     """把前端短名 / 配置值归一化为完整 FunASR 模型 ID。
@@ -234,6 +247,8 @@ DEFAULT_CONFIG = {
     "audio_source": "both",
     "engine": "FunASR",
     "funasr_model": FILE_MODEL_PARAFORMER_LARGE,
+    "whisper_model": WHISPER_DEFAULT_MODEL,
+    "qwen3_model": QWEN3_DEFAULT_MODEL,
     "auto_transcribe": True,
     "xfyun_app_id": "",
     "xfyun_api_key": "",
@@ -1143,6 +1158,166 @@ class FunASRTranscriber:
             self._diarization_loading = False
 
 
+# ─── Whisper 文件转写（faster-whisper）───
+class WhisperTranscriber:
+    """faster-whisper 后端，适合中英混合 / 英文文件转写。
+
+    不做实时流式，只在录音结束后处理整个文件。
+    """
+    def __init__(self):
+        self._model = None
+        self._model_name = None
+        self._lock = threading.Lock()
+
+    def _pick_device(self):
+        """选择最佳可用设备。CUDA 优先，否则 CPU。"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda", "float16"
+        except Exception:
+            pass
+        # CPU int8 比 float16 快，且不需要 GPU
+        return "cpu", "int8"
+
+    def load(self, model_name=WHISPER_DEFAULT_MODEL, status_callback=None):
+        if self._model is not None and self._model_name == model_name:
+            return True
+        with self._lock:
+            if self._model is not None and self._model_name == model_name:
+                return True
+            try:
+                from faster_whisper import WhisperModel
+                if status_callback:
+                    status_callback("loading", f"加载 Whisper {model_name}（首次需下载）...")
+                device, compute_type = self._pick_device()
+                print(f"[Whisper] device={device}, compute_type={compute_type}, model={model_name}", flush=True)
+                self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
+                self._model_name = model_name
+                if status_callback:
+                    status_callback("ready", f"Whisper {model_name} 就绪")
+                return True
+            except ImportError:
+                self._model = None
+                if status_callback:
+                    status_callback("error", "faster-whisper 未安装，请运行: pip install faster-whisper")
+                return False
+            except Exception as e:
+                self._model = None
+                _tb = traceback.format_exc()
+                print("[Whisper 加载失败]\n" + _tb, flush=True)
+                if status_callback:
+                    status_callback("error", f"Whisper 加载失败: {str(e)}")
+                return False
+
+    def transcribe(self, filepath, model_name=None, status_callback=None, hot_words=None):
+        if not self.load(model_name or self._model_name or WHISPER_DEFAULT_MODEL, status_callback):
+            return None
+        try:
+            if status_callback:
+                status_callback("transcribing", "Whisper 转写中（中英混合自动识别）...")
+            segments, info = self._model.transcribe(
+                filepath,
+                beam_size=5,
+                vad_filter=True,
+                # hot_words 通过 initial_prompt 传入，提升专有名词识别率
+                initial_prompt=hot_words if hot_words else None,
+            )
+            parts = []
+            for seg in segments:
+                text = seg.text.strip()
+                if text:
+                    parts.append(text)
+            return "".join(parts) if self._is_chinese_dominant(parts) else " ".join(parts)
+        except Exception as e:
+            if status_callback:
+                status_callback("error", f"Whisper 转写失败: {str(e)}")
+            return None
+
+    @staticmethod
+    def _is_chinese_dominant(parts):
+        """简单判断：中文字符占多数时不加空格拼接。"""
+        sample = "".join(parts[:20])
+        if not sample:
+            return False
+        cn = sum(1 for c in sample if '\u4e00' <= c <= '\u9fff')
+        return cn / max(len(sample), 1) > 0.3
+
+
+# ─── Qwen3-ASR 文件转写（transformers）───
+class Qwen3ASRTranscriber:
+    """Qwen3-ASR 后端，支持 52 语种自动检测，适合中英混合文件转写。
+
+    只做文件转写，不做实时流式。transformers 原生加载，CPU fp32 运行。
+    模型在无 CUDA 时自动退到 CPU。
+    """
+    def __init__(self):
+        self._model = None
+        self._processor = None
+        self._model_name = None
+        self._lock = threading.Lock()
+
+    def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None):
+        if self._model is not None and self._model_name == model_name:
+            return True
+        with self._lock:
+            if self._model is not None and self._model_name == model_name:
+                return True
+            try:
+                import torch
+                from transformers import AutoProcessor, AutoModelForMultimodalLM
+                if status_callback:
+                    status_callback("loading", f"加载 Qwen3-ASR {model_name.split('/')[-1]}（首次需下载）...")
+                self._processor = AutoProcessor.from_pretrained(model_name)
+                self._model = AutoModelForMultimodalLM.from_pretrained(
+                    model_name,
+                    device_map="cpu",
+                    dtype=torch.float32,
+                )
+                self._model.eval()
+                self._model_name = model_name
+                if status_callback:
+                    status_callback("ready", f"Qwen3-ASR 就绪")
+                return True
+            except ImportError as e:
+                self._model = None
+                self._processor = None
+                if status_callback:
+                    status_callback("error", f"transformers/torch 未安装: {e}")
+                return False
+            except Exception as e:
+                self._model = None
+                self._processor = None
+                _tb = traceback.format_exc()
+                print("[Qwen3-ASR 加载失败]\n" + _tb, flush=True)
+                if status_callback:
+                    status_callback("error", f"Qwen3-ASR 加载失败: {str(e)}")
+                return False
+
+    def transcribe(self, filepath, model_name=None, status_callback=None, hot_words=None):
+        if not self.load(model_name or self._model_name or QWEN3_DEFAULT_MODEL, status_callback):
+            return None
+        try:
+            import torch
+            if status_callback:
+                status_callback("transcribing", "Qwen3-ASR 转写中（中英混合自动识别）...")
+            # hot_words 通过 initial_prompt 风格注入：Qwen3-ASR 暂无官方
+            # hotword 参数，这里把热词拼到音频处理后的 prompt 里效果有限，
+            # 暂不做特殊处理（与 Whisper 的 initial_prompt 不同）。
+            inputs = self._processor.apply_transcription_request(audio=filepath)
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, max_new_tokens=1024)
+            generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+            text = self._processor.decode(
+                generated_ids, return_format="transcription_only"
+            )[0]
+            return text.strip() if text else ""
+        except Exception as e:
+            if status_callback:
+                status_callback("error", f"Qwen3-ASR 转写失败: {str(e)}")
+            return None
+
+
 # ─── 讯飞实时转写 ───
 class XfyunTranscriber:
     """讯飞语音转写WebSocket API"""
@@ -1449,6 +1624,8 @@ class AppState:
         self.event_loop = None  # uvicorn's event loop, set on first WS connect
         self.recorder = AudioRecorder()
         self.funasr = FunASRTranscriber()
+        self.whisper = WhisperTranscriber()
+        self.qwen3 = Qwen3ASRTranscriber()
         self.xfyun = None
         self.monitor = MeetingMonitor()
         self._lock = threading.Lock()
@@ -1627,6 +1804,12 @@ def create_app():
                 return
             state.is_realtime = True
             engine = state.config.get("engine", "FunASR")
+            if engine in ("Whisper", "Qwen3"):
+                engine_label = "Whisper" if engine == "Whisper" else "Qwen3-ASR"
+                await state.push_event_sync(ws, "realtime_status", {"status": "error", "message": f"{engine_label} 不支持实时转写，请使用 FunASR 或讯飞引擎进行实时转写；{engine_label} 用于录音结束后的文件转写。"})
+                await state.push_event_sync(ws, "status", "就绪")
+                state.is_realtime = False
+                return
             await state.push_event_sync(ws, "realtime_status", {"status": "loading", "message": f"正在启动{engine}..."})
             await state.push_event_sync(ws, "status", "加载中")
             # 启动实时转写线程
@@ -2230,7 +2413,51 @@ def _transcribe_file_task(filepath, ws):
     """后台线程：转写录音文件"""
     try:
         engine = state.config.get("engine", "FunASR")
-        if engine == "FunASR":
+        if engine == "Whisper":
+            def status_cb(status, msg):
+                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+
+            whisper_model = state.config.get("whisper_model", WHISPER_DEFAULT_MODEL)
+            state.push_from_thread("log", {"message": f"使用 Whisper {whisper_model} 转写..."})
+            result = state.whisper.transcribe(
+                filepath,
+                model_name=whisper_model,
+                status_callback=status_cb,
+                hot_words=state.config.get("hot_words", ""),
+            )
+            if result is not None:
+                state.set_transcript(result)
+                state.sentence_info = []
+                state.speaker_count = 0
+                state.push_from_thread("transcript_ready", result)
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": f"Whisper 转写完成，共{len(result)}字"})
+            else:
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": "Whisper 转写失败"})
+        elif engine == "Qwen3":
+            def status_cb(status, msg):
+                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+
+            qwen3_model = state.config.get("qwen3_model", QWEN3_DEFAULT_MODEL)
+            state.push_from_thread("log", {"message": f"使用 Qwen3-ASR {qwen3_model.split('/')[-1]} 转写..."})
+            result = state.qwen3.transcribe(
+                filepath,
+                model_name=qwen3_model,
+                status_callback=status_cb,
+                hot_words=state.config.get("hot_words", ""),
+            )
+            if result is not None:
+                state.set_transcript(result)
+                state.sentence_info = []
+                state.speaker_count = 0
+                state.push_from_thread("transcript_ready", result)
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": f"Qwen3-ASR 转写完成，共{len(result)}字"})
+            else:
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": "Qwen3-ASR 转写失败"})
+        elif engine == "FunASR":
             def status_cb(status, msg):
                 state.push_from_thread("realtime_status", {"status": status, "message": msg})
 
