@@ -359,6 +359,15 @@ DIAR_PUNC_MODEL = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 # （原 ERes2NetV2 的 modelscope 仓库 iic/speech_eres2netv2_sv_zh-cn_16k-common
 #  现已持续返回 404，导致加载失败。）
 DIAR_SPK_MODEL = "cam++"
+
+# 说话人分离后端：
+#   "pyannote" —— pyannote.audio 神经说话人分离（更准，需 HF token 下载 gated 模型）
+#   "funasr"   —— FunASR 内置 cam++ 说话人模型（纯离线，精度一般，作为兜底）
+DIAR_BACKEND_PYANNOTE = "pyannote"
+DIAR_BACKEND_FUNASR = "funasr"
+DIAR_DEFAULT_BACKEND = DIAR_BACKEND_PYANNOTE
+# pyannote 预训练 pipeline（HuggingFace gated 模型，需 HF token 且在网页接受条款）
+PYANNOTE_DEFAULT_MODEL = "pyannote/speaker-diarization-3.1"
 _FILE_MODEL_ALIASES = {
     "paraformer-large": FILE_MODEL_PARAFORMER_LARGE,
     "sensevoice": FILE_MODEL_SENSEVOICE,
@@ -407,6 +416,12 @@ DEFAULT_CONFIG = {
     "save_format": "txt",
     "speaker_diarization": False,
     "preset_spk_num": 0,
+    "diarization_backend": DIAR_DEFAULT_BACKEND,
+    "pyannote_model": PYANNOTE_DEFAULT_MODEL,
+    # HuggingFace token，用于下载 pyannote gated 模型。留空则回退读环境变量
+    # HF_TOKEN / HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_HUB_TOKEN；都没有则
+    # 回退到 FunASR 内置 cam++ 后端。
+    "hf_token": "",
 }
 
 # ─── 配置持久化 ───
@@ -1043,6 +1058,7 @@ class FunASRTranscriber:
         self.stream_model = None     # 实时流式模型 (paraformer-online)
         self.punc_model = None       # 标点恢复模型 (punc_ct-transformer)
         self.diarization_model = None  # 说话人分离pipeline (paraformer-large-vad-punc + ERes2NetV2)
+        self._pyannote = None          # pyannote 说话人分离后端（懒加载）
         self._file_model_name = None
         self._stream_model_name = None
         self._file_loading = False
@@ -1238,8 +1254,43 @@ class FunASRTranscriber:
                 status_callback("error", f"转写失败: {str(e)}")
             return None
 
-    def transcribe_file_with_diarization(self, filepath, status_callback=None, preset_spk_num=None, hot_words=None):
-        """转写音频文件并做说话人分离（使用paraformer-large-vad-punc + ERes2NetV2）"""
+    def transcribe_file_with_diarization(self, filepath, status_callback=None,
+                                         preset_spk_num=None, hot_words=None,
+                                         diarization_config=None):
+        """转写音频文件并做说话人分离。
+
+        diarization_config: 可选 dict，读取后端类型 / HF token：
+            - diarization_backend: "pyannote"（默认/推荐）或 "funasr"
+            - pyannote_model: pipeline 模型名
+            - hf_token: HuggingFace token
+            - preset_spk_num 也可从这里读
+        流程（pyannote）：FunASR 出带字级时间戳的句子 → pyannote 出说话人段 →
+        按时间重叠合并。pyannote 不可用时自动回退 FunASR 内置 cam++。
+        """
+        diarization_config = diarization_config or {}
+        preset_spk_num = preset_spk_num or diarization_config.get("preset_spk_num")
+        backend = (diarization_config.get("diarization_backend")
+                   or DIAR_DEFAULT_BACKEND).strip().lower()
+
+        if backend == DIAR_BACKEND_PYANNOTE:
+            try:
+                return self._transcribe_with_pyannote(
+                    filepath, status_callback=status_callback,
+                    preset_spk_num=preset_spk_num, hot_words=hot_words,
+                    pyannote_model=diarization_config.get("pyannote_model"),
+                    hf_token=diarization_config.get("hf_token"),
+                )
+            except Exception as e:
+                if status_callback:
+                    status_callback("log", f"pyannote 说话人分离失败，回退 FunASR 内置后端: {e}")
+                # 回退到 FunASR 内置 cam++
+        return self._transcribe_with_funasr_spk(
+            filepath, status_callback=status_callback,
+            preset_spk_num=preset_spk_num, hot_words=hot_words)
+
+    def _transcribe_with_funasr_spk(self, filepath, status_callback=None,
+                                    preset_spk_num=None, hot_words=None):
+        """FunASR 内置 cam++ 说话人分离（离线兜底）。"""
         # 加载带说话人分离的pipeline（需要支持timestamp的ASR模型）
         if not self._load_diarization_model(status_callback):
             return None
@@ -1269,6 +1320,50 @@ class FunASRTranscriber:
                 status_callback("error", f"说话人分离转写失败: {str(e)}")
             return None
 
+    def _transcribe_with_pyannote(self, filepath, status_callback=None,
+                                  preset_spk_num=None, hot_words=None,
+                                  pyannote_model=None, hf_token=None):
+        """pyannote 分离说话人 + FunASR 出带时间戳的转写，按时间重叠合并。"""
+        # 1) 加载/获取 pyannote pipeline（懒加载，实例缓存）
+        if not hasattr(self, "_pyannote") or self._pyannote is None:
+            self._pyannote = PyannoteDiarizer()
+        token = _resolve_hf_token(hf_token)
+        self._pyannote.load(
+            model_name=pyannote_model or PYANNOTE_DEFAULT_MODEL,
+            hf_token=token, status_callback=status_callback)
+
+        # 2) 加载 FunASR 分离专用 ASR（出字级时间戳）
+        if not self._load_diarization_model(status_callback):
+            return None
+
+        # 3) 跑 ASR（只转写，不要内置 spk）
+        if status_callback:
+            status_callback("transcribing", "正在转写（含说话人分离）...")
+        asr_kwargs = dict(input=filepath, batch_size_s=300,
+                          sentence_timestamp=True, pred_timestamp=True)
+        asr_kwargs.update(self.build_hotword_kwargs(hot_words))
+        result = self.diarization_model.generate(**asr_kwargs)
+        if not result or len(result) == 0:
+            return {"text": "", "sentence_info": [], "speaker_count": 0}
+        item = result[0]
+        text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', item.get("text", "")).strip()
+        raw_sents = item.get("sentence_info", []) or []
+
+        # 4) 跑 pyannote 说话人分段
+        tracks = self._pyannote.diarize(
+            filepath, num_speakers=preset_spk_num,
+            status_callback=status_callback)
+
+        # 5) 按时间重叠合并
+        sentence_info, label_map = _assign_speakers_to_sentences(raw_sents, tracks)
+        speaker_count = len(label_map) if label_map else 0
+
+        return {
+            "text": text,
+            "sentence_info": sentence_info,
+            "speaker_count": speaker_count,
+        }
+
     def _load_diarization_model(self, status_callback=None):
         """加载说话人分离pipeline（独立于file_model和stream_model）"""
         if self.diarization_model is not None:
@@ -1293,7 +1388,7 @@ class FunASRTranscriber:
                     # 不能用自带 vad-punc 的 paraformer（与外挂 VAD 冲突）。
                     # VAD 必须传注册名 "fsmn-vad"，传本地 snapshot 路径会报 not registered。
                     # pred_timestamp=True 让 ASR 输出字级时间戳，sentence_info 依赖它。
-                    model=DIAR_ASR_MODEL,
+                    model=_resolve_local_model(DIAR_ASR_MODEL),
                     vad_model=DIAR_VAD_MODEL,
                     punc_model=_resolve_local_model(DIAR_PUNC_MODEL),
                     spk_model=DIAR_SPK_MODEL,
@@ -1310,6 +1405,232 @@ class FunASRTranscriber:
             return False
         finally:
             self._diarization_loading = False
+
+
+# ─── pyannote 说话人分离 ───
+def _resolve_hf_token(config_token=""):
+    """解析 HuggingFace token：优先配置值，其次环境变量。"""
+    token = (config_token or "").strip()
+    if token:
+        return token
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    return None
+
+
+def _overlap_ms(a_start, a_end, b_start, b_end):
+    """两个区间的重叠长度（毫秒）。"""
+    return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def _speaker_at(ms, tracks_ms, last_id):
+    """返回某毫秒时刻对应的说话人 id。重叠语音时优先选“最短覆盖段”——
+    插话者的段通常更短更具体，长段主句在重叠区让位。无覆盖用 last_id。"""
+    best = None  # (duration, sid)
+    for t_start, t_end, sid in tracks_ms:
+        if t_start <= ms < t_end:
+            dur = t_end - t_start
+            if best is None or dur < best[0]:
+                best = (dur, sid)
+    if best is not None:
+        return best[1], True
+    return last_id, False
+
+
+def _assign_speakers_to_sentences(sentence_info, diarization_tracks):
+    """把 pyannote 的说话人段标注到 ASR 结果上。
+
+    新版策略（处理重叠语音）：利用 FunASR 的字级时间戳（timestamp 字段，每个字
+    [start_ms, end_ms]）逐字判定说话人，再把同一说话人连续的字合并成新句子。
+    这样一句话里两个人抢话也能拆成两段，不会被整句多数票盖掉。
+
+    入参:
+      sentence_info: [{text, start, end, timestamp:[[s,e],...], ...}]（毫秒）
+      diarization_tracks: [(start_s, end_s, speaker_label)]（秒）
+    返回:
+      (new_sentence_info, label_to_id)
+      每项写 spk（int）；新句子的 start/end 由字级时间戳重新计算。
+      若某句没有字级 timestamp，退回整句最大重叠判定。
+    """
+    label_to_id = {}
+    next_id = [0]
+
+    def _id_for(label):
+        if label not in label_to_id:
+            label_to_id[label] = next_id[0]
+            next_id[0] += 1
+        return label_to_id[label]
+
+    tracks_ms = [(int(s * 1000), int(e * 1000), _id_for(label))
+                 for s, e, label in diarization_tracks]
+
+    result = []
+    last_id = 0
+    for sent in sentence_info:
+        chars = list(sent.get("text", ""))
+        ts = sent.get("timestamp") or []
+        merged = dict(sent)
+
+        # 没有字级时间戳 → 退回整句最大重叠
+        if not ts:
+            s_start = int(sent.get("start", 0))
+            s_end = int(sent.get("end", s_start))
+            best_id, best_ov = None, 0
+            for t_start, t_end, sid in tracks_ms:
+                ov = _overlap_ms(s_start, s_end, t_start, t_end)
+                if ov > best_ov:
+                    best_ov, best_id = ov, sid
+            if best_id is None:
+                best_id = last_id
+            else:
+                last_id = best_id
+            merged["spk"] = best_id
+            result.append(merged)
+            continue
+
+        # 逐字归说话人，按连续相同说话人切段。
+        # FunASR 的 timestamp 只对应“内容字”（跳过空格/标点），需先对齐。
+        import unicodedata
+        def _is_content(c):
+            cat = unicodedata.category(c)
+            return not (cat.startswith("P") or cat.startswith("Z") or cat.startswith("C"))
+
+        n_ts = len(ts)
+        char_times = []  # 每个字符的 (start, end)，无时间戳的为 None
+        ti = 0
+        for c in chars:
+            if _is_content(c) and ti < n_ts:
+                char_times.append((int(ts[ti][0]), int(ts[ti][1])))
+                ti += 1
+            else:
+                char_times.append(None)
+        # 前向填充：开头的标点/空格继承后面第一个内容字时间
+        first_content = next((i for i, t in enumerate(char_times) if t), None)
+        if first_content is not None and first_content > 0:
+            fill = char_times[first_content]
+            for i in range(first_content):
+                char_times[i] = fill
+        # 后向/中间填充：无时间的字继承前一个内容字时间
+        last = None
+        for i, t in enumerate(char_times):
+            if t is None:
+                char_times[i] = last if last is not None else (int(sent["start"]), int(sent["end"]))
+            else:
+                last = t
+
+        cur_spk, cur_chars, cur_start, cur_end = None, [], None, None
+        for ch, (cs, ce) in zip(chars, char_times):
+            mid = (cs + ce) // 2
+            sid, hit = _speaker_at(mid, tracks_ms, last_id)
+            if hit:
+                last_id = sid
+            if cur_spk is None:
+                cur_spk, cur_chars = sid, [ch]
+                cur_start, cur_end = cs, ce
+            elif sid == cur_spk:
+                cur_chars.append(ch)
+                cur_end = ce
+            else:
+                seg = dict(merged)
+                seg["text"] = "".join(cur_chars)
+                seg["spk"] = cur_spk
+                seg["start"] = cur_start
+                seg["end"] = cur_end
+                result.append(seg)
+                cur_spk, cur_chars = sid, [ch]
+                cur_start, cur_end = cs, ce
+        if cur_chars:
+            seg = dict(merged)
+            seg["text"] = "".join(cur_chars)
+            seg["spk"] = cur_spk
+            seg["start"] = cur_start
+            seg["end"] = cur_end
+            result.append(seg)
+
+    return result, label_to_id
+
+
+class PyannoteDiarizer:
+    """pyannote.audio 说话人分离后端。
+
+    只负责“谁说了哪段时间”，不做 ASR。与 FunASR 的转写结果按时间重叠合并。
+    模型是 HuggingFace gated 模型，首次加载需 token + 网页接受条款，之后走缓存。
+    """
+    def __init__(self):
+        self._pipeline = None
+        self._model_name = None
+        self._lock = threading.Lock()
+
+    def load(self, model_name=PYANNOTE_DEFAULT_MODEL, hf_token=None,
+             status_callback=None):
+        if self._pipeline is not None and self._model_name == model_name:
+            return True
+        with self._lock:
+            if self._pipeline is not None and self._model_name == model_name:
+                return True
+            try:
+                if status_callback:
+                    status_callback("loading", "加载 pyannote 说话人分离模型（首次需下载）...")
+                from pyannote.audio import Pipeline
+                kwargs = {}
+                if hf_token:
+                    kwargs["token"] = hf_token
+                self._pipeline = Pipeline.from_pretrained(model_name, **kwargs)
+                if self._pipeline is None:
+                    raise RuntimeError("Pipeline.from_pretrained 返回 None（可能是 token 无效或未接受模型条款）")
+                # CPU 推理（本机 Arc 核显不被 pyannote/torch 支持，GPU 路径无收益）
+                try:
+                    import torch
+                    self._pipeline.to(torch.device("cpu"))
+                except Exception:
+                    pass
+                self._model_name = model_name
+                if status_callback:
+                    status_callback("ready", "pyannote 说话人分离模型就绪")
+                return True
+            except Exception as e:
+                self._pipeline = None
+                self._model_name = None
+                if status_callback:
+                    status_callback("error", f"pyannote 模型加载失败: {e}")
+                raise
+
+    def diarize(self, wav_path, num_speakers=None, min_speakers=None,
+                max_speakers=None, status_callback=None):
+        """对音频文件跑说话人分离，返回 [(start_s, end_s, label), ...]。
+
+        直接用 soundfile 读成波形张量传入 pipeline，避免 pyannote 4.x 默认走
+        torchcodec 解码（需系统安装 FFmpeg full-shared DLL，Windows 上常缺）。
+        """
+        if self._pipeline is None:
+            raise RuntimeError("pyannote pipeline 未加载")
+        if status_callback:
+            status_callback("diarizing", "pyannote 正在分离说话人...")
+        import soundfile as sf
+        import torch
+        waveform_np, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+        # always_2d -> (samples, channels)；pyannote 要 (channels, samples)
+        waveform = torch.from_numpy(waveform_np.T).contiguous()
+        kwargs = {}
+        if num_speakers:
+            kwargs["num_speakers"] = int(num_speakers)
+        if min_speakers:
+            kwargs["min_speakers"] = int(min_speakers)
+        if max_speakers:
+            kwargs["max_speakers"] = int(max_speakers)
+        # pyannote pipeline 接受 dict: {"waveform":..., "sample_rate":...}
+        audio_in = {"waveform": waveform, "sample_rate": int(sr)}
+        result = self._pipeline(audio_in, **kwargs)
+        # pyannote.audio 4.x 返回 DiarizeOutput，真正的 Annotation 在 .speaker_diarization；
+        # 旧版直接返回 Annotation。两者都兼容。
+        annotation = getattr(result, "speaker_diarization", result)
+        tracks = []
+        for segment, _, speaker in annotation.itertracks(yield_label=True):
+            tracks.append((segment.start, segment.end, speaker))
+        tracks.sort(key=lambda t: t[0])
+        return tracks
 
 
 # ─── Whisper 文件转写（faster-whisper）───
@@ -2693,7 +3014,7 @@ def _transcribe_file_task(filepath, ws):
                 state.push_from_thread("log", {"message": "正在加载说话人分离模型..."})
                 result = state.funasr.transcribe_file_with_diarization(
                     filepath, status_callback=status_cb, preset_spk_num=preset_spk,
-                    hot_words=hot_words
+                    hot_words=hot_words, diarization_config=state.config
                 )
                 if result is not None:
                     state.set_transcript(result.get("text", ""))
@@ -3055,7 +3376,8 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                 def diarization_status_cb(status, msg):
                     push("realtime_status", {"status": status, "message": msg})
                 result = state.funasr.transcribe_file_with_diarization(
-                    recording_filepath, status_callback=diarization_status_cb, preset_spk_num=preset_spk
+                    recording_filepath, status_callback=diarization_status_cb, preset_spk_num=preset_spk,
+                    diarization_config=state.config
                 )
                 if result is not None:
                     state.sentence_info = result.get("sentence_info", [])
