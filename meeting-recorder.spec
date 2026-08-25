@@ -16,6 +16,25 @@ modelscope_datas = collect_data_files('modelscope')
 funasr_hiddenimports = collect_submodules('funasr')
 modelscope_hiddenimports = collect_submodules('modelscope')
 
+# pyannote 说话人分离：大量动态实例化（hydra/omegaconf 通过配置字符串 import），
+# 需把 pyannote 全家桶 + hydra + asteroid_filterbanks 的子模块和数据全收进来。
+_pyannote_pkgs = [
+    'pyannote.audio', 'pyannote.core', 'pyannote.database',
+    'pyannote.pipeline', 'pyannote.metrics',
+    'hydra', 'omegaconf', 'asteroid_filterbanks',
+]
+pyannote_datas = []
+pyannote_hiddenimports = []
+for _pkg in _pyannote_pkgs:
+    try:
+        pyannote_datas += collect_data_files(_pkg)
+    except Exception:
+        pass
+    try:
+        pyannote_hiddenimports += collect_submodules(_pkg)
+    except Exception:
+        pass
+
 a = Analysis(
     ['app.py'],
     pathex=[],
@@ -24,8 +43,10 @@ a = Analysis(
         ('ui/index.html', 'ui'),          # 前端页面
         ('app_icon.ico', '.'),             # 应用图标
         ('app_icon.png', '.'),             # 应用图标PNG
-    ] + funasr_datas + modelscope_datas,
+    ] + funasr_datas + modelscope_datas + pyannote_datas,
     hiddenimports=[
+        'pyannote.audio.pipelines.speaker_diarization',
+        'soundfile',
         'uvicorn.logging',
         'uvicorn.loops',
         'uvicorn.loops.auto',
@@ -42,7 +63,7 @@ a = Analysis(
         'websockets',
         'websocket',
         'websocket_client',
-    ] + funasr_hiddenimports + modelscope_hiddenimports,
+    ] + funasr_hiddenimports + modelscope_hiddenimports + pyannote_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
