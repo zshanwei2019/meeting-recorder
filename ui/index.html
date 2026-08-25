@@ -554,12 +554,21 @@ html, body {
         录音结束自动转写
       </label>
       <label class="checkbox-row">
-        <input type="checkbox" id="speakerDiarization">
+        <input type="checkbox" id="speakerDiarization" onchange="onSpeakerDiarChange()">
         说话人分离（识别不同说话人）
       </label>
       <div id="spkNumRow" style="display:none; margin-left:24px; margin-top:4px;">
         <div class="setting-label" style="font-size:12px;">预设说话人数（0=自动）</div>
         <input class="setting-input" id="presetSpkNum" type="number" min="0" max="20" value="0" style="width:80px;" oninput="saveConfig()">
+        <div class="setting-label" style="font-size:12px; margin-top:6px;">分离后端</div>
+        <select class="setting-select" id="diarBackend" style="width:100%;" onchange="onDiarBackendChange()">
+          <option value="pyannote">pyannote（更准，需HF Token）</option>
+          <option value="funasr">FunASR内置（离线，兜底）</option>
+        </select>
+        <div id="hfTokenRow" style="margin-top:6px;">
+          <div class="setting-label" style="font-size:12px;">HuggingFace Token（pyannote用，仅本机存储）</div>
+          <input class="setting-input" id="hfToken" type="password" placeholder="hf_..." oninput="saveConfig()">
+        </div>
       </div>
       <div>
         <div class="setting-label">AI纪要 API Key</div>
@@ -812,6 +821,20 @@ function applyConfig(config) {
     document.getElementById('spkNumRow').style.display = 'block';
   }
   if (config.preset_spk_num) document.getElementById('presetSpkNum').value = config.preset_spk_num;
+  if (config.diarization_backend) document.getElementById('diarBackend').value = config.diarization_backend;
+  if (config.hf_token) document.getElementById('hfToken').value = config.hf_token;
+  onDiarBackendChange();
+}
+
+function onDiarBackendChange() {
+  const backend = document.getElementById('diarBackend').value;
+  document.getElementById('hfTokenRow').style.display = (backend === 'pyannote') ? '' : 'none';
+}
+
+function onSpeakerDiarChange() {
+  const on = document.getElementById('speakerDiarization').checked;
+  document.getElementById('spkNumRow').style.display = on ? 'block' : 'none';
+  saveConfig();
 }
 
 function onEngineChange() {
@@ -835,6 +858,8 @@ function saveConfig() {
     auto_transcribe: document.getElementById('autoTranscribe').checked,
     speaker_diarization: document.getElementById('speakerDiarization').checked,
     preset_spk_num: parseInt(document.getElementById('presetSpkNum').value) || 0,
+    diarization_backend: document.getElementById('diarBackend').value,
+    hf_token: document.getElementById('hfToken').value,
     llm_api_key: document.getElementById('llmKey').value,
     llm_provider: document.getElementById('llmProvider').value,
     hot_words: document.getElementById('hotWords').value,
