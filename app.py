@@ -1603,26 +1603,109 @@ class PyannoteDiarizer:
 
         直接用 soundfile 读成波形张量传入 pipeline，避免 pyannote 4.x 默认走
         torchcodec 解码（需系统安装 FFmpeg full-shared DLL，Windows 上常缺）。
+
+        长音频在 CPU 上可能要几十分钟，用 hook + 心跳线程持续报告阶段和预计剩余时间，
+        避免前端以为卡死。
         """
         if self._pipeline is None:
             raise RuntimeError("pyannote pipeline 未加载")
-        if status_callback:
-            status_callback("diarizing", "pyannote 正在分离说话人...")
         import soundfile as sf
         import torch
+        import threading
+        import time as _time
+
+        info = sf.info(str(wav_path))
+        audio_dur_s = info.frames / info.samplerate
+
+        if status_callback:
+            mins = audio_dur_s / 60
+            status_callback("diarizing",
+                f"正在分离说话人（音频 {mins:.0f} 分钟，CPU 推理约需 {mins*0.68:.0f} 分钟，请耐心等待）...")
+
         waveform_np, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-        # always_2d -> (samples, channels)；pyannote 要 (channels, samples)
         waveform = torch.from_numpy(waveform_np.T).contiguous()
-        kwargs = {}
-        if num_speakers:
-            kwargs["num_speakers"] = int(num_speakers)
-        if min_speakers:
-            kwargs["min_speakers"] = int(min_speakers)
-        if max_speakers:
-            kwargs["max_speakers"] = int(max_speakers)
-        # pyannote pipeline 接受 dict: {"waveform":..., "sample_rate":...}
         audio_in = {"waveform": waveform, "sample_rate": int(sr)}
-        result = self._pipeline(audio_in, **kwargs)
+
+        # pyannote hook 阶段名 → 中文显示
+        _STAGE_NAMES = {
+            "segmentation": "语音分段",
+            "embeddings": "声纹提取",
+            "speaker_counting": "说话人计数",
+            "discrete_diarization": "聚类归并",
+        }
+        current_stage = ["启动"]
+        stage_start = [_time.time()]
+        done = [False]
+        result_holder = [None]
+        exc_holder = [None]
+
+        def hook(step_name, *args, **kwargs):
+            # pyannote 会在不同阶段用两种方式调 hook：
+            #   hook("segmentation", segmentations)  阶段切换
+            #   hook(completed=3, total=10)            滑动窗口进度
+            if isinstance(step_name, str) and step_name in _STAGE_NAMES:
+                current_stage[0] = _STAGE_NAMES[step_name]
+                stage_start[0] = _time.time()
+                if status_callback:
+                    elapsed = _time.time() - t0
+                    status_callback("diarizing",
+                        f"正在分离说话人：{_STAGE_NAMES[step_name]}...（已用 {elapsed/60:.1f} 分钟）")
+            elif "completed" in kwargs and "total" in kwargs and status_callback:
+                comp = kwargs["completed"]
+                total = kwargs["total"]
+                if total and comp > 0:
+                    elapsed = _time.time() - t0
+                    pct = comp / total
+                    # 按已完成比例粗估剩余时间
+                    est_total = elapsed / pct if pct > 0 else 0
+                    remaining = max(0, est_total - elapsed)
+                    status_callback("diarizing",
+                        f"正在分离说话人：{current_stage[0]}..."
+                        f"（{comp}/{total} 块，已用 {elapsed/60:.1f} 分钟，"
+                        f"预计剩余 {remaining/60:.1f} 分钟）")
+
+        t0 = _time.time()
+
+        def _run():
+            try:
+                kwargs = {}
+                if num_speakers:
+                    kwargs["num_speakers"] = int(num_speakers)
+                if min_speakers:
+                    kwargs["min_speakers"] = int(min_speakers)
+                if max_speakers:
+                    kwargs["max_speakers"] = int(max_speakers)
+                result_holder[0] = self._pipeline.apply(
+                    audio_in, hook=hook, **kwargs)
+            except Exception as e:
+                exc_holder[0] = e
+            finally:
+                done[0] = True
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        # 心跳：每 15 秒报一次进度
+        while not done[0]:
+            t.join(timeout=15)
+            if not done[0]:
+                elapsed = _time.time() - t0
+                if status_callback:
+                    est_total = audio_dur_s * 0.68
+                    remaining = max(0, est_total - elapsed)
+                    status_callback("diarizing",
+                        f"正在分离说话人：{current_stage[0]}..."
+                        f"（已用 {elapsed/60:.1f} 分钟，预计剩余 {remaining/60:.1f} 分钟）")
+
+        if exc_holder[0] is not None:
+            raise exc_holder[0]
+
+        result = result_holder[0]
+        elapsed = _time.time() - t0
+        if status_callback:
+            status_callback("diarizing",
+                f"说话人分离完成（耗时 {elapsed/60:.1f} 分钟）")
+
         # pyannote.audio 4.x 返回 DiarizeOutput，真正的 Annotation 在 .speaker_diarization；
         # 旧版直接返回 Annotation。两者都兼容。
         annotation = getattr(result, "speaker_diarization", result)
