@@ -1697,8 +1697,15 @@ class PyannoteDiarizer:
             self._pipeline = None
             gc.collect()
 
-        worker_script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "pyannote_chunk_worker.py")
+        if getattr(sys, "frozen", False):
+            # PyInstaller onefile：没有独立 python，也没有 loose .py；
+            # worker 复用 asr-server.exe，靠 --pyannote-worker 首参数派发
+            # （见 app.py __main__ 入口）。
+            worker_script = None
+        else:
+            worker_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "pyannote_chunk_worker.py")
 
         # 构建所有 chunk 的请求
         chunk_jobs = []
@@ -1746,8 +1753,14 @@ class PyannoteDiarizer:
             err_log = os.path.join(job["tmp_dir"], "worker.log")
             err_fh = open(err_log, "w", encoding="utf-8")
             # stderr 写文件而非 PIPE：既避免管道死锁，又能事后看 worker 进度
+            if worker_script is not None:
+                worker_cmd = [_sys.executable, worker_script,
+                              job["req_file"], job["out_file"]]
+            else:
+                worker_cmd = [_sys.executable, "--pyannote-worker",
+                              job["req_file"], job["out_file"]]
             proc = subprocess.Popen(
-                [_sys.executable, worker_script, job["req_file"], job["out_file"]],
+                worker_cmd,
                 stdout=subprocess.DEVNULL, stderr=err_fh,
                 text=True, encoding="utf-8", env=env,
             )
@@ -4515,4 +4528,13 @@ def _main_inner(log_error):
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--pyannote-worker":
+        # PyInstaller onefile 打包后没有独立 python 解释器、也没有 loose .py，
+        # worker 子进程复用同一个 asr-server.exe，靠首参数派发。
+        # sys.argv 去掉 "--pyannote-worker"，worker.main() 读 argv[1]/argv[2]
+        # 作为 request_json / output_json 路径。
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        import pyannote_chunk_worker
+        pyannote_chunk_worker.main()
+    else:
+        main()

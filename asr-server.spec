@@ -41,6 +41,7 @@ a = Analysis(
         ('app_icon.png', '.'),
     ] + funasr_datas + modelscope_datas + pyannote_datas,
     hiddenimports=[
+        'pyannote_chunk_worker',
         'pyannote.audio.pipelines.speaker_diarization',
         'soundfile',
         'uvicorn.logging',
