@@ -106,6 +106,28 @@ id=13  立体声混音 (Realtek HD Audio Stereo input)  ch=2  sr=48000
 
 音频来源可选：系统声音 / 麦克风 / 两者混合（默认 `both`）。
 
+## 🗣️ 说话人分离（pyannote，需 HuggingFace 授权）
+
+说话人分离默认用本地 **pyannote.audio** 后端，能把转写按「说话人 0 / 说话人 1 …」分段。
+模型来自 HuggingFace，其中部分是 **gated（需授权）**，首次使用前要完成一次性授权：
+
+1. 注册 / 登录 [HuggingFace](https://huggingface.co) 账号。
+2. 打开下面模型页，逐个点 **"Agree and access repository"** 接受协议：
+   - [`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1)（主 pipeline，gated）
+   - [`pyannote/segmentation-3.0`](https://huggingface.co/pyannote/segmentation-3.0)（分段模型，gated）
+   - [`pyannote/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM)（声纹模型，用于跨分块全局聚类）
+3. 生成一个 **Access Token**：[Settings → Access Tokens](https://huggingface.co/settings/tokens)（Read 权限即可）。
+4. 在程序「设置」里把后端选为 **pyannote**，把 Token 粘贴到 **HuggingFace Token** 框
+   （仅存本机 `config.json`，不上传）。也可改用环境变量 `HF_TOKEN` /
+   `HUGGING_FACE_HUB_TOKEN` / `HUGGINGFACE_HUB_TOKEN`。
+
+授权并填好 Token 后，首次分离会自动下载模型到 HF 缓存（离线可用）。
+长音频（如 2 小时会议）会自动切成 10 分钟分块、多个子进程并行处理，
+并按声纹全局聚类成稳定的说话人编号（不会因分块把同一个人拆成多个）。
+
+> 不填 Token / 不授权也能用：程序会回退到 FunASR 内置的 cam++ 分离后端，
+> 或直接关闭说话人分离，转写与其他功能不受影响。
+
 ## ⚙️ 可选配置
 
 以下功能需在界面中填入相应密钥，**不配置也能正常使用本地转写**：
@@ -115,6 +137,7 @@ id=13  立体声混音 (Realtek HD Audio Stereo input)  ch=2  sr=48000
 | 讯飞实时转写 | `xfyun_app_id`、`xfyun_api_key`、`xfyun_api_secret` |
 | AI 摘要 | `llm_api_key`、`llm_provider`（`xfyun` / `volcengine` / `deepseek` / `qwen`） |
 | 热词优化 | `hot_words`（提升专有名词识别准确率） |
+| 说话人分离（pyannote） | `hf_token`（HuggingFace Token，需先授权 gated 模型，见上节） |
 
 ## 📁 文件存储
 
