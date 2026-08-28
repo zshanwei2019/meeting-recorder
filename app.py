@@ -1324,6 +1324,7 @@ class FunASRTranscriber:
                                   preset_spk_num=None, hot_words=None,
                                   pyannote_model=None, hf_token=None):
         """pyannote 分离说话人 + FunASR 出带时间戳的转写，按时间重叠合并。"""
+        import gc
         # 1) 加载/获取 pyannote pipeline（懒加载，实例缓存）
         if not hasattr(self, "_pyannote") or self._pyannote is None:
             self._pyannote = PyannoteDiarizer()
@@ -1333,7 +1334,8 @@ class FunASRTranscriber:
             hf_token=token, status_callback=status_callback)
 
         # 2) 加载 FunASR 分离专用 ASR（出字级时间戳）
-        if not self._load_diarization_model(status_callback):
+        #    pyannote 模式不需要 cam++ spk_model，省几百 MB 内存
+        if not self._load_diarization_model(status_callback, with_spk=False):
             return None
 
         # 3) 跑 ASR（只转写，不要内置 spk）
@@ -1348,6 +1350,12 @@ class FunASRTranscriber:
         item = result[0]
         text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', item.get("text", "")).strip()
         raw_sents = item.get("sentence_info", []) or []
+
+        # 3.5) ASR 完成，立即释放 FunASR 模型内存，给 pyannote 腾空间
+        if status_callback:
+            status_callback("log", "转写完成，释放 ASR 模型内存...")
+        self._unload_diarization_model()
+        gc.collect()
 
         # 4) 跑 pyannote 说话人分段
         tracks = self._pyannote.diarize(
@@ -1364,8 +1372,12 @@ class FunASRTranscriber:
             "speaker_count": speaker_count,
         }
 
-    def _load_diarization_model(self, status_callback=None):
-        """加载说话人分离pipeline（独立于file_model和stream_model）"""
+    def _load_diarization_model(self, status_callback=None, with_spk=True):
+        """加载说话人分离pipeline（独立于file_model和stream_model）。
+
+        with_spk=False 时不加载 cam++ 说话人模型，省几百 MB 内存。
+        pyannote 后端不需要 cam++（它自己做声纹分离），应传 False。
+        """
         if self.diarization_model is not None:
             return True
         if self._diarization_loading:
@@ -1383,18 +1395,17 @@ class FunASRTranscriber:
                     status_callback("loading", "加载说话人分离模型（首次较慢）...")
                 from funasr import AutoModel
                 _patch_funasr_char_tokenizer()
-                self.diarization_model = AutoModel(
-                    # 说话人分离必须四模型拼：纯ASR + 独立VAD + 标点 + 说话人。
-                    # 不能用自带 vad-punc 的 paraformer（与外挂 VAD 冲突）。
-                    # VAD 必须传注册名 "fsmn-vad"，传本地 snapshot 路径会报 not registered。
-                    # pred_timestamp=True 让 ASR 输出字级时间戳，sentence_info 依赖它。
-                    model=_resolve_local_model(DIAR_ASR_MODEL),
-                    vad_model=DIAR_VAD_MODEL,
-                    punc_model=_resolve_local_model(DIAR_PUNC_MODEL),
-                    spk_model=DIAR_SPK_MODEL,
-                    model_kwargs={"pred_timestamp": True, "mode": "paraformer"},
-                    disable_update=True,
-                )
+                model_kwargs = {
+                    "model": _resolve_local_model(DIAR_ASR_MODEL),
+                    "vad_model": DIAR_VAD_MODEL,
+                    "punc_model": _resolve_local_model(DIAR_PUNC_MODEL),
+                    "model_kwargs": {"pred_timestamp": True, "mode": "paraformer"},
+                    "disable_update": True,
+                }
+                # cam++ 只在 FunASR 内置说话人分离时需要；pyannote 后端不用
+                if with_spk:
+                    model_kwargs["spk_model"] = DIAR_SPK_MODEL
+                self.diarization_model = AutoModel(**model_kwargs)
             if status_callback:
                 status_callback("ready", "说话人分离模型就绪")
             return True
@@ -1405,6 +1416,19 @@ class FunASRTranscriber:
             return False
         finally:
             self._diarization_loading = False
+
+    def _unload_diarization_model(self):
+        """释放 diarization FunASR 模型，把内存还给系统。
+
+        pyannote 处理长音频时内存峰值高，ASR 跑完后应立即卸载。
+        下次需要时 _load_diarization_model 会重新加载。
+        """
+        if self.diarization_model is not None:
+            try:
+                # FunASR AutoModel 没有官方 close()，直接删引用让 GC 回收
+                self.diarization_model = None
+            except Exception:
+                self.diarization_model = None
 
 
 # ─── pyannote 说话人分离 ───
@@ -1604,29 +1628,246 @@ class PyannoteDiarizer:
         直接用 soundfile 读成波形张量传入 pipeline，避免 pyannote 4.x 默认走
         torchcodec 解码（需系统安装 FFmpeg full-shared DLL，Windows 上常缺）。
 
-        长音频在 CPU 上可能要几十分钟，用 hook + 心跳线程持续报告阶段和预计剩余时间，
-        避免前端以为卡死。
+        长音频（>10 分钟）自动切块处理，每块 10 分钟 + 30 秒重叠，
+        跨块按重叠区域匹配说话人标签，避免 pyannote CPU 处理超长音频时崩溃。
         """
         if self._pipeline is None:
             raise RuntimeError("pyannote pipeline 未加载")
         import soundfile as sf
         import torch
-        import threading
+        import gc
         import time as _time
 
         info = sf.info(str(wav_path))
         audio_dur_s = info.frames / info.samplerate
+        sr = info.samplerate
+
+        # 超过 10 分钟自动分块（实测 pyannote CPU 跑 112 分钟会在 ~20 分钟时崩溃）
+        CHUNK_S = 600       # 10 分钟一块
+        OVERLAP_S = 30      # 30 秒重叠用于跨块匹配说话人
+
+        # 分段+声纹缓存：命中则跳过分块分离（78 分钟那步），直接重聚类。
+        # 用于调聚类阈值 / 重新导出文档时避免重跑。
+        tracks_cache = os.environ.get("MR_TRACKS_CACHE", "").strip()
+        if tracks_cache and os.path.exists(tracks_cache):
+            try:
+                with open(tracks_cache, "r", encoding="utf-8") as f:
+                    _cached_flat = json.load(f)
+                if _cached_flat:
+                    if status_callback:
+                        status_callback("diarizing",
+                            f"命中声纹分段缓存（{len(_cached_flat)} 段），跳过分块分离...")
+                    _cm = self._cluster_speakers_global(
+                        _cached_flat, num_speakers=num_speakers,
+                        min_speakers=min_speakers, max_speakers=max_speakers,
+                        status_callback=status_callback)
+                    _cm.sort(key=lambda t: t[0])
+                    return _cm
+            except Exception as e:
+                if status_callback:
+                    status_callback("log", f"分段缓存读取失败，重新分离: {e}")
+
+        if audio_dur_s <= CHUNK_S + OVERLAP_S:
+            # 短音频直接整段跑
+            return self._diarize_single(wav_path, num_speakers, min_speakers,
+                                        max_speakers, status_callback, audio_dur_s)
+
+        # ── 长音频分块（独立子进程 + 并行，避免 pyannote 连续运行崩溃）──
+        import subprocess, sys as _sys, tempfile, concurrent.futures
+        MAX_PARALLEL = int(os.environ.get("PYANNOTE_PARALLEL", "4"))
+
+        step = CHUNK_S - OVERLAP_S
+        boundaries = []
+        cs = 0.0
+        while cs < audio_dur_s:
+            ce = min(cs + CHUNK_S, audio_dur_s)
+            if ce - cs < 60 and boundaries:  # 最后一块太短，并入上一块
+                break
+            boundaries.append((cs, ce))
+            cs += step
+        num_chunks = len(boundaries)
 
         if status_callback:
-            mins = audio_dur_s / 60
             status_callback("diarizing",
-                f"正在分离说话人（音频 {mins:.0f} 分钟，CPU 推理约需 {mins*0.68:.0f} 分钟，请耐心等待）...")
+                f"音频 {audio_dur_s/60:.0f} 分钟，分 {num_chunks} 块处理"
+                f"（每块 {CHUNK_S//60} 分钟，{MAX_PARALLEL} 并行，独立子进程）...")
 
-        waveform_np, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-        waveform = torch.from_numpy(waveform_np.T).contiguous()
-        audio_in = {"waveform": waveform, "sample_rate": int(sr)}
+        # 主进程不再持有 pipeline（释放内存给子进程）
+        if self._pipeline is not None:
+            self._pipeline = None
+            gc.collect()
 
-        # pyannote hook 阶段名 → 中文显示
+        worker_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "pyannote_chunk_worker.py")
+
+        # 构建所有 chunk 的请求
+        chunk_jobs = []
+        for ci, (chunk_start, chunk_end) in enumerate(boundaries):
+            tmp_dir = tempfile.mkdtemp(prefix=f"pyan_c{ci:02d}_")
+            req_file = os.path.join(tmp_dir, "req.json")
+            out_file = os.path.join(tmp_dir, "out.json")
+            req = {
+                "wav_path": str(wav_path),
+                "start_s": chunk_start,
+                "end_s": chunk_end,
+                "num_speakers": num_speakers,
+                "model_name": self._model_name or PYANNOTE_DEFAULT_MODEL,
+                "hf_token": _resolve_hf_token(),
+                "embed_model": os.environ.get(
+                    "PYANNOTE_EMBED_MODEL",
+                    "pyannote/wespeaker-voxceleb-resnet34-LM"),
+                "embed_step": float(os.environ.get("PYANNOTE_EMBED_STEP", "1.0")),
+            }
+            with open(req_file, "w", encoding="utf-8") as f:
+                json.dump(req, f)
+            chunk_jobs.append({
+                "ci": ci, "start": chunk_start, "end": chunk_end,
+                "req_file": req_file, "out_file": out_file, "tmp_dir": tmp_dir,
+            })
+
+        env = dict(os.environ)
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        env["OMP_NUM_THREADS"] = "4"
+        env["MKL_NUM_THREADS"] = "4"
+        env["TQDM_DISABLE"] = "1"
+
+        all_tracks = [None] * num_chunks  # 按块序号存放，保持顺序
+        t0 = _time.time()
+        completed = [0]
+
+        import threading
+        running_procs = []
+        proc_lock = threading.Lock()
+        WORKER_TIMEOUT = 3000  # 50 分钟（并行抢带宽会变慢，留足余量）
+
+        def _run_chunk(job):
+            ci = job["ci"]
+            err_log = os.path.join(job["tmp_dir"], "worker.log")
+            err_fh = open(err_log, "w", encoding="utf-8")
+            # stderr 写文件而非 PIPE：既避免管道死锁，又能事后看 worker 进度
+            proc = subprocess.Popen(
+                [_sys.executable, worker_script, job["req_file"], job["out_file"]],
+                stdout=subprocess.DEVNULL, stderr=err_fh,
+                text=True, encoding="utf-8", env=env,
+            )
+            with proc_lock:
+                running_procs.append(proc)
+            try:
+                proc.wait(timeout=WORKER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                err_fh.close()
+                return ci, None, f"第 {ci+1} 块超时（>{WORKER_TIMEOUT//60} 分钟）"
+            err_fh.close()
+            if proc.returncode != 0:
+                tail = ""
+                try:
+                    with open(err_log, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.read()[-2000:]
+                except OSError:
+                    pass
+                return ci, None, (
+                    f"第 {ci+1} 块退出码 {proc.returncode}:\n{tail}")
+            with open(job["out_file"], "r", encoding="utf-8") as f:
+                out_data = json.load(f)
+            # 兼容新旧 worker：新格式 {"tracks":[{start,end,speaker,emb}]}
+            if isinstance(out_data, dict):
+                tracks_raw = out_data.get("tracks", [])
+            else:
+                tracks_raw = out_data
+            # 清理临时文件
+            try:
+                os.remove(job["req_file"])
+                os.remove(job["out_file"])
+                os.remove(err_log)
+                os.rmdir(job["tmp_dir"])
+            except OSError:
+                pass
+            return ci, tracks_raw, None
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL)
+        try:
+            futures = {pool.submit(_run_chunk, job): job for job in chunk_jobs}
+            for future in concurrent.futures.as_completed(futures):
+                ci, tracks_raw, err = future.result()
+                if err:
+                    # 立即取消排队任务 + 杀掉还在跑的 worker，不再傻等
+                    for f in futures:
+                        f.cancel()
+                    with proc_lock:
+                        for p in running_procs:
+                            if p.poll() is None:
+                                p.kill()
+                    raise RuntimeError(f"pyannote 子进程失败: {err}")
+                chunk_start = boundaries[ci][0]
+                all_tracks[ci] = [
+                    {
+                        "start": t["start"] + chunk_start,
+                        "end": t["end"] + chunk_start,
+                        "label": f"C{ci}_{t['speaker']}",
+                        "emb": t.get("emb"),
+                    }
+                    for t in tracks_raw
+                ]
+                completed[0] += 1
+                if status_callback:
+                    elapsed = _time.time() - t0
+                    done_n = completed[0]
+                    remaining_chunks = num_chunks - done_n
+                    # 并行时预计剩余 = 已用时间 / 已完成数 × 剩余数 / 并行度
+                    est_remaining = (elapsed / done_n * remaining_chunks / MAX_PARALLEL
+                                     if done_n > 0 else 0)
+                    status_callback("diarizing",
+                        f"第 {done_n}/{num_chunks} 块完成（{MAX_PARALLEL} 并行），"
+                        f"已用 {elapsed/60:.1f} 分钟，"
+                        f"预计剩余 {est_remaining/60:.1f} 分钟")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        # 展平
+        all_tracks_flat = []
+        for chunk_tracks in all_tracks:
+            all_tracks_flat.extend(chunk_tracks)
+
+        # 分段+声纹落缓存（聚类前的原始段），供后续调阈值/重导出免重跑分离
+        if tracks_cache:
+            try:
+                with open(tracks_cache, "w", encoding="utf-8") as f:
+                    json.dump(all_tracks_flat, f, ensure_ascii=False)
+                if status_callback:
+                    status_callback("log",
+                        f"声纹分段已缓存（{len(all_tracks_flat)} 段）→ {tracks_cache}")
+            except Exception as e:
+                if status_callback:
+                    status_callback("log", f"分段缓存写入失败（不影响结果）: {e}")
+
+        # ── 跨块全局声纹聚类（替代旧的接缝区标签拼接）──
+        merged = self._cluster_speakers_global(
+            all_tracks_flat, num_speakers=num_speakers,
+            min_speakers=min_speakers, max_speakers=max_speakers,
+            status_callback=status_callback)
+
+        elapsed = _time.time() - t0
+        if status_callback:
+            n_spk = len(set(t[2] for t in merged))
+            status_callback("diarizing",
+                f"说话人分离完成（{n_spk} 位说话人，耗时 {elapsed/60:.1f} 分钟）")
+        merged.sort(key=lambda t: t[0])
+        return merged
+
+    def _run_pipeline(self, audio_in, audio_dur_s, num_speakers, min_speakers,
+                      max_speakers, status_callback, t_start,
+                      chunk_idx=None, chunk_total=None):
+        """在一段波形上跑 pyannote pipeline，返回 [(start_s, end_s, label), ...]。
+
+        带 hook 心跳，避免长音频时前端以为卡死。
+        """
+        import threading
+        import gc
+        import time as _time
+
         _STAGE_NAMES = {
             "segmentation": "语音分段",
             "embeddings": "声纹提取",
@@ -1634,37 +1875,34 @@ class PyannoteDiarizer:
             "discrete_diarization": "聚类归并",
         }
         current_stage = ["启动"]
-        stage_start = [_time.time()]
         done = [False]
         result_holder = [None]
         exc_holder = [None]
 
+        chunk_prefix = ""
+        if chunk_idx is not None:
+            chunk_prefix = f"第 {chunk_idx}/{chunk_total} 块 "
+
         def hook(step_name, *args, **kwargs):
-            # pyannote 会在不同阶段用两种方式调 hook：
-            #   hook("segmentation", segmentations)  阶段切换
-            #   hook(completed=3, total=10)            滑动窗口进度
             if isinstance(step_name, str) and step_name in _STAGE_NAMES:
                 current_stage[0] = _STAGE_NAMES[step_name]
-                stage_start[0] = _time.time()
                 if status_callback:
-                    elapsed = _time.time() - t0
+                    elapsed = _time.time() - t_start
                     status_callback("diarizing",
-                        f"正在分离说话人：{_STAGE_NAMES[step_name]}...（已用 {elapsed/60:.1f} 分钟）")
+                        f"正在分离说话人：{chunk_prefix}{_STAGE_NAMES[step_name]}..."
+                        f"（已用 {elapsed/60:.1f} 分钟）")
             elif "completed" in kwargs and "total" in kwargs and status_callback:
                 comp = kwargs["completed"]
                 total = kwargs["total"]
                 if total and comp > 0:
-                    elapsed = _time.time() - t0
+                    elapsed = _time.time() - t_start
                     pct = comp / total
-                    # 按已完成比例粗估剩余时间
                     est_total = elapsed / pct if pct > 0 else 0
                     remaining = max(0, est_total - elapsed)
                     status_callback("diarizing",
-                        f"正在分离说话人：{current_stage[0]}..."
-                        f"（{comp}/{total} 块，已用 {elapsed/60:.1f} 分钟，"
+                        f"正在分离说话人：{chunk_prefix}{current_stage[0]}..."
+                        f"（{comp}/{total}，已用 {elapsed/60:.1f} 分钟，"
                         f"预计剩余 {remaining/60:.1f} 分钟）")
-
-        t0 = _time.time()
 
         def _run():
             try:
@@ -1685,35 +1923,190 @@ class PyannoteDiarizer:
         t = threading.Thread(target=_run, daemon=True)
         t.start()
 
-        # 心跳：每 15 秒报一次进度
         while not done[0]:
             t.join(timeout=15)
             if not done[0]:
-                elapsed = _time.time() - t0
+                elapsed = _time.time() - t_start
                 if status_callback:
-                    est_total = audio_dur_s * 0.68
-                    remaining = max(0, est_total - elapsed)
+                    est_chunk = audio_dur_s * 0.68
                     status_callback("diarizing",
-                        f"正在分离说话人：{current_stage[0]}..."
-                        f"（已用 {elapsed/60:.1f} 分钟，预计剩余 {remaining/60:.1f} 分钟）")
+                        f"正在分离说话人：{chunk_prefix}{current_stage[0]}..."
+                        f"（已用 {elapsed/60:.1f} 分钟）")
 
         if exc_holder[0] is not None:
+            gc.collect()
             raise exc_holder[0]
 
         result = result_holder[0]
-        elapsed = _time.time() - t0
-        if status_callback:
-            status_callback("diarizing",
-                f"说话人分离完成（耗时 {elapsed/60:.1f} 分钟）")
+        gc.collect()
 
-        # pyannote.audio 4.x 返回 DiarizeOutput，真正的 Annotation 在 .speaker_diarization；
-        # 旧版直接返回 Annotation。两者都兼容。
         annotation = getattr(result, "speaker_diarization", result)
         tracks = []
         for segment, _, speaker in annotation.itertracks(yield_label=True):
             tracks.append((segment.start, segment.end, speaker))
+        return tracks
+
+    def _diarize_single(self, wav_path, num_speakers, min_speakers,
+                        max_speakers, status_callback, audio_dur_s):
+        """短音频（<=10.5 分钟）整段处理。"""
+        import soundfile as sf
+        import torch
+        import gc
+        import time as _time
+
+        if status_callback:
+            mins = audio_dur_s / 60
+            status_callback("diarizing",
+                f"正在分离说话人（音频 {mins:.0f} 分钟）...")
+
+        waveform_np, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(waveform_np.T).contiguous()
+        del waveform_np
+        audio_in = {"waveform": waveform, "sample_rate": int(sr)}
+
+        t0 = _time.time()
+        tracks = self._run_pipeline(
+            audio_in, audio_dur_s, num_speakers, min_speakers, max_speakers,
+            status_callback, t0)
+
+        del waveform, audio_in
+        gc.collect()
+
+        elapsed = _time.time() - t0
+        if status_callback:
+            n_spk = len(set(t[2] for t in tracks))
+            status_callback("diarizing",
+                f"说话人分离完成（{n_spk} 位说话人，耗时 {elapsed/60:.1f} 分钟）")
         tracks.sort(key=lambda t: t[0])
         return tracks
+
+    @staticmethod
+    def _cluster_speakers_global(all_tracks, num_speakers=None,
+                                 min_speakers=None, max_speakers=None,
+                                 status_callback=None):
+        """全局声纹聚类：把各块的本地说话人标签按“嗓音”归并成全局说话人。
+
+        旧做法只在相邻块 30s 重叠区里按时间重叠贪心配对标签——同一个人只要
+        没在某两块接缝处同时出声就会被当成新人，12 块 × 每块 3~4 人 → 虚高到
+        40+ 个标签。这里改为：每段附带声纹向量，对“每个本地标签的声纹原型”
+        做全局层次聚类，同一人的声音跨块自动归并，与块编号彻底解耦。
+
+        all_tracks: [{"start","end","label","emb"}, ...]
+                    emb 为 L2 归一化的 256 维 list（worker 用 wespeaker 提取），
+                    提取失败时为 None。
+        返回 [(start_s, end_s, "SPEAKER_xx"), ...]，按总时长从多到少编号。
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        try:
+            thr = float(os.environ.get("PYANNOTE_EMB_THRESHOLD", "0.5"))
+        except (TypeError, ValueError):
+            thr = 0.5
+
+        # 1) 收集每个本地标签的段与声纹
+        label_dur = defaultdict(float)          # label -> 总时长
+        label_segs = defaultdict(list)          # label -> [(s,e)]
+        label_embs = defaultdict(list)          # label -> [(dur, np.ndarray)]
+        for t in all_tracks:
+            lab = t["label"]
+            dur = max(0.05, t["end"] - t["start"])
+            label_dur[lab] += dur
+            label_segs[lab].append((t["start"], t["end"]))
+            emb = t.get("emb")
+            if emb is not None:
+                v = np.asarray(emb, dtype="float32")
+                nrm = float(np.linalg.norm(v))
+                if nrm > 1e-6:
+                    label_embs[lab].append((dur, v / nrm))
+
+        all_labels = sorted(label_dur.keys())
+
+        # 2) 每个本地标签 → 声纹原型（按时长加权平均后再归一化）
+        proto = {}
+        for lab in all_labels:
+            embs = label_embs.get(lab)
+            if not embs:
+                continue
+            w = np.array([d for d, _ in embs], dtype="float32")
+            M = np.stack([v for _, v in embs])
+            p = (M * w[:, None]).sum(axis=0) / w.sum()
+            nrm = float(np.linalg.norm(p))
+            if nrm > 1e-6:
+                proto[lab] = (p / nrm).astype("float32")
+
+        emb_labels = [l for l in all_labels if l in proto]
+
+        # 3) 对有原型的标签做层次聚类（cosine 距离 / average linkage）
+        label_cluster = {}
+        n_emb = len(emb_labels)
+        if n_emb > 0:
+            X = np.stack([proto[l] for l in emb_labels])
+            from sklearn.cluster import AgglomerativeClustering
+            if n_emb == 1:
+                clusters = np.array([0])
+            elif num_speakers:
+                k = max(1, min(int(num_speakers), n_emb))
+                model = AgglomerativeClustering(
+                    n_clusters=k, metric="cosine", linkage="average")
+                clusters = model.fit_predict(X)
+            else:
+                model = AgglomerativeClustering(
+                    n_clusters=None, metric="cosine", linkage="average",
+                    distance_threshold=thr)
+                clusters = model.fit_predict(X)
+                # 上限约束：聚类数超过 max_speakers 时按 max 重聚
+                n_cl = int(clusters.max()) + 1 if len(clusters) else 1
+                if max_speakers and n_cl > int(max_speakers):
+                    model = AgglomerativeClustering(
+                        n_clusters=int(max_speakers), metric="cosine",
+                        linkage="average")
+                    clusters = model.fit_predict(X)
+            for l, c in zip(emb_labels, clusters):
+                label_cluster[l] = int(c)
+
+        # 4) 无声纹的标签（极少数）：按与已有类的时间重叠量挂靠，否则单列新类
+        next_cluster = (max(label_cluster.values()) + 1) if label_cluster else 0
+        for lab in all_labels:
+            if lab in label_cluster:
+                continue
+            best_c, best_ov = None, 0.0
+            for other in all_labels:
+                if other not in label_cluster:
+                    continue
+                ov = 0.0
+                for s1, e1 in label_segs[lab]:
+                    for s2, e2 in label_segs[other]:
+                        ts, te = max(s1, s2), min(e1, e2)
+                        if te > ts:
+                            ov += te - ts
+                if ov > best_ov:
+                    best_ov, best_c = ov, label_cluster[other]
+            if best_c is not None and best_ov > 1.0:
+                label_cluster[lab] = best_c
+            else:
+                label_cluster[lab] = next_cluster
+                next_cluster += 1
+
+        # 5) 类 id → 全局 SPEAKER_xx（按总时长从多到少编号，主角在前）
+        cluster_dur = defaultdict(float)
+        for lab, c in label_cluster.items():
+            cluster_dur[c] += label_dur[lab]
+        ordered = sorted(cluster_dur.keys(), key=lambda c: -cluster_dur[c])
+        cluster_to_name = {c: f"SPEAKER_{i:02d}" for i, c in enumerate(ordered)}
+
+        if status_callback:
+            status_callback("diarizing",
+                f"声纹全局聚类完成：{len(all_labels)} 个块内标签 → "
+                f"{len(ordered)} 位说话人" +
+                ("（按声纹相似度自动判定）" if not num_speakers else f"（指定 {num_speakers} 人）"))
+
+        out = []
+        for t in all_tracks:
+            out.append((t["start"], t["end"],
+                        cluster_to_name[label_cluster[t["label"]]]))
+        out.sort(key=lambda x: x[0])
+        return out
 
 
 # ─── Whisper 文件转写（faster-whisper）───

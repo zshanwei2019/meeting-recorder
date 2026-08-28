@@ -37,3 +37,6 @@ librosa>=0.10
 # pyannote speaker diarization (>=4.0 returns DiarizeOutput; needs HF token for gated models)
 pyannote.audio>=4.0
 soundfile>=0.12
+
+# 说话人全局声纹聚类（pyannote_chunk_worker 声纹 + 主进程层次聚类）
+scikit-learn>=1.3
