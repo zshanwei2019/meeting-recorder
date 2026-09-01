@@ -5,7 +5,19 @@ Tauri sidecar.rs 在 resource_dir/asr-server/asr-server.exe 找它。
 onefile 启动时自解压到 %TEMP%，避免 Tauri/NSIS 打包目录结构问题。
 用法: pyinstaller asr-server.spec
 """
+import os
+import sys
+import subprocess
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# 打包前自动生成版本信息（固化 git commit/日期），version.py 会 import _build_info，
+# PyInstaller 跟随 import 自动打进 onefile；_version.py 同时作为数据文件兏底。
+try:
+    subprocess.run([sys.executable, os.path.join(SPECPATH, 'tools', 'gen_version.py')],
+                   cwd=SPECPATH, check=False)
+except Exception:
+    pass
+_version_data = [('_version.py', '.')] if os.path.exists(os.path.join(SPECPATH, '_version.py')) else []
 
 block_cipher = None
 
@@ -39,7 +51,7 @@ a = Analysis(
         ('ui/index.html', 'ui'),
         ('app_icon.ico', '.'),
         ('app_icon.png', '.'),
-    ] + funasr_datas + modelscope_datas + pyannote_datas,
+    ] + _version_data + funasr_datas + modelscope_datas + pyannote_datas,
     hiddenimports=[
         'pyannote_chunk_worker',
         'pyannote.audio.pipelines.speaker_diarization',
