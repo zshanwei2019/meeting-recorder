@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.bak
+
+# 打包时由 tools/gen_version.py 自动生成的版本信息，勿入库
+_version.py
+_build_info.py
 build/
 dist/
 # ── 音频/转写产物：绝不可入库 ──

@@ -66,7 +66,13 @@ if getattr(sys, "frozen", False):
 
 # ─── 配置 ───
 APP_NAME = "会议录音转写助手"
-APP_VERSION = "3.1.0"
+try:
+    import version as _version_mod
+    APP_VERSION = _version_mod.version_string()
+    _APP_VERSION_INFO = _version_mod.version_dict()
+except Exception:
+    APP_VERSION = "3.1.0 (dev)"
+    _APP_VERSION_INFO = {"version": "3.1.0", "display": APP_VERSION}
 BASE_DIR = Path(__file__).parent
 UI_DIR = BASE_DIR / "ui"
 DATA_DIR = Path.home() / "MeetingRecorder"
@@ -2662,6 +2668,11 @@ def create_app():
     @app.get("/api/config")
     async def get_config():
         return JSONResponse(state.config)
+
+    # REST: 版本信息（前端启动时拉取，显示真实构建 commit/日期）
+    @app.get("/api/version")
+    async def get_version():
+        return JSONResponse(_APP_VERSION_INFO)
 
     # REST: list audio devices
     @app.get("/api/devices")

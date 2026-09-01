@@ -451,7 +451,7 @@ html, body {
       <div class="logo-icon">M</div>
       <div class="logo-info">
         <div class="logo-title">会议录音转写助手</div>
-        <div class="logo-version">v3.1.0</div>
+        <div class="logo-version" id="logoVersion">v3.1.0</div>
       </div>
     </div>
 
@@ -601,7 +601,7 @@ html, body {
     </div>
 
     <div class="sidebar-spacer"></div>
-    <div class="sidebar-footer">会议录音转写助手 v3.1.0</div>
+    <div class="sidebar-footer" id="sidebarFooter">会议录音转写助手 v3.1.0</div>
   </div>
 
   <!-- Main Content -->
@@ -1222,7 +1222,22 @@ function onMonitorStatus(data) {
 // ══════════════════════════════════════════
 window.addEventListener('load', function() {
   connectWs();
+  loadVersion();
 });
+
+// 拉取后端真实版本（含 git commit/日期），替换界面上的占位版本号
+async function loadVersion() {
+  try {
+    const resp = await fetch('/api/version');
+    if (!resp.ok) return;
+    const info = await resp.json();
+    const label = info.display || ('v' + info.version);
+    const logoEl = document.getElementById('logoVersion');
+    const footEl = document.getElementById('sidebarFooter');
+    if (logoEl) logoEl.textContent = label;
+    if (footEl) footEl.textContent = '会议录音转写助手 ' + label;
+  } catch (e) { /* 版本拉取失败不影响使用，保留占位 */ }
+}
 </script>
 </body>
 </html>

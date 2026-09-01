@@ -3,8 +3,18 @@
 会议录音转写助手 v3.1.0 - PyInstaller 打包配置
 用法: pyinstaller meeting-recorder.spec
 """
+import os
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# 打包前自动生成 _version.py（固化 git commit/日期进产物）
+import subprocess
+try:
+    subprocess.run([sys.executable, os.path.join(SPECPATH, 'tools', 'gen_version.py')],
+                   cwd=SPECPATH, check=False)
+except Exception:
+    pass
+_version_data = [('_version.py', '.')] if os.path.exists(os.path.join(SPECPATH, '_version.py')) else []
 
 block_cipher = None
 
@@ -43,7 +53,7 @@ a = Analysis(
         ('ui/index.html', 'ui'),          # 前端页面
         ('app_icon.ico', '.'),             # 应用图标
         ('app_icon.png', '.'),             # 应用图标PNG
-    ] + funasr_datas + modelscope_datas + pyannote_datas,
+    ] + _version_data + funasr_datas + modelscope_datas + pyannote_datas,
     hiddenimports=[
         'pyannote.audio.pipelines.speaker_diarization',
         'soundfile',
