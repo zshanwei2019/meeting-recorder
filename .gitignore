@@ -45,3 +45,10 @@ config.json
 .venv/
 venv/
 env/
+
+# ── Tauri / Node 桌面壳 ──
+node_modules/
+# Tauri 构建产物（壳 exe / 安装包），不入库
+src-tauri/target/
+# tauri icon / build 生成的 schema 与缓存
+src-tauri/gen/

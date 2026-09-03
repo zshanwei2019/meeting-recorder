@@ -167,6 +167,22 @@ id=13  立体声混音 (Realtek HD Audio Stereo input)  ch=2  sr=48000
 
 > 打包产物**不包含语音模型**，首次运行仍会下载到 `~/.cache/modelscope`。
 
+### 桌面安装包（Tauri 2 壳）
+
+Windows 桌面版用一个很轻的 Tauri 2 (Rust) 壳包裹上面的 PyInstaller 服务
+（`dist/asr-server.exe`），产出 NSIS 安装包，产品名 **NewMeetingRecorder**。
+完整发布流水线见 [`src-tauri/PACKAGING.md`](src-tauri/PACKAGING.md)，简述：
+
+```powershell
+npm install --include=dev          # 首次：装 @tauri-apps/cli
+pyinstaller asr-server.spec        # 1) 生成 dist/asr-server.exe（自动同步版本）
+npx tauri build                    # 2) 出 NSIS 安装包
+```
+
+壳源码在 `src-tauri/`；版本号单一来源是 `version.py` 的 `BASE_VERSION`，
+`tools/gen_version.py` 会自动同步进 `src-tauri/tauri.conf.json`（驱动 exe 文件
+版本与 NSIS 产品版本）。
+
 ## 🐛 常见问题
 
 **界面没有出现？**

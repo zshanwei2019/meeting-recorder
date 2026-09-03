@@ -1,0 +1,15 @@
+{
+  "name": "meeting-recorder-desktop",
+  "version": "3.1.0",
+  "private": true,
+  "description": "会议录音转写助手 Tauri 2 桌面壳（Python FastAPI 后端 asr-server.exe 作为资源打包）",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "tauri icon app_icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
