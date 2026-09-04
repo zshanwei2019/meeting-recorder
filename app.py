@@ -79,6 +79,14 @@ DATA_DIR = Path.home() / "MeetingRecorder"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 
+# 会后处理层（编辑持久化 / 结构化纪要 / 全文检索 / 声纹库）。
+# 该模块顶层只依赖标准库，重模型（numpy/torch/funasr）全部惰性 import。
+try:
+    import postmeeting as _pm
+except Exception as _pm_err:  # pragma: no cover - 缺模块不应拖垮主干
+    _pm = None
+    print(f"[WARN] postmeeting 模块加载失败（会后处理功能不可用）: {_pm_err}")
+
 # ─── 确保目录存在 ───
 def ensure_dirs():
     for d in [DATA_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR]:
@@ -3527,11 +3535,12 @@ def _transcribe_file_task(filepath, ws):
                         sentence_info=state.sentence_info,
                         speaker_count=state.speaker_count,
                     )
-                    # 发送结构化结果给前端
+                    # 发送结构化结果给前端（wav_name 供会后处理：对照回放/编辑保存/声纹注册）
                     state.push_from_thread("transcript_ready", {
                         "text": state.transcript_text,
                         "sentence_info": state.sentence_info,
                         "speaker_count": state.speaker_count,
+                        "wav_name": Path(filepath).name,
                     })
                     state.push_from_thread("status", "就绪")
                     spk_info = f"，识别{state.speaker_count}位说话人" if state.speaker_count > 0 else ""
@@ -3882,11 +3891,12 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                 if result is not None:
                     state.sentence_info = result.get("sentence_info", [])
                     state.speaker_count = result.get("speaker_count", 0)
-                    # 发送结构化结果（含说话人信息）
+                    # 发送结构化结果（含说话人信息；wav_name 供会后处理）
                     push("transcript_ready", {
                         "text": state.transcript_text,
                         "sentence_info": state.sentence_info,
                         "speaker_count": state.speaker_count,
+                        "wav_name": Path(recording_filepath).name if recording_filepath else None,
                     })
                     spk_info = f"，识别{state.speaker_count}位说话人" if state.speaker_count > 0 else ""
                     push("log", {"message": f"说话人分离完成{spk_info}"})
