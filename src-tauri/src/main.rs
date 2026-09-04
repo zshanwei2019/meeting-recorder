@@ -7,6 +7,13 @@
 //!   3. 创建主窗口加载 http://127.0.0.1:18765/；
 //!   4. 退出时杀掉 sidecar 子进程，避免 asr-server.exe 残留。
 //!
+//! 外围体验：
+//!   - 系统托盘：启动即显示；菜单含「显示主窗口」「退出」；左键图标切换显示/聚焦；
+//!     点窗口关闭按钮不退出，而是隐藏到托盘，托盘「退出」才真正退出（并 kill sidecar）。
+//!   - 单实例：第二次启动聚焦已存在的主窗口，而非开新进程。
+//!   - 桌面通知：装好插件 + 权限，提供 `send_notification` 命令供后续 sidecar 事件调用，
+//!     启动时不自动弹通知。
+//!
 //! 生产布局：`resource_dir/asr-server/asr-server.exe`
 //! （见 tauri.conf.json 的 bundle.resources 映射）。
 //! 开发态回退：仓库根 `dist/asr-server.exe`；都没有则提示 `python app.py`。
@@ -17,7 +24,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_notification::NotificationExt;
 
 /// sidecar 监听地址（Python 端在 ASR_SIDECAR=1 时锁定此端口）。
 const SIDECAR_HOST: &str = "127.0.0.1";
@@ -40,6 +52,43 @@ fn kill_sidecar(slot: &mut Option<Child>) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// 显示并聚焦主窗口（若已创建）。托盘菜单 / 单实例回调 / 托盘点击共用。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// 左键托盘图标：窗口可见且未最小化则隐藏，否则显示并聚焦。
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let visible = win.is_visible().unwrap_or(false);
+        let minimized = win.is_minimized().unwrap_or(false);
+        if visible && !minimized {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+        }
+    }
+    // 窗口尚未创建（sidecar 还在预热）时无窗口可切换，忽略即可。
+}
+
+/// 桌面通知命令：供前端或后续 sidecar 事件（如转写完成、出错）调用。
+/// 刻意不在启动时自动弹出，避免每次启动打扰用户。
+#[tauri::command]
+fn send_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|e| format!("通知发送失败: {e}"))
 }
 
 /// 定位 asr-server.exe。生产：resource_dir/asr-server/asr-server.exe；
@@ -109,9 +158,76 @@ fn wait_until_ready(deadline: Instant) -> bool {
     false
 }
 
+/// 创建系统托盘图标与菜单。启动即调用，独立于延迟创建的主窗口。
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("main-tray")
+        .tooltip("会议录音转写助手")
+        .menu(&menu)
+        // 左键留给“切换窗口”，右键才弹菜单（Windows 默认左键也弹菜单，这里关掉）。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => {
+                // 真正退出：先复用 SidecarState 清理逻辑杀掉 sidecar，再退出。
+                if let Some(state) = app.try_state::<SidecarState>() {
+                    kill_sidecar(&mut state.0.lock().unwrap());
+                }
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle());
+            }
+        });
+
+    // 优先用编译进程序的默认窗口图标（打包/tauri dev 均会嵌入 icons）；
+    // 兜底用编译期 include_bytes! 读 icons/icon.png 解码，避免运行期路径依赖。
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    } else if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!(
+        "../icons/icon.png"
+    )) {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
+        // 单实例必须最早注册：第二次启动时聚焦已有窗口，而非开新进程。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![send_notification])
+        .on_window_event(|window, event| {
+            // 关闭主窗口 = 隐藏到托盘，不退出应用；托盘「退出」才真正退出。
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
+            // 托盘启动即显示（不依赖 sidecar / 主窗口是否就绪）。
+            if let Err(e) = build_tray(app.handle()) {
+                eprintln!("[shell] failed to create tray icon: {e}");
+            }
+
             // 定位并启动 sidecar。
             let Some(exe) = locate_sidecar(app.handle()) else {
                 // 开发态没有打包资源、也没构建 dist 时的友好提示。

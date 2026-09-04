@@ -13,7 +13,14 @@ rust-version = "1.77.2"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon feature 开启 tauri::tray（Tauri 2 中托盘模块默认 feature gate）；
+# image-png 让 Image::from_bytes 能解码 PNG（托盘图标兜底路径用）。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# 系统托盘为 tauri::tray 内置，无需额外插件。
+# 单实例：第二次启动聚焦已有窗口，而非开新进程。
+tauri-plugin-single-instance = { version = "2", features = [] }
+# 桌面通知：提供 Rust 侧发通知能力 + notify 命令，供 sidecar 事件后续调用。
+tauri-plugin-notification = { version = "2", features = [] }
 
 [profile.release]
 # 减小壳体积；sidecar 是独立的 asr-server.exe，壳本身很轻。
