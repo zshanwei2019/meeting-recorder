@@ -270,12 +270,16 @@ def _pm_core_update_recording(data):
     if not ok:
         return False, str(meta_or_err)
     labels_out = meta_or_err.get("speaker_labels", {}) or {}
-    rendered = _pm.render_transcript_text(
-        meta_or_err.get("sentence_info") or [], labels_out)
+    # 手工编辑过正文时回存保存后的 text；仅改名时用句信息重渲染全文
+    if text is not None:
+        out_text = meta_or_err.get("text") or text
+    else:
+        out_text = _pm.render_transcript_text(
+            meta_or_err.get("sentence_info") or [], labels_out)
     return True, {
         "recording_id": rid,
         "speaker_labels": labels_out,
-        "text": rendered,
+        "text": out_text,
     }
 
 
@@ -297,6 +301,20 @@ def _pm_core_export_minutes(raw_text, topic=None):
         "topic": topic or minutes.get("topic") or "会议纪要",
         "parse_ok": minutes.get("parse_ok", False),
     }
+
+
+def _pm_map_cluster_embeddings_to_spk(cluster_embs, label_map):
+    """把簇嵌入的 key 从 pyannote 标签（SPEAKER_00…）映射为 spk 序号字符串。
+
+    label_map 是 {pyannote标签: spk序号}；没有对应 spk 或向量为空的项丢弃。
+    输出 key 与 sentence_info / postmeeting.speaker_labels 的 key 对齐。
+    """
+    out = {}
+    for label, vec in (cluster_embs or {}).items():
+        spk = (label_map or {}).get(label)
+        if spk is not None and vec is not None:
+            out[str(spk)] = vec
+    return out
 
 
 def _pm_auto_match_speakers(filepath, result):
@@ -1512,14 +1530,8 @@ class FunASRTranscriber:
         sentence_info, label_map = _assign_speakers_to_sentences(raw_sents, tracks)
         speaker_count = len(label_map) if label_map else 0
 
-        # 6) 簇嵌入 key 从 pyannote 标签（SPEAKER_00…）换成 spk 序号，
-        #    与 sentence_info / postmeeting.speaker_labels 的 key 对齐。
-        spk_embeddings = {}
-        if cluster_embs:
-            for label, vec in cluster_embs.items():
-                spk = label_map.get(label)
-                if spk is not None and vec is not None:
-                    spk_embeddings[str(spk)] = vec
+        # 6) 簇嵌入 key 从 pyannote 标签（SPEAKER_00…）换成 spk 序号
+        spk_embeddings = _pm_map_cluster_embeddings_to_spk(cluster_embs, label_map)
 
         return {
             "text": text,
