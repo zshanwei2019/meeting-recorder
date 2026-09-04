@@ -427,6 +427,102 @@ html, body {
 .log-content::-webkit-scrollbar-track { background: transparent; }
 .log-content::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.12); border-radius: 2px; }
 
+/* ══════════════════════════════════════════
+   会后处理面板
+   ══════════════════════════════════════════ */
+.pm-overlay {
+  position: fixed; inset: 0; z-index: 9000;
+  background: rgba(10,12,20,0.72);
+  display: none; align-items: center; justify-content: center;
+}
+.pm-overlay.visible { display: flex; }
+.pm-panel {
+  width: min(920px, 92vw); max-height: 88vh;
+  display: flex; flex-direction: column;
+  background: #13161f;
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+  overflow: hidden;
+}
+.pm-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(148,163,184,0.12);
+  background: transparent;
+}
+.pm-title { font-size: 16px; font-weight: 700; color: #f1f5f9; }
+.pm-close {
+  margin-left: auto; background: transparent; border: none;
+  color: #94a3b8; font-size: 20px; cursor: pointer; line-height: 1;
+}
+.pm-close:hover { color: #f1f5f9; }
+.pm-body {
+  padding: 16px 18px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.pm-section {
+  background: #161922;
+  border: 1px solid rgba(148,163,184,0.08);
+  border-radius: 10px; padding: 12px 14px;
+}
+.pm-section-title {
+  font-size: 13px; font-weight: 700; color: #818cf8;
+  margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+.pm-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pm-input, .pm-select {
+  background: #1c1f2e;
+  border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px; padding: 7px 10px;
+  color: #f1f5f9; font-size: 12px; font-family: inherit; outline: none;
+}
+.pm-input:focus, .pm-select:focus { border-color: #6366f1; }
+.pm-input::placeholder { color: #64748b; }
+.pm-btn {
+  background: #6366f1; color: #fff; border: none;
+  border-radius: 6px; padding: 7px 14px;
+  font-size: 12px; font-weight: 600; font-family: inherit;
+  cursor: pointer; white-space: nowrap;
+}
+.pm-btn:hover { background: #818cf8; }
+.pm-btn.ghost {
+  background: transparent; color: #94a3b8;
+  border: 1px solid rgba(148,163,184,0.2);
+}
+.pm-btn.ghost:hover { color: #f1f5f9; border-color: rgba(99,102,241,0.5); }
+.pm-btn.danger { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); padding: 3px 10px; }
+.pm-btn.danger:hover { background: rgba(239,68,68,0.3); }
+.pm-list {
+  max-height: 180px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
+}
+.pm-item {
+  padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  background: #1c1f2e; border: 1px solid transparent;
+  font-size: 12px; color: #cbd5e1;
+}
+.pm-item:hover { border-color: rgba(99,102,241,0.5); }
+.pm-item.active { border-color: #6366f1; background: #252940; }
+.pm-item .pm-item-sub { color: #64748b; font-size: 11px; margin-top: 2px; }
+.pm-item .pm-item-title { color: #e2e8f0; font-weight: 600; }
+.pm-textarea {
+  width: 100%; min-height: 120px; resize: vertical;
+  background: #1c1f2e; border: 1px solid rgba(148,163,184,0.12);
+  border-radius: 6px; padding: 10px; color: #f1f5f9;
+  font-size: 13px; line-height: 1.7; font-family: inherit; outline: none;
+}
+.pm-textarea:focus { border-color: #6366f1; }
+.pm-status { font-size: 12px; color: #94a3b8; margin-top: 6px; }
+.pm-status.err { color: #f87171; }
+.pm-status.ok { color: #4ade80; }
+.pm-speaker-grid { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.pm-speaker-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #94a3b8; }
+.pm-speaker-row label { width: 72px; flex-shrink: 0; }
+.pm-speaker-row .pm-input { flex: 1; }
+.pm-empty { color: #64748b; font-size: 12px; padding: 8px 2px; }
+.pm-match-tag { color: #4ade80; font-size: 11px; margin-left: 6px; }
+
 /* Connection indicator */
 .conn-indicator {
   position: fixed;
@@ -495,6 +591,9 @@ html, body {
     <div class="btn-row">
       <button class="btn-secondary" onclick="saveTranscript()">保存</button>
       <button class="btn-secondary" onclick="copyTranscript()">复制</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="openPostMeeting()">📋 会后处理</button>
     </div>
 
     <div class="divider"></div>
@@ -645,6 +744,76 @@ html, body {
   </div>
 </div>
 
+<!-- 会后处理面板 -->
+<div class="pm-overlay" id="pmOverlay">
+  <div class="pm-panel">
+    <div class="pm-header">
+      <span class="pm-title">会后处理</span>
+      <button class="pm-close" onclick="closePostMeeting()" title="关闭">&times;</button>
+    </div>
+    <div class="pm-body">
+
+      <!-- 历史录音 -->
+      <div class="pm-section">
+        <div class="pm-section-title">历史录音
+          <button class="pm-btn ghost" style="margin-left:auto; padding:3px 10px;" onclick="pmLoadRecordings()">刷新</button>
+        </div>
+        <div class="pm-list" id="pmRecordingList"><div class="pm-empty">点击“刷新”加载历史录音…</div></div>
+      </div>
+
+      <!-- 转写编辑 -->
+      <div class="pm-section">
+        <div class="pm-section-title">转写编辑 <span id="pmEditingName" class="pm-item-sub"></span></div>
+        <textarea class="pm-textarea" id="pmEditTextarea" placeholder="先在上方选择一条录音，转写内容会加载到这里，可直接编辑后保存…"></textarea>
+        <div class="pm-row" style="margin-top:8px;">
+          <button class="pm-btn" onclick="pmSaveEdit()">保存转写</button>
+          <button class="pm-btn ghost" onclick="pmExportMinutes()">导出结构化纪要(.md)</button>
+          <span class="pm-status" id="pmEditStatus"></span>
+        </div>
+      </div>
+
+      <!-- 说话人改名 -->
+      <div class="pm-section">
+        <div class="pm-section-title">说话人改名</div>
+        <div class="pm-speaker-grid" id="pmSpeakerGrid"><div class="pm-empty">选择含说话人分离结果的录音后，这里会出现改名框。</div></div>
+        <div class="pm-row" style="margin-top:8px;">
+          <button class="pm-btn" onclick="pmRenameSpeakers()">保存改名</button>
+          <span class="pm-status" id="pmRenameStatus"></span>
+        </div>
+      </div>
+
+      <!-- 跨录音检索 -->
+      <div class="pm-section">
+        <div class="pm-section-title">跨录音检索</div>
+        <div class="pm-row">
+          <input class="pm-input" style="flex:1;" id="pmSearchInput" placeholder="输入关键词（支持拼音模糊匹配），回车搜索…" onkeydown="if(event.key==='Enter')pmSearch()">
+          <button class="pm-btn" onclick="pmSearch()">搜索</button>
+        </div>
+        <div class="pm-list" id="pmSearchResults"></div>
+      </div>
+
+      <!-- 声纹管理 -->
+      <div class="pm-section">
+        <div class="pm-section-title">声纹库
+          <button class="pm-btn ghost" style="margin-left:auto; padding:3px 10px;" onclick="pmRefreshVoiceprints()">刷新</button>
+        </div>
+        <div class="pm-list" id="pmVoiceprintList"><div class="pm-empty">暂无注册声纹。</div></div>
+        <div class="pm-row" style="margin-top:10px;">
+          <input class="pm-input" id="pmVpName" placeholder="声纹名字（如：张总）" style="width:130px;">
+          <select class="pm-select" id="pmVpRecording" style="flex:1;"><option value="">选择采样录音…</option></select>
+        </div>
+        <div class="pm-row" style="margin-top:6px;">
+          <input class="pm-input" id="pmVpStart" type="number" min="0" placeholder="起(秒，可选)" style="width:110px;">
+          <input class="pm-input" id="pmVpEnd" type="number" min="0" placeholder="止(秒，可选)" style="width:110px;">
+          <button class="pm-btn" onclick="pmRegisterVoiceprint()">从录音注册</button>
+        </div>
+        <div class="pm-status" id="pmVpStatus"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <!-- Connection indicator -->
 <div class="conn-indicator disconnected" id="connIndicator">未连接</div>
 
@@ -764,6 +933,36 @@ function handleEvent(ev) {
       break;
     case 'monitor_status':
       onMonitorStatus(ev.data);
+      break;
+    case 'pm_edit_saved':
+      onPmEditSaved(ev.data);
+      break;
+    case 'pm_speakers_renamed':
+      onPmSpeakersRenamed(ev.data);
+      break;
+    case 'pm_search_results':
+      onPmSearchResults(ev.data);
+      break;
+    case 'pm_voiceprints':
+      onPmVoiceprints(ev.data);
+      break;
+    case 'pm_voiceprint_status':
+      pmSetVpStatus((ev.data && ev.data.message) || '', '');
+      break;
+    case 'pm_voiceprint_registered':
+      pmSetVpStatus((ev.data && ev.data.message) || '已注册', 'ok');
+      pmRefreshVoiceprints();
+      break;
+    case 'pm_voiceprint_deleted':
+      appendLog((ev.data && ev.data.message) || '声纹已删除');
+      pmRefreshVoiceprints();
+      break;
+    case 'pm_minutes_exported':
+      onPmMinutesExported(ev.data);
+      break;
+    case 'postmeeting_error':
+      pmSetVpStatus((ev.data && ev.data.message) || '会后处理出错', 'err');
+      appendLog('会后处理：' + ((ev.data && ev.data.message) || '未知错误'));
       break;
   }
 }
@@ -1125,6 +1324,11 @@ const SPEAKER_COLORS = ['#4472C4', '#ED7D31', '#70AD47', '#FFC000', '#5B9BD5', '
 function onTranscriptReady(data) {
   const ta = document.getElementById('transcriptArea');
 
+  // 记住本次转写的录音文件名，会后处理面板打开时自动选中
+  if (data && typeof data === 'object' && data.wav_name) {
+    pmLastWavName = data.wav_name;
+  }
+
   // 判断是否为结构化结果（含sentence_info）
   if (data && typeof data === 'object' && data.sentence_info && data.sentence_info.length > 0) {
     // 说话人分离模式：格式化显示
@@ -1215,6 +1419,234 @@ function onMonitorStatus(data) {
     btn.style.background = '';
     btn.innerHTML = '<span id="monitorIcon">👁‍🗨</span> 自动监控';
   }
+}
+
+// ══════════════════════════════════════════
+// 会后处理（postmeeting）面板
+// ══════════════════════════════════════════
+let pmRecordings = [];        // /api/recordings 列表缓存
+let pmCurrentId = null;       // 当前在面板中打开的录音 id
+let pmCurrentMeta = null;     // 当前录音详情（含 text/sentence_info/speaker_labels）
+let pmLastWavName = null;     // 最近一次转写完成的 wav_name（用于自动选中）
+
+function openPostMeeting() {
+  document.getElementById('pmOverlay').classList.add('visible');
+  pmLoadRecordings();
+  pmRefreshVoiceprints();
+}
+function closePostMeeting() {
+  document.getElementById('pmOverlay').classList.remove('visible');
+}
+
+function pmEscape(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function pmFmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * (ts > 1e12 ? 1 : 1000));
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function pmFmtDur(sec) {
+  sec = Math.round(sec || 0);
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+async function pmLoadRecordings() {
+  const listEl = document.getElementById('pmRecordingList');
+  try {
+    const resp = await fetch('/api/recordings');
+    pmRecordings = resp.ok ? await resp.json() : [];
+  } catch (e) { pmRecordings = []; }
+  if (!pmRecordings.length) {
+    listEl.innerHTML = '<div class="pm-empty">录音库为空。</div>';
+  } else {
+    listEl.innerHTML = pmRecordings.map(r => {
+      const spk = r.speaker_count > 0 ? ` · ${r.speaker_count}位说话人` : '';
+      const done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
+      return `<div class="pm-item" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
+        <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
+        <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(r.engine || '未知引擎')}${spk}</div>
+      </div>`;
+    }).join('');
+  }
+  // 声纹注册用的录音下拉同步
+  const sel = document.getElementById('pmVpRecording');
+  sel.innerHTML = '<option value="">选择采样录音…</option>' + pmRecordings.map(
+    r => `<option value="${pmEscape(r.wav_name)}">${pmEscape(pmFmtTime(r.created))} ${pmEscape(r.wav_name)}</option>`).join('');
+  // 自动选中刚转写完的录音
+  if (pmLastWavName && !pmCurrentId) {
+    const hit = pmRecordings.find(r => r.wav_name === pmLastWavName);
+    if (hit) pmSelectRecording(hit.id);
+  }
+}
+
+async function pmSelectRecording(id) {
+  pmCurrentId = id;
+  document.querySelectorAll('#pmRecordingList .pm-item').forEach(el => {
+    el.classList.toggle('active', el.getAttribute('data-id') === id);
+  });
+  const rec = pmRecordings.find(r => r.id === id);
+  document.getElementById('pmEditingName').textContent = rec ? '（' + rec.wav_name + '）' : '';
+  document.getElementById('pmEditTextarea').value = '加载中…';
+  try {
+    const resp = await fetch(`/api/recordings/${encodeURIComponent(id + '.wav')}/meta`);
+    pmCurrentMeta = resp.ok ? await resp.json() : null;
+  } catch (e) { pmCurrentMeta = null; }
+  if (!pmCurrentMeta) {
+    document.getElementById('pmEditTextarea').value = '';
+    pmRenderSpeakerGrid(0, {});
+    return;
+  }
+  document.getElementById('pmEditTextarea').value = pmCurrentMeta.text || '';
+  // 说话人改名框：优先 speaker_count，兼容 sentence_info 里的最大 spk
+  let n = pmCurrentMeta.speaker_count || 0;
+  const si = pmCurrentMeta.sentence_info;
+  if (si && si.length) {
+    n = Math.max(n, Math.max(...si.map(s => (s.spk || 0) + 1)));
+  }
+  pmRenderSpeakerGrid(n, pmCurrentMeta.speaker_labels || {});
+}
+
+function pmRenderSpeakerGrid(count, labels) {
+  const grid = document.getElementById('pmSpeakerGrid');
+  if (!count) {
+    grid.innerHTML = '<div class="pm-empty">该录音没有说话人分离结果。</div>';
+    return;
+  }
+  let html = '';
+  for (let i = 0; i < count; i++) {
+    const val = labels[String(i)] || '';
+    const tag = val ? `<span class="pm-match-tag">✓ 已命名</span>` : '';
+    html += `<div class="pm-speaker-row"><label>说话人${i+1}${tag}</label>
+      <input class="pm-input" data-spk="${i}" value="${pmEscape(val)}" placeholder="留空则保持“说话人${i+1}”"></div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function pmSaveEdit() {
+  if (!pmCurrentId) { pmSetEditStatus('请先选择一条录音', 'err'); return; }
+  const text = document.getElementById('pmEditTextarea').value;
+  sendAction('pm_save_edit', { recording_id: pmCurrentId, text: text });
+}
+function onPmEditSaved(data) {
+  if (data && data.recording_id === pmCurrentId && data.text) {
+    document.getElementById('pmEditTextarea').value = data.text;
+  }
+  pmSetEditStatus('已保存', 'ok');
+}
+function pmSetEditStatus(msg, kind) {
+  const el = document.getElementById('pmEditStatus');
+  el.textContent = msg; el.className = 'pm-status' + (kind ? ' ' + kind : '');
+}
+
+function pmRenameSpeakers() {
+  if (!pmCurrentId) { document.getElementById('pmRenameStatus').textContent = '请先选择一条录音'; return; }
+  const labels = {};
+  document.querySelectorAll('#pmSpeakerGrid input[data-spk]').forEach(inp => {
+    labels[inp.getAttribute('data-spk')] = inp.value.trim();
+  });
+  sendAction('pm_rename_speakers', { recording_id: pmCurrentId, speaker_labels: labels });
+}
+function onPmSpeakersRenamed(data) {
+  const st = document.getElementById('pmRenameStatus');
+  st.textContent = '改名已保存'; st.className = 'pm-status ok';
+  if (data && data.text && data.recording_id === pmCurrentId) {
+    document.getElementById('pmEditTextarea').value = data.text;
+  }
+  if (data && data.speaker_labels) {
+    const n = document.querySelectorAll('#pmSpeakerGrid input[data-spk]').length;
+    pmRenderSpeakerGrid(n || Object.keys(data.speaker_labels).length, data.speaker_labels);
+  }
+}
+
+function pmSearch() {
+  const q = document.getElementById('pmSearchInput').value.trim();
+  if (!q) return;
+  sendAction('pm_search', { query: q });
+}
+function onPmSearchResults(data) {
+  const box = document.getElementById('pmSearchResults');
+  const results = (data && data.results) || [];
+  if (!results.length) {
+    box.innerHTML = '<div class="pm-empty">没有匹配的录音。</div>';
+    return;
+  }
+  box.innerHTML = results.map(r => {
+    const matches = (r.matches || []).map(m =>
+      `<div class="pm-item-sub">…${pmEscape(m.snippet || '')}…</div>`).join('');
+    return `<div class="pm-item" onclick="pmOpenRecordingById('${pmEscape(r.id)}')">
+      <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(r.wav_name || (r.id + '.wav'))}
+        <span class="pm-match-tag">${r.match_count || 0} 处命中</span></div>
+      ${matches}
+    </div>`;
+  }).join('');
+}
+async function pmOpenRecordingById(id) {
+  await pmLoadRecordings();
+  if (pmRecordings.some(r => r.id === id)) pmSelectRecording(id);
+}
+
+function pmRefreshVoiceprints() {
+  sendAction('pm_list_voiceprints');
+}
+function onPmVoiceprints(data) {
+  const box = document.getElementById('pmVoiceprintList');
+  const voices = (data && data.voices) || [];
+  if (!voices.length) {
+    box.innerHTML = '<div class="pm-empty">暂无注册声纹。</div>';
+    return;
+  }
+  box.innerHTML = voices.map(v =>
+    `<div class="pm-item" style="cursor:default;">
+      <div class="pm-item-title">${pmEscape(v.name)}
+        <button class="pm-btn danger" style="float:right;" onclick="pmDeleteVoiceprint('${pmEscape(v.name)}')">删除</button></div>
+      <div class="pm-item-sub">样本：${pmEscape(v.sample || '—')} · 更新 ${pmEscape(pmFmtTime(v.updated || v.created))}</div>
+    </div>`).join('');
+}
+function pmRegisterVoiceprint() {
+  const name = document.getElementById('pmVpName').value.trim();
+  const wavName = document.getElementById('pmVpRecording').value;
+  if (!name) { pmSetVpStatus('请填写声纹名字', 'err'); return; }
+  if (!wavName) { pmSetVpStatus('请选择采样录音', 'err'); return; }
+  const startRaw = document.getElementById('pmVpStart').value;
+  const endRaw = document.getElementById('pmVpEnd').value;
+  const payload = { name: name, recording_id: wavName.replace(/\.wav$/i, '') };
+  if (startRaw !== '') payload.start_s = parseFloat(startRaw);
+  if (endRaw !== '') payload.end_s = parseFloat(endRaw);
+  pmSetVpStatus('正在提取声纹，首次需加载模型，请稍候…', '');
+  sendAction('pm_register_voiceprint', payload);
+}
+function pmDeleteVoiceprint(name) {
+  if (!confirm('确定删除声纹「' + name + '」？')) return;
+  sendAction('pm_delete_voiceprint', { name: name });
+}
+function pmSetVpStatus(msg, kind) {
+  const el = document.getElementById('pmVpStatus');
+  if (!el) { if (msg) appendLog(msg); return; }
+  el.textContent = msg;
+  el.className = 'pm-status' + (kind ? ' ' + kind : '');
+}
+
+function pmExportMinutes() {
+  // 优先导出编辑器里的纪要/转写文本；若当前是转写稿也可整理为纪要格式
+  const raw = document.getElementById('pmEditTextarea').value || '';
+  if (!raw.trim()) { pmSetEditStatus('没有可导出的内容', 'err'); return; }
+  sendAction('pm_export_minutes', { raw: raw, topic: '会议纪要' });
+}
+function onPmMinutesExported(data) {
+  if (!data || !data.text) return;
+  const blob = new Blob([data.text], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '');
+  a.href = url;
+  a.download = `${(data.topic || '会议纪要')}-${stamp}.md`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  pmSetEditStatus('纪要已导出下载', 'ok');
 }
 
 // ══════════════════════════════════════════
