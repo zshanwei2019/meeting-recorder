@@ -2941,17 +2941,21 @@ def create_app():
         mp = _meta_path_for_wav(p)
         text = ""
         sentence_info = None
+        speaker_labels = None
         if mp.exists():
             try:
                 m = json.loads(mp.read_text(encoding="utf-8"))
                 text = m.get("text", "")
                 sentence_info = m.get("sentence_info")
+                speaker_labels = m.get("speaker_labels")
             except Exception:
                 pass
         if entry is not None:
             entry["text"] = text
             if sentence_info is not None:
                 entry["sentence_info"] = sentence_info
+            if speaker_labels is not None:
+                entry["speaker_labels"] = speaker_labels
         return JSONResponse(entry or {"error": "not found"}, status_code=200 if entry else 404)
 
     @app.api_route("/api/recordings/{name}/audio", methods=["GET", "HEAD"])
