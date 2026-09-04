@@ -250,6 +250,138 @@ def _resolve_output_path(base_dir, filename, ext, fallback="transcript"):
         raise ValueError(f"非法输出路径: {filename!r}")
     return path
 
+# ─── 会后处理接线核心（模块级薄封装，便于单测；重逻辑全在 postmeeting.py）───
+def _pm_core_update_recording(data):
+    """pm_save_edit / pm_rename_speakers 共用核心。
+
+    data: {recording_id, text?, speaker_labels?}
+    返回 (ok, payload|错误串)。成功 payload 含重渲染后的全文与最终名字映射。
+    """
+    if _pm is None:
+        return False, "会后处理模块未加载"
+    data = data or {}
+    rid = (data.get("recording_id") or "").strip()
+    if not rid:
+        return False, "缺少录音 id"
+    text = data.get("text", None)
+    labels = data.get("speaker_labels", None)
+    ok, meta_or_err = _pm.update_recording_edit(
+        rid, text=text, speaker_labels=labels, recordings_dir=RECORDINGS_DIR)
+    if not ok:
+        return False, str(meta_or_err)
+    labels_out = meta_or_err.get("speaker_labels", {}) or {}
+    rendered = _pm.render_transcript_text(
+        meta_or_err.get("sentence_info") or [], labels_out)
+    return True, {
+        "recording_id": rid,
+        "speaker_labels": labels_out,
+        "text": rendered,
+    }
+
+
+def _pm_core_search(query):
+    """跨录音全文检索，返回结果列表（postmeeting 负责缓存/拼音容错）。"""
+    if _pm is None:
+        return None
+    return _pm.search_transcripts_cached(query or "", RECORDINGS_DIR)
+
+
+def _pm_core_export_minutes(raw_text, topic=None):
+    """把 AI 纪要原文解析成结构化纪要并渲染为可下载文本。"""
+    if _pm is None:
+        return None
+    minutes = _pm.parse_structured_minutes(raw_text or "")
+    text = _pm.structured_minutes_to_text(minutes)
+    return {
+        "text": text,
+        "topic": topic or minutes.get("topic") or "会议纪要",
+        "parse_ok": minutes.get("parse_ok", False),
+    }
+
+
+def _pm_auto_match_speakers(filepath, result):
+    """转写落库后的自动声纹匹配（pyannote 路径产出簇嵌入时生效）。
+
+    命中声纹库时用带姓名的分段格式重渲染 text。调用方随后落 meta 时应把
+    返回的 labels/rendered 一并写进 meta（否则 save_recording_meta 会覆盖掉）。
+    返回 (info, labels, rendered_text)：
+      info = [(spk_index, name|None, score, matched), ...]
+      labels = {"0": "张总", ...}（仅命中项）
+      rendered_text = 带姓名重渲染的全文（无命中时为 ""）
+    """
+    if _pm is None or not result:
+        return [], {}, ""
+    ce = result.get("cluster_embeddings")
+    if not ce:
+        return [], {}, ""
+    try:
+        matches = _pm.match_speakers(ce)
+    except Exception as e:
+        print(f"[postmeeting] 声纹匹配失败: {e}")
+        return [], {}, ""
+    labels = {}
+    info = []
+    for spk, m in matches.items():
+        info.append((int(spk), m.get("name"), float(m.get("score", 0) or 0),
+                     bool(m.get("matched"))))
+        if m.get("matched") and m.get("name"):
+            labels[str(spk)] = m["name"]
+    rendered = ""
+    if labels:
+        rendered = _pm.render_transcript_text(
+            result.get("sentence_info") or [], labels)
+    return info, labels, rendered
+
+
+def _pm_cluster_embeddings_for_meta(result):
+    """从转写结果里取簇嵌入，供 save_recording_meta 的 extra 使用（无则 None）。"""
+    ce = (result or {}).get("cluster_embeddings")
+    return ce if ce else None
+
+
+def _pm_register_voiceprint_task(d):
+    """后台线程：从指定录音区间提取声纹并注册。"""
+    def status(msg):
+        state.push_from_thread("pm_voiceprint_status", {"message": str(msg)})
+    try:
+        if _pm is None:
+            state.push_from_thread("postmeeting_error",
+                                   {"message": "会后处理模块未加载"})
+            return
+        name = (d.get("name") or "").strip()
+        rid = (d.get("recording_id") or "").strip()
+        start_s = d.get("start_s") or None
+        end_s = d.get("end_s") or None
+        if not name:
+            state.push_from_thread("postmeeting_error",
+                                   {"message": "请填写声纹名字"})
+            return
+        wav = _pm.wav_path_from_id(rid, RECORDINGS_DIR)
+        if wav is None:
+            state.push_from_thread("postmeeting_error",
+                                   {"message": "录音不存在或已被删除"})
+            return
+        status(f"正在从 {wav.name} 提取声纹向量（首次需加载模型）...")
+        vec = _pm.extract_embedding_from_audio(
+            wav, start_s=start_s, end_s=end_s, status_cb=status)
+        if vec is None:
+            state.push_from_thread("postmeeting_error", {
+                "message": "声纹提取失败（模型未加载，或所选区间无有效语音）"})
+            return
+        ok, msg = _pm.register_voiceprint(name, vec, sample_recording=wav.name)
+        if ok:
+            state.push_from_thread("pm_voiceprint_registered",
+                                   {"ok": True, "message": msg, "name": name})
+            state.push_from_thread("pm_voiceprints",
+                                   {"voices": _pm.list_voiceprints()})
+        else:
+            state.push_from_thread("postmeeting_error", {"message": str(msg)})
+    except Exception as e:
+        traceback.print_exc()
+        state.push_from_thread("postmeeting_error",
+                               {"message": f"声纹注册失败：{e}"})
+
+
 # ─── PyInstaller + FunASR 兼容补丁 ───
 # 打包后 CharTokenizer.__init__ 抛 NameError: name 'load_seg_dict'
 # is not defined。下面在 import funasr 前诊断 + 无条件注入。
@@ -1371,8 +1503,8 @@ class FunASRTranscriber:
         self._unload_diarization_model()
         gc.collect()
 
-        # 4) 跑 pyannote 说话人分段
-        tracks = self._pyannote.diarize(
+        # 4) 跑 pyannote 说话人分段（同时产出簇级声纹向量）
+        tracks, cluster_embs = self._pyannote.diarize(
             filepath, num_speakers=preset_spk_num,
             status_callback=status_callback)
 
@@ -1380,10 +1512,20 @@ class FunASRTranscriber:
         sentence_info, label_map = _assign_speakers_to_sentences(raw_sents, tracks)
         speaker_count = len(label_map) if label_map else 0
 
+        # 6) 簇嵌入 key 从 pyannote 标签（SPEAKER_00…）换成 spk 序号，
+        #    与 sentence_info / postmeeting.speaker_labels 的 key 对齐。
+        spk_embeddings = {}
+        if cluster_embs:
+            for label, vec in cluster_embs.items():
+                spk = label_map.get(label)
+                if spk is not None and vec is not None:
+                    spk_embeddings[str(spk)] = vec
+
         return {
             "text": text,
             "sentence_info": sentence_info,
             "speaker_count": speaker_count,
+            "cluster_embeddings": spk_embeddings,
         }
 
     def _load_diarization_model(self, status_callback=None, with_spk=True):
@@ -1590,6 +1732,31 @@ def _assign_speakers_to_sentences(sentence_info, diarization_tracks):
     return result, label_to_id
 
 
+def _segment_embedding_from_feat(emb_feat, seg_s, seg_e):
+    """从 wespeaker 滑窗输出里取 [seg_s, seg_e] 区间帧的平均嵌入（L2 归一）。
+
+    与 pyannote_chunk_worker.py 的 _segment_embeddings 同一逻辑，供短音频
+    进程内路径复用；无可用帧时返回 None。
+    """
+    import numpy as np
+    data = np.asarray(emb_feat.data, dtype="float32")
+    if data.ndim != 2 or data.shape[0] == 0:
+        return None
+    sw = emb_feat.sliding_window
+    n = data.shape[0]
+    centers = [sw.start + i * sw.step + sw.duration / 2.0 for i in range(n)]
+    idx = [i for i, c in enumerate(centers) if seg_s <= c <= seg_e]
+    if not idx:
+        # 段短于一个步长 / 落在帧间：取最近帧中心
+        mid = (seg_s + seg_e) / 2.0
+        idx = [min(range(n), key=lambda i: abs(centers[i] - mid))]
+    v = data[idx].mean(axis=0)
+    nrm = float(np.linalg.norm(v))
+    if nrm < 1e-8:
+        return None
+    return (v / nrm).tolist()
+
+
 class PyannoteDiarizer:
     """pyannote.audio 说话人分离后端。
 
@@ -1625,6 +1792,7 @@ class PyannoteDiarizer:
                 except Exception:
                     pass
                 self._model_name = model_name
+                self._hf_token = hf_token
                 if status_callback:
                     status_callback("ready", "pyannote 说话人分离模型就绪")
                 return True
@@ -1671,12 +1839,12 @@ class PyannoteDiarizer:
                     if status_callback:
                         status_callback("diarizing",
                             f"命中声纹分段缓存（{len(_cached_flat)} 段），跳过分块分离...")
-                    _cm = self._cluster_speakers_global(
+                    _cm, _embs = self._cluster_speakers_global(
                         _cached_flat, num_speakers=num_speakers,
                         min_speakers=min_speakers, max_speakers=max_speakers,
                         status_callback=status_callback)
                     _cm.sort(key=lambda t: t[0])
-                    return _cm
+                    return _cm, _embs
             except Exception as e:
                 if status_callback:
                     status_callback("log", f"分段缓存读取失败，重新分离: {e}")
@@ -1871,7 +2039,7 @@ class PyannoteDiarizer:
                     status_callback("log", f"分段缓存写入失败（不影响结果）: {e}")
 
         # ── 跨块全局声纹聚类（替代旧的接缝区标签拼接）──
-        merged = self._cluster_speakers_global(
+        merged, cluster_embs = self._cluster_speakers_global(
             all_tracks_flat, num_speakers=num_speakers,
             min_speakers=min_speakers, max_speakers=max_speakers,
             status_callback=status_callback)
@@ -1882,7 +2050,7 @@ class PyannoteDiarizer:
             status_callback("diarizing",
                 f"说话人分离完成（{n_spk} 位说话人，耗时 {elapsed/60:.1f} 分钟）")
         merged.sort(key=lambda t: t[0])
-        return merged
+        return merged, cluster_embs
 
     def _run_pipeline(self, audio_in, audio_dur_s, num_speakers, min_speakers,
                       max_speakers, status_callback, t_start,
@@ -1996,16 +2164,65 @@ class PyannoteDiarizer:
             audio_in, audio_dur_s, num_speakers, min_speakers, max_speakers,
             status_callback, t0)
 
+        # best-effort 进程内声纹提取（与分块 worker 同款 wespeaker），
+        # 让短音频路径也产出簇嵌入供会后自动声纹匹配；失败静默退化为无向量。
+        seg_tracks = [{"start": float(s), "end": float(e),
+                       "label": str(lab), "emb": None}
+                      for s, e, lab in tracks]
+        try:
+            emb_feat = self._extract_wespeaker_embeddings(
+                audio_in, status_callback=status_callback)
+            if emb_feat is not None:
+                for t in seg_tracks:
+                    t["emb"] = _segment_embedding_from_feat(
+                        emb_feat, t["start"], t["end"])
+        except Exception as e:
+            if status_callback:
+                status_callback("log", f"短音频声纹提取失败（不影响分离）: {e}")
+
         del waveform, audio_in
         gc.collect()
 
+        # 短音频的标签本来就是全局的，走一遍全局聚类是幂等的，
+        # 主要为拿到簇级声纹向量 + SPEAKER_xx 统一命名。
+        merged, cluster_embs = self._cluster_speakers_global(
+            seg_tracks, num_speakers=num_speakers,
+            min_speakers=min_speakers, max_speakers=max_speakers,
+            status_callback=status_callback)
+
         elapsed = _time.time() - t0
         if status_callback:
-            n_spk = len(set(t[2] for t in tracks))
+            n_spk = len(set(t[2] for t in merged))
             status_callback("diarizing",
                 f"说话人分离完成（{n_spk} 位说话人，耗时 {elapsed/60:.1f} 分钟）")
-        tracks.sort(key=lambda t: t[0])
-        return tracks
+        merged.sort(key=lambda t: t[0])
+        return merged, cluster_embs
+
+    def _extract_wespeaker_embeddings(self, audio_in, status_callback=None):
+        """进程内跑 wespeaker 滑窗推理，返回 SlidingWindowFeature；失败返回 None。
+
+        与 pyannote_chunk_worker.py 的嵌入路径保持一致（模型名/步长走同样的
+        环境变量），短音频整段提取，供 _cluster_speakers_global 做簇原型。
+        """
+        import torch
+        embed_model = os.environ.get(
+            "PYANNOTE_EMBED_MODEL",
+            "pyannote/wespeaker-voxceleb-resnet34-LM")
+        if not embed_model:
+            return None
+        embed_step = float(os.environ.get("PYANNOTE_EMBED_STEP", "1.0"))
+        if status_callback:
+            status_callback("diarizing", "正在提取说话人声纹（短音频路径）...")
+        from pyannote.audio import Model
+        from pyannote.audio.core.inference import Inference
+        emb_model = Model.from_pretrained(
+            embed_model, token=getattr(self, "_hf_token", None) or None)
+        inference = Inference(emb_model, window="sliding", step=embed_step,
+                              device=torch.device("cpu"))
+        feat = inference(audio_in)
+        del emb_model, inference
+        gc.collect()
+        return feat
 
     @staticmethod
     def _cluster_speakers_global(all_tracks, num_speakers=None,
@@ -2128,12 +2345,27 @@ class PyannoteDiarizer:
                 f"{len(ordered)} 位说话人" +
                 ("（按声纹相似度自动判定）" if not num_speakers else f"（指定 {num_speakers} 人）"))
 
+        # 6) 簇级声纹向量：同簇各本地标签的原型按时长加权平均后 L2 归一，
+        #    供会后声纹库自动匹配（match_speakers）。无原型的簇不产出向量。
+        cluster_vecs = defaultdict(list)   # cluster_id -> [(weight, proto_vec)]
+        for lab, c in label_cluster.items():
+            if lab in proto:
+                cluster_vecs[c].append((label_dur[lab], proto[lab]))
+        cluster_embs = {}
+        for c, wv in cluster_vecs.items():
+            w = np.array([d for d, _ in wv], dtype="float32")
+            M = np.stack([v for _, v in wv])
+            v = (M * w[:, None]).sum(axis=0) / w.sum()
+            nrm = float(np.linalg.norm(v))
+            if nrm > 1e-6:
+                cluster_embs[cluster_to_name[c]] = (v / nrm).astype("float32").tolist()
+
         out = []
         for t in all_tracks:
             out.append((t["start"], t["end"],
                         cluster_to_name[label_cluster[t["label"]]]))
         out.sort(key=lambda x: x[0])
-        return out
+        return out, cluster_embs
 
 
 # ─── Whisper 文件转写（faster-whisper）───
@@ -3038,6 +3270,94 @@ def create_app():
             else:
                 await state.push_event_sync(ws, "log", {"message": "自动监控未在运行"})
 
+        # ─── 会后处理（postmeeting）WS actions ───
+        elif action == "pm_save_edit":
+            ok, payload = _pm_core_update_recording(msg.get("data", {}))
+            if ok:
+                await state.push_event_sync(ws, "pm_edit_saved", payload)
+                await state.push_event_sync(ws, "log", {"message": "转写修改已保存"})
+            else:
+                await state.push_event_sync(ws, "postmeeting_error", {"message": payload})
+
+        elif action == "pm_rename_speakers":
+            ok, payload = _pm_core_update_recording(msg.get("data", {}))
+            if ok:
+                await state.push_event_sync(ws, "pm_speakers_renamed", payload)
+                await state.push_event_sync(ws, "log", {"message": "说话人改名已保存"})
+            else:
+                await state.push_event_sync(ws, "postmeeting_error", {"message": payload})
+
+        elif action == "pm_search":
+            if _pm is None:
+                await state.push_event_sync(ws, "postmeeting_error",
+                                            {"message": "会后处理模块未加载"})
+            else:
+                query = (msg.get("data", {}) or {}).get("query", "")
+                try:
+                    results = _pm_core_search(query)
+                    await state.push_event_sync(ws, "pm_search_results",
+                                                {"query": query, "results": results})
+                except Exception as e:
+                    await state.push_event_sync(ws, "postmeeting_error",
+                                                {"message": f"检索失败：{e}"})
+
+        elif action == "pm_list_voiceprints":
+            if _pm is None:
+                await state.push_event_sync(ws, "postmeeting_error",
+                                            {"message": "会后处理模块未加载"})
+            else:
+                try:
+                    await state.push_event_sync(ws, "pm_voiceprints",
+                                                {"voices": _pm.list_voiceprints()})
+                except Exception as e:
+                    await state.push_event_sync(ws, "postmeeting_error",
+                                                {"message": f"声纹列表读取失败：{e}"})
+
+        elif action == "pm_register_voiceprint":
+            if _pm is None:
+                await state.push_event_sync(ws, "postmeeting_error",
+                                            {"message": "会后处理模块未加载"})
+            else:
+                threading.Thread(
+                    target=_pm_register_voiceprint_task,
+                    args=(msg.get("data", {}) or {},),
+                    daemon=True,
+                ).start()
+
+        elif action == "pm_delete_voiceprint":
+            if _pm is None:
+                await state.push_event_sync(ws, "postmeeting_error",
+                                            {"message": "会后处理模块未加载"})
+            else:
+                name = (msg.get("data", {}) or {}).get("name", "")
+                ok, msg_txt = _pm.delete_voiceprint(name)
+                await state.push_event_sync(ws, "pm_voiceprint_deleted",
+                                            {"ok": ok, "message": msg_txt, "name": name})
+                if ok:
+                    await state.push_event_sync(ws, "pm_voiceprints",
+                                                {"voices": _pm.list_voiceprints()})
+                else:
+                    await state.push_event_sync(ws, "postmeeting_error",
+                                                {"message": msg_txt})
+
+        elif action == "pm_export_minutes":
+            if _pm is None:
+                await state.push_event_sync(ws, "postmeeting_error",
+                                            {"message": "会后处理模块未加载"})
+            else:
+                d = msg.get("data", {}) or {}
+                raw = d.get("raw") if d.get("raw") is not None else d.get("text", "")
+                if not str(raw).strip():
+                    await state.push_event_sync(ws, "postmeeting_error",
+                                                {"message": "没有可导出的纪要内容"})
+                else:
+                    try:
+                        out = _pm_core_export_minutes(raw, topic=d.get("topic"))
+                        await state.push_event_sync(ws, "pm_minutes_exported", out)
+                    except Exception as e:
+                        await state.push_event_sync(ws, "postmeeting_error",
+                                                    {"message": f"纪要导出失败：{e}"})
+
         else:
             await state.push_event_sync(ws, "log", {"message": f"未知操作: {action}"})
 
@@ -3528,13 +3848,35 @@ def _transcribe_file_task(filepath, ws):
                     state.set_transcript(result.get("text", ""))
                     state.sentence_info = result.get("sentence_info", [])
                     state.speaker_count = result.get("speaker_count", 0)
+                    _ce = _pm_cluster_embeddings_for_meta(result)
+                    # pyannote 路径产出簇嵌入 → 自动与声纹库匹配
+                    _auto_labels, _auto_rendered = {}, ""
+                    if _ce:
+                        try:
+                            _mi, _auto_labels, _auto_rendered = _pm_auto_match_speakers(filepath, result)
+                            for _spk, _name, _score, _matched in _mi:
+                                if _matched and _name:
+                                    state.push_from_thread(
+                                        "log", {"message":
+                                            f"声纹自动识别：说话人{int(_spk)+1} → {_name}（相似度 {_score:.2f}）"})
+                        except Exception as _e:
+                            state.push_from_thread("log", {"message": f"声纹自动匹配跳过：{_e}"})
+                    _extra = {}
+                    if _ce:
+                        _extra["cluster_embeddings"] = _ce
+                    if _auto_labels:
+                        _extra["speaker_labels"] = _auto_labels
+                    _meta_text = _auto_rendered or state.transcript_text
                     save_recording_meta(
                         filepath,
-                        text=state.transcript_text,
+                        text=_meta_text,
                         engine="FunASR",
                         sentence_info=state.sentence_info,
                         speaker_count=state.speaker_count,
+                        extra=_extra or None,
                     )
+                    if _auto_rendered:
+                        state.set_transcript(_auto_rendered)
                     # 发送结构化结果给前端（wav_name 供会后处理：对照回放/编辑保存/声纹注册）
                     state.push_from_thread("transcript_ready", {
                         "text": state.transcript_text,
@@ -3876,6 +4218,8 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
 
         # 如果开启了说话人分离，对录音文件做离线说话人分离
         speaker_diary = state.config.get("speaker_diarization", False)
+        diarization_result = None  # 保留分离结果供落 meta / 声纹自动匹配用
+        _auto_labels, _auto_rendered = {}, ""  # 声纹自动匹配结果（随 meta 一起落库）
         if speaker_diary and recording_filepath and engine == "FunASR":
             push("realtime_status", {"status": "diarizing", "message": "正在做说话人分离..."})
             push("status", "说话人分离中")
@@ -3889,8 +4233,22 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
                     diarization_config=state.config
                 )
                 if result is not None:
+                    diarization_result = result
                     state.sentence_info = result.get("sentence_info", [])
                     state.speaker_count = result.get("speaker_count", 0)
+                    # pyannote 路径产出簇嵌入 → 自动与声纹库匹配
+                    _ce = _pm_cluster_embeddings_for_meta(result)
+                    if _ce:
+                        try:
+                            _mi, _auto_labels, _auto_rendered = _pm_auto_match_speakers(recording_filepath, result)
+                            for _spk, _name, _score, _matched in _mi:
+                                if _matched and _name:
+                                    push("log", {"message":
+                                        f"声纹自动识别：说话人{int(_spk)+1} → {_name}（相似度 {_score:.2f}）"})
+                        except Exception as _e:
+                            push("log", {"message": f"声纹自动匹配跳过：{_e}"})
+                    if _auto_rendered:
+                        state.set_transcript(_auto_rendered)
                     # 发送结构化结果（含说话人信息；wav_name 供会后处理）
                     push("transcript_ready", {
                         "text": state.transcript_text,
@@ -3913,12 +4271,19 @@ def _realtime_transcribe_task(ws, engine="FunASR"):
         # 录音库存档：把本次转写文本/引擎/时长写到 WAV 同名 .meta.json
         if recording_filepath:
             try:
+                _ce = _pm_cluster_embeddings_for_meta(diarization_result)
+                _extra = {}
+                if _ce:
+                    _extra["cluster_embeddings"] = _ce
+                if _auto_labels:
+                    _extra["speaker_labels"] = _auto_labels
                 save_recording_meta(
                     recording_filepath,
-                    text=state.transcript_text or "",
+                    text=_auto_rendered or state.transcript_text or "",
                     engine="讯飞" if engine == "xfyun" else engine,
                     sentence_info=list(state.sentence_info or []) if speaker_diary else None,
                     speaker_count=state.speaker_count,
+                    extra=_extra or None,
                 )
             except Exception as e:
                 push("log", {"message": f"录音元数据保存失败: {e}"})
