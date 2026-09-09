@@ -63,7 +63,7 @@ for ci in range(12):
 n_labels = len(set(t["label"] for t in tracks))
 print(f"fabricated {len(tracks)} segments, {n_labels} local labels")
 
-merged = app.PyannoteDiarizer._cluster_speakers_global(
+merged, cluster_embs = app.PyannoteDiarizer._cluster_speakers_global(
     tracks, num_speakers=None, status_callback=None)
 
 spk_names = sorted(set(t[2] for t in merged))

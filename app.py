@@ -87,6 +87,21 @@ except Exception as _pm_err:  # pragma: no cover - 缺模块不应拖垮主干
     _pm = None
     print(f"[WARN] postmeeting 模块加载失败（会后处理功能不可用）: {_pm_err}")
 
+# 环境自检与模型就绪检查（纯标准库，音频库惰性 import）。
+try:
+    import healthcheck as _hc
+except Exception as _hc_err:  # pragma: no cover
+    _hc = None
+    print(f"[WARN] healthcheck 模块加载失败（环境自检不可用）: {_hc_err}")
+
+# 模型下载器单例（后台串行下载 modelscope 缺失模型）
+_model_downloader = None
+if _hc is not None:
+    try:
+        _model_downloader = _hc.ModelDownloader()
+    except Exception as _dl_err:  # pragma: no cover
+        print(f"[WARN] 模型下载器初始化失败: {_dl_err}")
+
 # ─── 确保目录存在 ───
 def ensure_dirs():
     for d in [DATA_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR]:
@@ -2895,7 +2910,7 @@ state = AppState()
 
 # ─── FastAPI 后端 ───
 def create_app():
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
     from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
 
@@ -2934,6 +2949,50 @@ def create_app():
             return JSONResponse(devices)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # REST: 环境自检（模型就绪 / 音频设备 / 磁盘），重检查在后台线程跑避免阻塞事件循环
+    @app.get("/api/health")
+    async def api_health():
+        if _hc is None:
+            return JSONResponse({"error": "healthcheck 模块未加载"}, status_code=500)
+        import asyncio
+        import functools
+        loop = asyncio.get_event_loop()
+        try:
+            report = await loop.run_in_executor(
+                None, functools.partial(_hc.run_health_check, state.config))
+            return JSONResponse(report)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # REST: 触发下载缺失 model（body: {models: [id,...]}，不传则下载所有缺失的核心模型）
+    @app.post("/api/models/download")
+    async def api_models_download(request: Request):
+        if _model_downloader is None:
+            return JSONResponse({"error": "模型下载器不可用"}, status_code=500)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        ids = body.get("models")
+        if not ids:
+            # 默认：补齐所有未就绪的核心 modelscope 模型
+            report = _hc.run_health_check(state.config)
+            ids = [m["id"] for m in report["models"]
+                   if m["kind"] == "core" and m["status"] != "ok"
+                   and m["provider"] == "modelscope"]
+        try:
+            res = _model_downloader.start(ids)
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # REST: 查询下载任务状态（前端轮询）
+    @app.get("/api/models/download/status")
+    async def api_models_download_status():
+        if _model_downloader is None:
+            return JSONResponse({"jobs": []})
+        return JSONResponse({"jobs": _model_downloader.status()})
 
     # ── 录音库 REST ──
     @app.get("/api/recordings")

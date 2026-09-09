@@ -127,22 +127,22 @@ check("最终 flush 也做纠正（共两处调用）",
       src.count("correct_hotwords_by_pinyin("), 2)
 
 print()
-print("=== 旧代码 NameError 隐患已修复 ===")
-# 旧实现把 _async_punctuate 定义在 `if audio_data is None:` 分支内部，
-# 却在分支外调用；若首次循环即取到音频（不进该分支），直接 NameError。
-# 锂点选得小心：不能用分支/循环字面量——注释里包含 `if audio_data is None:`，
-# 而 `while state.is_realtime:` 在 xfyun 分支也出现过（确实在 def 之前）。
-# 用只属于 FunASR 主循环的真实语句作锂点。
-def_pos = src.index("def _async_punctuate")
+print("=== 标点在主循环同线程同步做（杜绝跨线程调模型死锁）===")
+# 架构已从“后台线程异步标点”(_async_punctuate) 改为在主循环停顿点同步调用的
+# 内联函数 _punctuate_inline：torch/ONNX 模型句柄绑定创建线程，跨线程调用会
+# 在底层锁上死锁。这里锁定新不变量，防止有人改回后台线程方案。
+check("旧的 _async_punctuate 符号已彻底移除", "_async_punctuate" in src, False)
+check("不存在后台线程 target= 标点调用", src.count("target="), 0)
+check("_punctuate_inline 恰好定义一次", src.count("def _punctuate_inline"), 1)
 loop_pos = src.index("audio_data = state.recorder.get_audio_chunk")
-check("锂点在源码中唯一", src.count("audio_data = state.recorder.get_audio_chunk"), 1)
-check_true("_async_punctuate 定义在 FunASR 主循环之前", def_pos < loop_pos)
-check("全文仅定义一次（未重复定义）", src.count("def _async_punctuate"), 1)
-check("两处调用均在定义之后",
-      all(p > def_pos for p in
-          [i for i in range(len(src))
-           if src.startswith("target=_async_punctuate", i)]),
-      True)
+def_pos = src.index("def _punctuate_inline")
+check("主循环取音频锂点唯一", src.count("audio_data = state.recorder.get_audio_chunk"), 1)
+check_true("_punctuate_inline 定义在 FunASR 主循环之前", def_pos < loop_pos)
+# 函数体内：先加标点、再做热词纠正（顺序不能反，否则跨句误匹配）
+helper_body = src[def_pos:loop_pos]
+check_true("内联标点函数内先 add_punctuation 后热词纠正",
+           helper_body.index("add_punctuation") < helper_body.index("correct_hotwords_by_pinyin"))
+check("主循环中停顿点会调用 _punctuate_inline", src.count("_punctuate_inline()") >= 2, True)
 
 print()
 if FAILED:

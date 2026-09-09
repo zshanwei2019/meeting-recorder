@@ -255,7 +255,9 @@ for site in ui_sites:
 print()
 print("=== 8. realtime 路径按设计不维护 is_recording（防误改）===")
 rt = [i for i in call_lines if owner_name(i) == "_realtime_transcribe_task"]
-check("realtime 内 stop() 调用点数", len(rt), 2)
+# 三处 stop()：讯飞分支末尾、FunASR recorder.start() 后复查 is_realtime 的竞态保护
+# （模型加载期间用户点了停止时，立即停掉刚启动的录音防偷录）、FunASR 主循环末尾 flush。
+check("realtime 内 stop() 调用点数", len(rt), 3)
 for f in ast.walk(TREE):
     if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
             f.name == "_realtime_transcribe_task":

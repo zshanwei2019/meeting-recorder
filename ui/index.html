@@ -493,6 +493,38 @@ html, body {
 .pm-btn.ghost:hover { color: #f1f5f9; border-color: rgba(99,102,241,0.5); }
 .pm-btn.danger { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); padding: 3px 10px; }
 .pm-btn.danger:hover { background: rgba(239,68,68,0.3); }
+/* ── 环境自检面板 ── */
+.hc-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  border: 1px solid transparent;
+}
+.hc-banner.ok    { background: rgba(34,197,94,0.12);  color: #4ade80; border-color: rgba(34,197,94,0.3); }
+.hc-banner.bad   { background: rgba(239,68,68,0.12);  color: #f87171; border-color: rgba(239,68,68,0.32); }
+.hc-banner.warn  { background: rgba(234,179,8,0.12);  color: #facc15; border-color: rgba(234,179,8,0.32); }
+.hc-banner .hc-sub { font-weight: 400; font-size: 12px; color: #94a3b8; }
+.hc-item {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 8px 10px; border-radius: 7px;
+  background: #1c1f2e; font-size: 12px; color: #cbd5e1;
+  margin-bottom: 5px;
+}
+.hc-item .hc-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; }
+.hc-item .hc-body { flex: 1; min-width: 0; }
+.hc-item .hc-name { color: #e2e8f0; font-weight: 600; }
+.hc-item .hc-detail { color: #8b96a8; font-size: 11px; margin-top: 2px; line-height: 1.5; word-break: break-word; }
+.hc-item .hc-size { color: #64748b; font-size: 11px; white-space: nowrap; }
+.hc-dot.ok      { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.6); }
+.hc-dot.warn    { background: #eab308; }
+.hc-dot.partial { background: #f97316; box-shadow: 0 0 6px rgba(249,115,22,0.5); }
+.hc-dot.missing { background: #64748b; }
+.hc-dot.error   { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.6); }
+.hc-group-label { font-size: 11px; color: #6366f1; font-weight: 700; margin: 10px 2px 6px; text-transform: uppercase; letter-spacing: .5px; }
+.hc-spinner {
+  display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(148,163,184,.25);
+  border-top-color: #818cf8; border-radius: 50%; animation: hc-spin .7s linear infinite; vertical-align: -2px;
+}
+@keyframes hc-spin { to { transform: rotate(360deg); } }
 .pm-list {
   max-height: 180px; overflow-y: auto;
   display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
@@ -594,6 +626,9 @@ html, body {
     </div>
     <div class="btn-row">
       <button class="btn-secondary" onclick="openPostMeeting()">📋 会后处理</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="openHealth()">🩺 环境自检</button>
     </div>
 
     <div class="divider"></div>
@@ -810,6 +845,34 @@ html, body {
         <div class="pm-status" id="pmVpStatus"></div>
       </div>
 
+    </div>
+  </div>
+</div>
+
+<!-- 环境自检弹窗 -->
+<div class="pm-overlay" id="hcOverlay">
+  <div class="pm-panel" style="width:min(680px,92vw);">
+    <div class="pm-header">
+      <span class="pm-title">🩺 环境自检</span>
+      <button class="pm-close" onclick="closeHealth()" title="关闭">&times;</button>
+    </div>
+    <div class="pm-body">
+      <div class="pm-row" style="justify-content:space-between;">
+        <span id="hcSummary" style="font-size:12px;color:#94a3b8;">检查本机转写环境是否就绪</span>
+        <span class="pm-row">
+          <button class="pm-btn" style="padding:4px 12px;" id="hcDownloadBtn" onclick="hcDownloadMissing()">下载缺失核心模型</button>
+          <button class="pm-btn ghost" style="padding:4px 12px;" onclick="runHealth()"><span id="hcBtnText">重新检测</span></button>
+        </span>
+      </div>
+      <div id="hcBanner" class="hc-banner" style="display:none;"></div>
+      <div id="hcDlStatus" style="display:none; flex-direction:column; gap:5px; margin-bottom:4px;"></div>
+      <div class="hc-group-label">语音模型</div>
+      <div id="hcModels"><div class="pm-empty">点击“重新检测”开始…</div></div>
+      <div class="hc-group-label">音频设备</div>
+      <div id="hcDevices"></div>
+      <div class="hc-group-label">存储</div>
+      <div id="hcSystem"></div>
+      <div id="hcExtra"></div>
     </div>
   </div>
 </div>
@@ -1436,6 +1499,192 @@ function openPostMeeting() {
 }
 function closePostMeeting() {
   document.getElementById('pmOverlay').classList.remove('visible');
+}
+
+// ══════════════════════════════════════════
+// 环境自检（healthcheck）面板
+// ══════════════════════════════════════════
+function openHealth() {
+  document.getElementById('hcOverlay').classList.add('visible');
+  runHealth();
+}
+function closeHealth() {
+  document.getElementById('hcOverlay').classList.remove('visible');
+}
+
+const HC_STATUS_TEXT = {
+  ok: '正常', warn: '警告', partial: '下载不完整',
+  missing: '未安装', error: '错误', skip: '跳过',
+};
+
+function hcItem(name, status, detail, sizeText) {
+  const st = HC_STATUS_TEXT[status] || status;
+  return `<div class="hc-item">`
+    + `<span class="hc-dot ${status}" title="${st}"></span>`
+    + `<div class="hc-body">`
+    + `<div class="hc-name">${pmEscape(name)}</div>`
+    + (detail ? `<div class="hc-detail">${pmEscape(detail)}</div>` : '')
+    + `</div>`
+    + (sizeText ? `<span class="hc-size">${pmEscape(sizeText)}</span>` : '')
+    + `</div>`;
+}
+
+async function runHealth() {
+  const btn = document.getElementById('hcBtnText');
+  const banner = document.getElementById('hcBanner');
+  const modelsEl = document.getElementById('hcModels');
+  const devEl = document.getElementById('hcDevices');
+  const sysEl = document.getElementById('hcSystem');
+  const extraEl = document.getElementById('hcExtra');
+  btn.innerHTML = '<span class="hc-spinner"></span>';
+  banner.style.display = 'none';
+  modelsEl.innerHTML = '<div class="pm-empty">正在检测语音模型…</div>';
+  devEl.innerHTML = ''; sysEl.innerHTML = ''; extraEl.innerHTML = '';
+
+  let r;
+  try {
+    const resp = await fetch('/api/health');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    r = await resp.json();
+  } catch (e) {
+    btn.textContent = '重新检测';
+    modelsEl.innerHTML = '';
+    banner.className = 'hc-banner bad';
+    banner.style.display = 'flex';
+    banner.innerHTML = '❌ 环境自检失败<span class="hc-sub">' + pmEscape(String(e.message || e)) + '</span>';
+    return;
+  }
+  btn.textContent = '重新检测';
+
+  // 模型：核心在前、可选在后
+  const core = (r.models || []).filter(m => m.kind === 'core');
+  const optional = (r.models || []).filter(m => m.kind !== 'core');
+  let html = '';
+  core.forEach(m => { html += hcItem(m.label, m.status, m.detail, m.sizeMb ? m.sizeMb + ' MB' : ''); });
+  if (optional.length) {
+    html += '<div class="hc-group-label" style="margin-left:0;">可选模型（用到对应功能才需要）</div>';
+    optional.forEach(m => { html += hcItem(m.label, m.status, m.detail, m.sizeMb ? m.sizeMb + ' MB' : ''); });
+  }
+  modelsEl.innerHTML = html || '<div class="pm-empty">无模型信息</div>';
+
+  // 设备
+  const d = r.devices || {};
+  let dhtml = hcItem('音频输入设备', d.status || 'warn', d.detail || '');
+  if (Array.isArray(d.loopbackNames) && d.loopbackNames.length) {
+    dhtml += d.loopbackNames.map(n => `<div class="hc-detail" style="margin:2px 2px 0 18px;">🎧 ${pmEscape(n)}</div>`).join('');
+  }
+  devEl.innerHTML = dhtml;
+
+  // 存储
+  const disk = r.disk || {};
+  sysEl.innerHTML = hcItem('数据目录与磁盘', disk.status || 'warn',
+    ((disk.dataDir || '') + ' · ' + (disk.detail || '')), disk.freeGb != null ? disk.freeGb + ' GB 可用' : '');
+
+  // 额外检查项（HF token 等）
+  const extras = (r.checks || []).filter(c => c.group === 'config');
+  extraEl.innerHTML = extras.length ? '<div class="hc-group-label">配置提醒</div>' + extras.map(c => hcItem(c.label, c.status, c.detail)).join('') : '';
+
+  // 总览横幅
+  const s = r.summary || {};
+  if (r.ok && !(s.warnings > 0) && !(s.partial > 0)) {
+    banner.className = 'hc-banner ok';
+    banner.innerHTML = '✅ 环境就绪，核心功能可正常使用';
+  } else if (r.ok) {
+    banner.className = 'hc-banner warn';
+    const parts = [];
+    if (s.partial) parts.push(s.partial + ' 个模型下载不完整');
+    if (s.warnings) parts.push(s.warnings + ' 项提醒');
+    banner.innerHTML = '🟡 核心功能可用' + (parts.length ? '<span class="hc-sub">' + parts.join('；') + '（可选模型不影响默认转写）</span>' : '');
+  } else {
+    banner.className = 'hc-banner bad';
+    const names = (s.coreMissing || []).map(id => id.split('/').pop()).join('、');
+    banner.innerHTML = '❌ 核心模型未就绪<span class="hc-sub">缺失：' + pmEscape(names || '见下方列表') + '。请保持联网后重启程序自动下载，或在前台运行查看下载进度。</span>';
+  }
+  window._hcReport = r;
+  // 仅当存在未就绪的核心 modelscope 模型时显示下载按钮
+  const dlBtn = document.getElementById('hcDownloadBtn');
+  const needDl = (r.models || []).some(m => m.kind === 'core' && m.status !== 'ok' && m.provider === 'modelscope');
+  dlBtn.style.display = needDl ? '' : 'none';
+  dlBtn.disabled = false;
+  dlBtn.textContent = '下载缺失核心模型';
+  banner.style.display = 'flex';
+  // 面板打开时若已有下载任务在跑，自动接上轮询
+  hcStartPolling();
+}
+
+// ── 下载缺失核心模型 ──
+let hcPollTimer = null;
+
+function hcModelLabel(id) {
+  const m = (window._hcReport && window._hcReport.models || []).find(x => x.id === id);
+  return m ? m.label : id;
+}
+
+async function hcDownloadMissing() {
+  const btn = document.getElementById('hcDownloadBtn');
+  btn.disabled = true;
+  btn.textContent = '正在提交…';
+  try {
+    const resp = await fetch('/api/models/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const r = await resp.json().catch(() => ({}));
+    if (!resp.ok || r.error) throw new Error(r.error || ('HTTP ' + resp.status));
+    if (!(r.started || []).length) {
+      btn.textContent = '下载缺失核心模型';
+      btn.disabled = false;
+      runHealth();
+      return;
+    }
+    btn.textContent = '下载中…（可关闭面板，后台继续）';
+    hcStartPolling();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '下载缺失核心模型';
+    alert('启动下载失败：' + (e.message || e));
+  }
+}
+
+function hcStartPolling() {
+  if (hcPollTimer) return;
+  hcPollDownload();
+  hcPollTimer = setInterval(hcPollDownload, 2000);
+}
+
+async function hcPollDownload() {
+  let r;
+  try {
+    const resp = await fetch('/api/models/download/status');
+    if (!resp.ok) return;
+    r = await resp.json();
+  } catch (e) { return; }
+  const jobs = r.jobs || [];
+  const box = document.getElementById('hcDlStatus');
+  if (!jobs.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const dlText = { queued: '排队中', downloading: '下载中', done: '完成', error: '失败' };
+  const dlDot = { queued: 'missing', downloading: 'warn', done: 'ok', error: 'error' };
+  let html = '';
+  let active = false;
+  jobs.forEach(j => {
+    if (j.status === 'queued' || j.status === 'downloading') active = true;
+    const extra = (j.status === 'downloading') ? '<span class="hc-spinner"></span>' : '';
+    html += hcItem(extra + hcModelLabel(j.id) + ' — ' + (dlText[j.status] || j.status),
+      dlDot[j.status] || 'warn',
+      (j.status === 'done' || j.status === 'error') ? j.message : '保持网络畅通，大模型可能需要数分钟', '');
+  });
+  box.innerHTML = html;
+  box.style.display = 'flex';
+  const btn = document.getElementById('hcDownloadBtn');
+  if (!active) {
+    clearInterval(hcPollTimer);
+    hcPollTimer = null;
+    btn.disabled = false;
+    btn.textContent = '下载缺失核心模型';
+    // 全部任务结束后刷新一次自检状态
+    runHealth();
+  }
 }
 
 function pmEscape(s) {
