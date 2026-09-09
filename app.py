@@ -87,6 +87,13 @@ except Exception as _pm_err:  # pragma: no cover - 缺模块不应拖垮主干
     _pm = None
     print(f"[WARN] postmeeting 模块加载失败（会后处理功能不可用）: {_pm_err}")
 
+# 环境自检与模型就绪检查（纯标准库，音频库惰性 import）。
+try:
+    import healthcheck as _hc
+except Exception as _hc_err:  # pragma: no cover
+    _hc = None
+    print(f"[WARN] healthcheck 模块加载失败（环境自检不可用）: {_hc_err}")
+
 # ─── 确保目录存在 ───
 def ensure_dirs():
     for d in [DATA_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR]:
@@ -2932,6 +2939,21 @@ def create_app():
         try:
             devices = state.recorder.list_devices()
             return JSONResponse(devices)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    # REST: 环境自检（模型就绪 / 音频设备 / 磁盘），重检查在后台线程跑避免阻塞事件循环
+    @app.get("/api/health")
+    async def api_health():
+        if _hc is None:
+            return JSONResponse({"error": "healthcheck 模块未加载"}, status_code=500)
+        import asyncio
+        import functools
+        loop = asyncio.get_event_loop()
+        try:
+            report = await loop.run_in_executor(
+                None, functools.partial(_hc.run_health_check, state.config))
+            return JSONResponse(report)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
