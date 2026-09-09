@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
+import threading
 import platform
 from pathlib import Path
 
@@ -351,3 +353,111 @@ def run_health_check(config: dict | None = None,
         "disk": disk,
         "checks": checks,
     }
+
+
+# ── 缺失模型下载 ─────────────────────────────────────────────
+# 说明：只支持 modelscope 公开模型（核心转写链路 + cam++）。pyannote 是
+# HuggingFace gated 模型，必须先在网页接受条款 + 填 token，不能在这里静默拉取。
+class ModelDownloader:
+    """后台串行下载 modelscope 模型，内存里跟踪进度供前端轮询。
+
+    downloader_fn 可注入（单测里传一个假函数，避免真的联网）；生产传 None
+    则惰性 import modelscope.snapshot_download。
+    """
+
+    def __init__(self, downloader_fn=None):
+        # RLock：start() 持锁后还要调 status()，同线程可重入，避免自锁死锁
+        self._lock = threading.RLock()
+        self._jobs = {}          # model_id -> 状态 dict
+        self._queue = []         # 待下载 model_id 顺序
+        self._worker_started = False
+        self._downloader_fn = downloader_fn
+
+    # 内部：真正的下载函数（惰性 import，避免健康检查强依赖 modelscope）
+    def _real_download(self, model_id: str) -> str:
+        from modelscope import snapshot_download
+        return snapshot_download(model_id)
+
+    def _download(self, model_id: str) -> str:
+        if self._downloader_fn is not None:
+            return self._downloader_fn(model_id)
+        return self._real_download(model_id)
+
+    def _known_ids(self):
+        return {m["id"] for m in MODEL_REGISTRY if m["provider"] == "modelscope"}
+
+    def start(self, model_ids, ms_base: Path | None = None, hf_base: Path | None = None) -> dict:
+        """请求下载一批模型（去重、只接受已知 modelscope 模型）。返回 {started, skipped, jobs}。"""
+        known = self._known_ids()
+        started, skipped = [], []
+        should_start_worker = False
+        with self._lock:
+            for raw in model_ids or []:
+                mid = str(raw or "").strip()
+                if mid not in known:
+                    skipped.append({"id": mid, "reason": "不支持的模型（可能是 gated 模型）"})
+                    continue
+                st = self._jobs.get(mid)
+                if st and st["status"] in ("queued", "downloading"):
+                    skipped.append({"id": mid, "reason": "已在下载队列中"})
+                    continue
+                # 已就绪的不必重下
+                entry = next(m for m in MODEL_REGISTRY if m["id"] == mid)
+                chk = check_model(entry, ms_base, hf_base)
+                if chk["status"] == "ok":
+                    skipped.append({"id": mid, "reason": "已就绪"})
+                    continue
+                self._jobs[mid] = {
+                    "id": mid, "status": "queued", "message": "排队等待下载…",
+                    "startedAt": time.time(),
+                }
+                if mid not in self._queue:
+                    self._queue.append(mid)
+                started.append(mid)
+            if started and not self._worker_started:
+                self._worker_started = True
+                should_start_worker = True
+        # 线程启动与 status() 都放到锁外，避免持锁做阻塞/重入操作
+        if should_start_worker:
+            threading.Thread(target=self._worker, daemon=True).start()
+        return {"started": started, "skipped": skipped,
+                "jobs": self.status(ms_base=ms_base, hf_base=hf_base)}
+
+    def _worker(self):
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._worker_started = False
+                    return
+                mid = self._queue.pop(0)
+                self._jobs[mid] = {**self._jobs.get(mid, {}),
+                                   "id": mid, "status": "downloading",
+                                   "message": "正在下载，请保持网络畅通…"}
+            try:
+                path = self._download(mid)
+                with self._lock:
+                    self._jobs[mid] = {**self._jobs.get(mid, {}), "id": mid,
+                                       "status": "done", "message": f"下载完成：{path}",
+                                       "finishedAt": time.time()}
+            except Exception as e:  # noqa: BLE001
+                with self._lock:
+                    self._jobs[mid] = {**self._jobs.get(mid, {}), "id": mid,
+                                       "status": "error", "message": f"下载失败：{e}",
+                                       "finishedAt": time.time()}
+
+    def status(self, ms_base: Path | None = None, hf_base: Path | None = None) -> list:
+        """返回所有任务状态；done 的再用 check_model 复核（防止假成功）。"""
+        with self._lock:
+            jobs = [dict(v) for v in self._jobs.values()]
+        for j in jobs:
+            if j["status"] == "done":
+                entry = next((m for m in MODEL_REGISTRY if m["id"] == j["id"]), None)
+                if entry is not None:
+                    chk = check_model(entry, ms_base, hf_base)
+                    if chk["status"] != "ok":
+                        j["status"] = "error"
+                        j["message"] = "下载结束但未检测到完整权重，请重试"
+        # 稳定排序：进行中在前，再按开始时间
+        order = {"downloading": 0, "queued": 1, "error": 2, "done": 3}
+        jobs.sort(key=lambda j: (order.get(j["status"], 9), j.get("startedAt", 0)))
+        return jobs

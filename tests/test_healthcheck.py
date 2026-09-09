@@ -125,6 +125,61 @@ check("含 3 个核心模型", sum(1 for m in hc.MODEL_REGISTRY if m["kind"] == 
 check("provider 仅 modelscope/huggingface",
       all(m["provider"] in ("modelscope", "huggingface") for m in hc.MODEL_REGISTRY))
 
+print("=== 7. ModelDownloader（注入假下载，不联网）===")
+import time as _time
+
+with tempfile.TemporaryDirectory() as td2:
+    dms = Path(td2) / "ms"
+
+    def _wait_jobs(dl, timeout=8):
+        t0 = _time.time()
+        while _time.time() - t0 < timeout:
+            st = dl.status(ms_base=dms)
+            if st and all(j["status"] in ("done", "error") for j in st):
+                return st
+            _time.sleep(0.03)
+        return dl.status(ms_base=dms)
+
+    # 7.1 假下载成功：真的在缓存里造出权重文件
+    def fake_ok(mid):
+        snap = hc.modelscope_snapshot(mid, dms)
+        snap.mkdir(parents=True, exist_ok=True)
+        (snap / "model.pt").write_bytes(b"w" * (2 * 1024 * 1024))
+        return str(snap)
+
+    dl = hc.ModelDownloader(downloader_fn=fake_ok)
+    res = dl.start(["iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"], ms_base=dms)
+    check("合法模型进入 started", len(res["started"]) == 1, str(res))
+    jobs = _wait_jobs(dl)
+    check("假下载后状态 done", jobs and jobs[0]["status"] == "done", str(jobs))
+    # done 后 check_model 复核应真的 ok
+    chk = hc.check_model(
+        {"id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch", "label": "x",
+         "kind": "core", "provider": "modelscope"}, dms, None)
+    check("下载后自检复核 ok", chk["status"] == "ok", str(chk))
+
+    # 7.2 已就绪的再请求 -> skipped，不开任务
+    res2 = dl.start(["iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"], ms_base=dms)
+    check("已就绪被跳过", len(res2["started"]) == 0 and len(res2["skipped"]) == 1, str(res2))
+
+    # 7.3 gated / 未知模型被拒绝
+    res3 = dl.start(["pyannote/speaker-diarization-3.1", "iic/not-exist"], ms_base=dms)
+    check("gated+未知模型不入队", len(res3["started"]) == 0 and len(res3["skipped"]) == 2, str(res3))
+
+    # 7.4 下载失败 -> error，不崩
+    def fake_fail(mid):
+        raise RuntimeError("network down")
+    dlf = hc.ModelDownloader(downloader_fn=fake_fail)
+    dlf.start(["iic/SenseVoiceSmall"], ms_base=dms)
+    fjobs = _wait_jobs(dlf)
+    check("下载异常记为 error", fjobs and fjobs[0]["status"] == "error" and "network down" in fjobs[0]["message"], str(fjobs))
+
+    # 7.5 假成功但没造出权重 -> 复核降级 error（防空报成功）
+    dlf2 = hc.ModelDownloader(downloader_fn=lambda mid: "whatever")
+    dlf2.start(["iic/SenseVoiceSmall"], ms_base=dms)
+    f2 = _wait_jobs(dlf2)
+    check("无权重时 done 被复核改 error", f2 and f2[0]["status"] == "error", str(f2))
+
 print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
 if FAIL:

@@ -859,9 +859,13 @@ html, body {
     <div class="pm-body">
       <div class="pm-row" style="justify-content:space-between;">
         <span id="hcSummary" style="font-size:12px;color:#94a3b8;">检查本机转写环境是否就绪</span>
-        <button class="pm-btn ghost" style="padding:4px 12px;" onclick="runHealth()"><span id="hcBtnText">重新检测</span></button>
+        <span class="pm-row">
+          <button class="pm-btn" style="padding:4px 12px;" id="hcDownloadBtn" onclick="hcDownloadMissing()">下载缺失核心模型</button>
+          <button class="pm-btn ghost" style="padding:4px 12px;" onclick="runHealth()"><span id="hcBtnText">重新检测</span></button>
+        </span>
       </div>
       <div id="hcBanner" class="hc-banner" style="display:none;"></div>
+      <div id="hcDlStatus" style="display:none; flex-direction:column; gap:5px; margin-bottom:4px;"></div>
       <div class="hc-group-label">语音模型</div>
       <div id="hcModels"><div class="pm-empty">点击“重新检测”开始…</div></div>
       <div class="hc-group-label">音频设备</div>
@@ -1596,7 +1600,91 @@ async function runHealth() {
     const names = (s.coreMissing || []).map(id => id.split('/').pop()).join('、');
     banner.innerHTML = '❌ 核心模型未就绪<span class="hc-sub">缺失：' + pmEscape(names || '见下方列表') + '。请保持联网后重启程序自动下载，或在前台运行查看下载进度。</span>';
   }
+  window._hcReport = r;
+  // 仅当存在未就绪的核心 modelscope 模型时显示下载按钮
+  const dlBtn = document.getElementById('hcDownloadBtn');
+  const needDl = (r.models || []).some(m => m.kind === 'core' && m.status !== 'ok' && m.provider === 'modelscope');
+  dlBtn.style.display = needDl ? '' : 'none';
+  dlBtn.disabled = false;
+  dlBtn.textContent = '下载缺失核心模型';
   banner.style.display = 'flex';
+  // 面板打开时若已有下载任务在跑，自动接上轮询
+  hcStartPolling();
+}
+
+// ── 下载缺失核心模型 ──
+let hcPollTimer = null;
+
+function hcModelLabel(id) {
+  const m = (window._hcReport && window._hcReport.models || []).find(x => x.id === id);
+  return m ? m.label : id;
+}
+
+async function hcDownloadMissing() {
+  const btn = document.getElementById('hcDownloadBtn');
+  btn.disabled = true;
+  btn.textContent = '正在提交…';
+  try {
+    const resp = await fetch('/api/models/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const r = await resp.json().catch(() => ({}));
+    if (!resp.ok || r.error) throw new Error(r.error || ('HTTP ' + resp.status));
+    if (!(r.started || []).length) {
+      btn.textContent = '下载缺失核心模型';
+      btn.disabled = false;
+      runHealth();
+      return;
+    }
+    btn.textContent = '下载中…（可关闭面板，后台继续）';
+    hcStartPolling();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '下载缺失核心模型';
+    alert('启动下载失败：' + (e.message || e));
+  }
+}
+
+function hcStartPolling() {
+  if (hcPollTimer) return;
+  hcPollDownload();
+  hcPollTimer = setInterval(hcPollDownload, 2000);
+}
+
+async function hcPollDownload() {
+  let r;
+  try {
+    const resp = await fetch('/api/models/download/status');
+    if (!resp.ok) return;
+    r = await resp.json();
+  } catch (e) { return; }
+  const jobs = r.jobs || [];
+  const box = document.getElementById('hcDlStatus');
+  if (!jobs.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const dlText = { queued: '排队中', downloading: '下载中', done: '完成', error: '失败' };
+  const dlDot = { queued: 'missing', downloading: 'warn', done: 'ok', error: 'error' };
+  let html = '';
+  let active = false;
+  jobs.forEach(j => {
+    if (j.status === 'queued' || j.status === 'downloading') active = true;
+    const extra = (j.status === 'downloading') ? '<span class="hc-spinner"></span>' : '';
+    html += hcItem(extra + hcModelLabel(j.id) + ' — ' + (dlText[j.status] || j.status),
+      dlDot[j.status] || 'warn',
+      (j.status === 'done' || j.status === 'error') ? j.message : '保持网络畅通，大模型可能需要数分钟', '');
+  });
+  box.innerHTML = html;
+  box.style.display = 'flex';
+  const btn = document.getElementById('hcDownloadBtn');
+  if (!active) {
+    clearInterval(hcPollTimer);
+    hcPollTimer = null;
+    btn.disabled = false;
+    btn.textContent = '下载缺失核心模型';
+    // 全部任务结束后刷新一次自检状态
+    runHealth();
+  }
 }
 
 function pmEscape(s) {
