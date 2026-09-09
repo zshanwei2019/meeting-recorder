@@ -2910,7 +2910,7 @@ state = AppState()
 
 # ─── FastAPI 后端 ───
 def create_app():
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
     from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
 
@@ -2967,7 +2967,7 @@ def create_app():
 
     # REST: 触发下载缺失 model（body: {models: [id,...]}，不传则下载所有缺失的核心模型）
     @app.post("/api/models/download")
-    async def api_models_download(request):
+    async def api_models_download(request: Request):
         if _model_downloader is None:
             return JSONResponse({"error": "模型下载器不可用"}, status_code=500)
         try:
