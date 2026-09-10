@@ -22,6 +22,11 @@ tauri-plugin-single-instance = { version = "2", features = [] }
 # 桌面通知：提供 Rust 侧发通知能力 + notify 命令，供 sidecar 事件后续调用。
 tauri-plugin-notification = { version = "2", features = [] }
 
+# Windows Job Object：把 PyInstaller onefile sidecar 的整棵进程树（bootloader→服务进程）
+# 挂进 KILL_ON_JOB_CLOSE 作业，壳退出/崩溃时由系统连孙进程一起回收，杜绝孤儿占端口。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [profile.release]
 # 减小壳体积；sidecar 是独立的 asr-server.exe，壳本身很轻。
 strip = true

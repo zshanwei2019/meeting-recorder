@@ -38,8 +38,93 @@ const SIDECAR_PORT: u16 = 18765;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
-/// 持有 sidecar 子进程句柄；应用退出时统一 kill。
-struct SidecarState(Mutex<Option<Child>>);
+// Windows：把 sidecar 整棵进程树挂进 KILL_ON_JOB_CLOSE 作业对象。
+// PyInstaller onefile 的 asr-server.exe 是「引导进程→真正的服务进程（孙进程，占 18765）」
+// 两层结构，std 的 Child::kill 只杀直接子进程，孙进程会成为孤儿。
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::RawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    };
+
+    /// KILL_ON_JOB_CLOSE 作业；最后一个句柄关闭（正常退出/崩溃被强杀）时，
+    /// 系统自动终止作业内的所有进程及其后代。
+    ///
+    /// HANDLE 是裸指针默认 !Send，但作业句柄可跨线程使用（CloseHandle/释放可在任意线程），
+    /// 且 SidecarState 必须 Send + Sync 才能被 Tauri 管理，这里手动声明 Send。
+    pub(super) struct WinJob(HANDLE);
+    unsafe impl Send for WinJob {}
+
+    impl WinJob {
+        /// 创建作业并把进程挂入（其以后派生的所有子孙默认都在作业内）。失败返回 None。
+        pub(super) fn attach(process: RawHandle) -> Option<WinJob> {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() || job == INVALID_HANDLE_VALUE {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                if AssignProcessToJobObject(job, process as HANDLE) == 0 {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                Some(WinJob(job))
+            }
+        }
+    }
+
+    impl Drop for WinJob {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// sidecar 进程：子进程句柄 + Windows 作业对象（兜底回收整棵树）。
+struct Sidecar {
+    child: Child,
+    // 不显式读取：它靠 Drop 时关闭句柄触发 KILL_ON_JOB_CLOSE 兜底回收整棵进程树。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    job: Option<win_job::WinJob>,
+}
+
+impl Sidecar {
+    /// 终止整棵 sidecar 进程树。先 taskkill /T /F 显式连根杀（确定性），
+    /// self 随后被 drop 时 Job Object 句柄关闭再兜底（连崩溃场景也覆盖）。
+    fn kill_tree(&mut self) {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.child.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 持有 sidecar 句柄；应用退出时统一回收整棵进程树。
+struct SidecarState(Mutex<Option<Sidecar>>);
 
 impl Drop for SidecarState {
     fn drop(&mut self) {
@@ -47,10 +132,10 @@ impl Drop for SidecarState {
     }
 }
 
-fn kill_sidecar(slot: &mut Option<Child>) {
-    if let Some(mut child) = slot.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+fn kill_sidecar(slot: &mut Option<Sidecar>) {
+    if let Some(mut sc) = slot.take() {
+        sc.kill_tree();
+        // sc 在此 drop：Windows 上关闭 Job 句柄，KILL_ON_JOB_CLOSE 兜底清掉任何残余后代。
     }
 }
 
@@ -174,7 +259,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "quit" => {
                 // 真正退出：先复用 SidecarState 清理逻辑杀掉 sidecar，再退出。
                 if let Some(state) = app.try_state::<SidecarState>() {
-                    kill_sidecar(&mut state.0.lock().unwrap());
+                    kill_sidecar(&mut state.inner().0.lock().unwrap());
                 }
                 app.exit(0);
             }
@@ -248,7 +333,20 @@ fn main() {
             println!("[shell] launching sidecar: {}", exe.display());
             match spawn_sidecar(&exe) {
                 Ok(child) => {
-                    app.manage(SidecarState(Mutex::new(Some(child))));
+                    // Windows：把 sidecar（及其以后派生的全部子孙）挂进 KILL_ON_JOB_CLOSE 作业。
+                    #[cfg(windows)]
+                    let job = {
+                        use std::os::windows::io::AsRawHandle;
+                        win_job::WinJob::attach(child.as_raw_handle())
+                    };
+                    #[cfg(not(windows))]
+                    let job = ();
+                    let _ = &job;
+                    app.manage(SidecarState(Mutex::new(Some(Sidecar {
+                        child,
+                        #[cfg(windows)]
+                        job,
+                    }))));
                 }
                 Err(e) => {
                     eprintln!("[shell] failed to spawn sidecar: {e}");
@@ -283,7 +381,7 @@ fn main() {
             // 应用退出时杀掉 sidecar，避免 asr-server.exe 残留。
             if let RunEvent::Exit | RunEvent::ExitRequested { .. } = event {
                 if let Some(state) = app_handle.try_state::<SidecarState>() {
-                    kill_sidecar(&mut state.0.lock().unwrap());
+                    kill_sidecar(&mut state.inner().0.lock().unwrap());
                 }
             }
         });
