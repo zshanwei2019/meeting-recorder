@@ -1037,6 +1037,12 @@ function handleEvent(ev) {
     case 'postmeeting_error':
       pmSetVpStatus((ev.data && ev.data.message) || '会后处理出错', 'err');
       appendLog('会后处理：' + ((ev.data && ev.data.message) || '未知错误'));
+      // 重转失败：复位“重转中”按钮并刷新列表
+      if (pmRetranscribing.size) {
+        pmRetranscribing.clear();
+        const _ovErr = document.getElementById('pmOverlay');
+        if (_ovErr && _ovErr.classList.contains('visible')) pmLoadRecordings();
+      }
       break;
   }
 }
@@ -1475,7 +1481,10 @@ function onTranscriptReady(data) {
   // 重转/转写完成后，若会后处理面板开着，自动刷新录音库列表（更新“未转写”/引擎/说话人数）
   const _pmOv = document.getElementById('pmOverlay');
   if (_pmOv && _pmOv.classList.contains('visible')) {
+    pmRetranscribing.clear();
     pmLoadRecordings();
+  } else {
+    pmRetranscribing.clear();
   }
 }
 
@@ -1531,6 +1540,7 @@ let pmRecordings = [];        // /api/recordings 列表缓存
 let pmCurrentId = null;       // 当前在面板中打开的录音 id
 let pmCurrentMeta = null;     // 当前录音详情（含 text/sentence_info/speaker_labels）
 let pmLastWavName = null;     // 最近一次转写完成的 wav_name（用于自动选中）
+let pmRetranscribing = new Set();  // 正在重转的 wav_name（按钮显示“重转中”）
 
 function openPostMeeting() {
   document.getElementById('pmOverlay').classList.add('visible');
@@ -1805,13 +1815,14 @@ async function pmLoadRecordings() {
     listEl.innerHTML = pmRecordings.map(r => {
       const spk = r.speaker_count > 0 ? ` · ${r.speaker_count}位说话人` : '';
       const done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
+      const busy = pmRetranscribing.has(r.wav_name);
       return `<div class="pm-item" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
         <div class="pm-item-row">
           <div class="pm-item-main">
             <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
             <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(r.engine || '未知引擎')}${spk}</div>
           </div>
-          <button class="pm-retrans-btn" title="用当前设置（热词/大模型/说话人分离）重新转写" onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}')">重转</button>
+          <button class="pm-retrans-btn" title="用当前设置（热词/大模型/说话人分离）重新转写"${busy ? ' disabled' : ''} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${busy ? '重转中…' : '重转'}</button>
         </div>
       </div>`;
     }).join('');
@@ -1828,16 +1839,20 @@ async function pmLoadRecordings() {
 }
 
 // 录音库「高质量重转」：用当前设置（热词/大模型/说话人分离）对已有录音重跑
-function pmRetranscribe(wavName) {
-  const btn = (typeof event !== 'undefined' && event && event.currentTarget) ? event.currentTarget : null;
-  if (btn) { btn.disabled = true; btn.textContent = '排队中'; }
-  appendLog('已提交高质量重转：' + wavName);
-  // 转写完成事件 transcript_ready 到达后由 onTranscriptReady 触发列表刷新
+function pmRetranscribe(wavName, btn) {
+  if (pmRetranscribing.has(wavName)) return;
+  pmRetranscribing.add(wavName);
+  if (btn) { btn.disabled = true; btn.textContent = '重转中…'; }
+  appendLog('已提交高质量重转：' + wavName + '（约需数十秒，完成后列表自动刷新）');
+  // 完成（transcript_ready）或失败（postmeeting_error）时清状态并刷新列表
   sendAction('pm_retranscribe', { wav_name: wavName });
-  // 兜底：3 秒后恢复按钮（成功/失败的最终状态以列表刷新为准）
+  // 安全兏底：3 分钟后无论如何复位按钮，避免异常时永久卡住
   setTimeout(() => {
-    document.querySelectorAll('.pm-retrans-btn').forEach(b => { b.disabled = false; b.textContent = '重转'; });
-  }, 3000);
+    if (pmRetranscribing.delete(wavName)) {
+      const ov = document.getElementById('pmOverlay');
+      if (ov && ov.classList.contains('visible')) pmLoadRecordings();
+    }
+  }, 180000);
 }
 
 async function pmSelectRecording(id) {
