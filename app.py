@@ -2974,15 +2974,21 @@ def create_app():
             body = await request.json()
         except Exception:
             body = {}
+        # 优先用请求里的 token，其次配置里的（设置页填的）
+        hf_token = str(body.get("hf_token") or state.config.get("hf_token") or "").strip()
         ids = body.get("models")
         if not ids:
-            # 默认：补齐所有未就绪的核心 modelscope 模型
+            # 默认：补齐所有未就绪的核心模型；HF 模型仅在已提供 token 时纳入
             report = _hc.run_health_check(state.config)
-            ids = [m["id"] for m in report["models"]
-                   if m["kind"] == "core" and m["status"] != "ok"
-                   and m["provider"] == "modelscope"]
+            ids = []
+            for m in report["models"]:
+                if m["kind"] != "core" or m["status"] == "ok":
+                    continue
+                if m["provider"] == "huggingface" and not hf_token:
+                    continue
+                ids.append(m["id"])
         try:
-            res = _model_downloader.start(ids)
+            res = _model_downloader.start(ids, hf_token=hf_token)
             return JSONResponse(res)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)

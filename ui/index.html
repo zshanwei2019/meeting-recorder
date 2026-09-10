@@ -866,6 +866,7 @@ html, body {
       </div>
       <div id="hcBanner" class="hc-banner" style="display:none;"></div>
       <div id="hcDlStatus" style="display:none; flex-direction:column; gap:5px; margin-bottom:4px;"></div>
+      <div id="hcHfHint" style="display:none; background:rgba(245,158,11,.12); border:1px solid rgba(245,158,11,.4); border-radius:8px; padding:8px 10px; margin-bottom:6px; font-size:12px; color:#fcd34d;"></div>
       <div class="hc-group-label">语音模型</div>
       <div id="hcModels"><div class="pm-empty">点击“重新检测”开始…</div></div>
       <div class="hc-group-label">音频设备</div>
@@ -1035,6 +1036,7 @@ function handleEvent(ev) {
 // ══════════════════════════════════════════
 function applyConfig(config) {
   if (!config) return;
+  window._appConfig = config;
   const srcMap = {'system': 0, 'mic': 1, 'both': 2};
   if (config.audio_source && srcMap[config.audio_source] !== undefined)
     document.getElementById('audioSource').selectedIndex = srcMap[config.audio_source];
@@ -1601,15 +1603,65 @@ async function runHealth() {
     banner.innerHTML = '❌ 核心模型未就绪<span class="hc-sub">缺失：' + pmEscape(names || '见下方列表') + '。请保持联网后重启程序自动下载，或在前台运行查看下载进度。</span>';
   }
   window._hcReport = r;
-  // 仅当存在未就绪的核心 modelscope 模型时显示下载按钮
+  // 主下载按钮：仅当存在未就绪的核心 modelscope 模型时显示
   const dlBtn = document.getElementById('hcDownloadBtn');
   const needDl = (r.models || []).some(m => m.kind === 'core' && m.status !== 'ok' && m.provider === 'modelscope');
   dlBtn.style.display = needDl ? '' : 'none';
   dlBtn.disabled = false;
   dlBtn.textContent = '下载缺失核心模型';
+  hcRenderHfHint(r);
   banner.style.display = 'flex';
   // 面板打开时若已有下载任务在跑，自动接上轮询
   hcStartPolling();
+}
+
+// ── HuggingFace gated（pyannote）模型引导/下载 ──
+function hcRenderHfHint(r) {
+  const box = document.getElementById('hcHfHint');
+  const hfMissing = (r.models || []).filter(m => m.provider === 'huggingface' && m.status !== 'ok');
+  if (!hfMissing.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const token = (window._appConfig && window._appConfig.hf_token || '').trim();
+  const names = hfMissing.map(m => '<li>' + pmEscape(m.label) + '</li>').join('');
+  if (token) {
+    // 已填 token：给一个下载按钮（条款若未接受，后端会返回具体指引）
+    box.innerHTML = '<div style="margin-bottom:6px;">检测到 ' + hfMissing.length + ' 个 pyannote 说话人分离模型未就绪（可选，不影响转写）：</div>'
+      + '<ul style="margin:0 0 8px 16px; padding:0;">' + names + '</ul>'
+      + '<button class="pm-btn" style="padding:4px 12px;" onclick="hcDownloadHf()">用已填 Token 下载 pyannote 模型</button>'
+      + '<div style="margin-top:6px;color:#fbbf24;">前提：已在 huggingface.co 对应模型页点过 “Agree” 接受条款。</div>';
+  } else {
+    const links = hfMissing.map(m => '<li><b>huggingface.co/' + pmEscape(m.id) + '</b>（登录后点 “Agree”）</li>').join('');
+    box.innerHTML = '<div style="margin-bottom:6px;">有 ' + hfMissing.length + ' 个 pyannote 说话人分离模型未就绪（<b>可选功能，不影响正常转写</b>）。该模型需授权，软件无法静默下载：</div>'
+      + '<ol style="margin:0 0 6px 16px; padding:0;">'
+      + '<li>注册/登录 <b>huggingface.co</b>，在下面页面逐个点 “Agree” 接受条款：' + '<ul style="margin:4px 0 4px 14px; padding:0;">' + links + '</ul></li>'
+      + '<li>在 <b>huggingface.co/settings/tokens</b> 建一个 Read 权限 Token（hf_ 开头）</li>'
+      + '<li>回到软件「设置」，分离后端选 pyannote，粘贴 Token 后再回这里下载</li>'
+      + '</ol>';
+  }
+  box.style.display = 'block';
+}
+
+async function hcDownloadHf() {
+  const token = (window._appConfig && window._appConfig.hf_token || '').trim();
+  const ids = (window._hcReport.models || [])
+    .filter(m => m.provider === 'huggingface' && m.status !== 'ok').map(m => m.id);
+  const box = document.getElementById('hcHfHint');
+  try {
+    const resp = await fetch('/api/models/download', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ models: ids, hf_token: token }),
+    });
+    const r = await resp.json().catch(() => ({}));
+    if (!resp.ok || r.error) throw new Error(r.error || ('HTTP ' + resp.status));
+    if (!(r.started || []).length) {
+      const why = (r.skipped || []).map(s => s.reason).join('；');
+      alert('没有开始下载：' + (why || '未知原因'));
+      return;
+    }
+    box.style.display = 'none';
+    hcStartPolling();
+  } catch (e) {
+    alert('启动 pyannote 下载失败：' + (e.message || e));
+  }
 }
 
 // ── 下载缺失核心模型 ──
