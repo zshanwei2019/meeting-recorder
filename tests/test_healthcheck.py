@@ -84,6 +84,21 @@ with tempfile.TemporaryDirectory() as td:
     rp = hc.check_model(entry_py, ms, hf)
     check("HF 完整=ok", rp["status"] == "ok" and rp["sizeMb"] >= 2.9, str(rp))
 
+    # configOnly 仓库（pyannote pipeline 主仓库天生只有 config.yaml，权重在子模型）
+    cfg_id = "pyannote/speaker-diarization-3.1"
+    entry_cfg = {"id": cfg_id, "label": "p", "kind": "optional",
+                 "provider": "huggingface", "configOnly": True}
+    cfg_rev = hf / "models--pyannote--speaker-diarization-3.1" / "snapshots" / "cfg001"
+    cfg_rev.mkdir(parents=True)
+    check("configOnly 空快照=partial", hc.check_model(entry_cfg, ms, hf)["status"] == "partial")
+    (cfg_rev / "config.yaml").write_text("version: 3.1.0\n", encoding="utf-8")
+    rc = hc.check_model(entry_cfg, ms, hf)
+    check("configOnly 仅 config.yaml 即=ok（不误报残缺）", rc["status"] == "ok", str(rc))
+    check("configOnly 标记透传", rc.get("configOnly") is True)
+    # 0 字节配置不算就绪
+    (cfg_rev / "config.yaml").write_bytes(b"")
+    check("configOnly 0字节配置仍=partial", hc.check_model(entry_cfg, ms, hf)["status"] == "partial")
+
     print("=== 3. run_health_check 总判定 ===")
     rep = hc.run_health_check(config={}, ms_base=ms, hf_base=hf, data_dir=Path(td) / "data")
     # 临时目录里只有 fsmn 一个核心模型完整，punct 残缺 => 总体不 ok
@@ -179,6 +194,89 @@ with tempfile.TemporaryDirectory() as td2:
     dlf2.start(["iic/SenseVoiceSmall"], ms_base=dms)
     f2 = _wait_jobs(dlf2)
     check("无权重时 done 被复核改 error", f2 and f2[0]["status"] == "error", str(f2))
+
+print("=== 8. HuggingFace gated 模型下载（注入假 HF 下载器，不联网）===")
+
+class _FakeGatedError(Exception):
+    """类名含 Gated，_is_auth_error 据此识别为授权失败。"""
+
+
+with tempfile.TemporaryDirectory() as td3:
+    dhf = Path(td3) / "hf"
+
+    def _wait_hf(dl, timeout=8):
+        t0 = _time.time()
+        while _time.time() - t0 < timeout:
+            st = dl.status(hf_base=dhf)
+            if st and all(j["status"] in ("done", "error") for j in st):
+                return st
+            _time.sleep(0.03)
+        return dl.status(hf_base=dhf)
+
+    SEG = "pyannote/segmentation-3.0"
+    CFG = "pyannote/speaker-diarization-3.1"
+
+    # 8.1 无 token：拒绝并入队，给出条款接受链接
+    dl0 = hc.ModelDownloader(hf_downloader_fn=lambda m, t: "x")
+    r0 = dl0.start([SEG], hf_base=dhf, hf_token="")
+    check("HF 无 token 不入队", r0["started"] == [] and len(r0["skipped"]) == 1, str(r0))
+    check("HF 无 token 给条款链接",
+          r0["skipped"][0].get("acceptUrl", "").endswith(SEG), str(r0["skipped"]))
+    check("无 token 时不调用 HF 下载器",
+          dl0.status(hf_base=dhf) == [])
+
+    # 8.2 带 token 成功：下载器收到 token，造出权重文件后 done 且复核 ok
+    seen = {}
+
+    def hf_ok(mid, token):
+        seen["token"] = token
+        rev = hc.hf_snapshot(mid, dhf)
+        if rev is None:
+            rev = dhf / ("models--" + mid.replace("/", "--")) / "snapshots" / "main"
+        rev.mkdir(parents=True, exist_ok=True)
+        (rev / "pytorch_model.bin").write_bytes(b"w" * (2 * 1024 * 1024))
+        return str(rev)
+
+    dl1 = hc.ModelDownloader(hf_downloader_fn=hf_ok)
+    r1 = dl1.start([SEG], hf_base=dhf, hf_token="hf_secret_123")
+    check("HF 带 token 入队", r1["started"] == [SEG], str(r1))
+    j1 = _wait_hf(dl1)
+    check("HF 下载成功 done", j1 and j1[0]["status"] == "done", str(j1))
+    check("HF 下载器确实收到 token", seen.get("token") == "hf_secret_123", str(seen))
+    chk1 = hc.check_model(
+        {"id": SEG, "label": "x", "kind": "optional", "provider": "huggingface"},
+        None, dhf)
+    check("HF 下载后复核 ok", chk1["status"] == "ok", str(chk1))
+
+    # 8.3 授权失败（GatedRepoError / 403）：error 信息含条款链接与中文指引
+    def hf_gated(mid, token):
+        raise _FakeGatedError("403 Client Error: Cannot access gated repo")
+
+    dl2 = hc.ModelDownloader(hf_downloader_fn=hf_gated)
+    dl2.start(["pyannote/wespeaker-voxceleb-resnet34-LM"], hf_base=dhf, hf_token="hf_x")
+    j2 = _wait_hf(dl2)
+    msg2 = j2[0]["message"] if j2 else ""
+    check("HF 授权失败记为 error", j2 and j2[0]["status"] == "error", str(j2))
+    check("授权错误提示去网页接受条款", "条款" in msg2 and "Agree" in msg2, msg2)
+    check("授权错误给出模型页面链接", "huggingface.co/pyannote/wespeaker" in msg2, msg2)
+    check("_is_auth_error 识别 401/403/gated",
+          hc._is_auth_error(_FakeGatedError("401")) and hc._is_auth_error(RuntimeError("403 forbidden")))
+
+    # 8.4 configOnly 模型成功：只造 config.yaml 也应 done 且复核 ok
+    def hf_cfg_ok(mid, token):
+        rev = dhf / ("models--" + mid.replace("/", "--")) / "snapshots" / "c1"
+        rev.mkdir(parents=True, exist_ok=True)
+        (rev / "config.yaml").write_text("version: 3.1.0\n", encoding="utf-8")
+        return str(rev)
+
+    dl3 = hc.ModelDownloader(hf_downloader_fn=hf_cfg_ok)
+    dl3.start([CFG], hf_base=dhf, hf_token="hf_z")
+    j3 = _wait_hf(dl3)
+    check("configOnly HF 下载 done", j3 and j3[0]["status"] == "done", str(j3))
+    chk3 = hc.check_model(
+        {"id": CFG, "label": "x", "kind": "optional",
+         "provider": "huggingface", "configOnly": True}, None, dhf)
+    check("configOnly HF 下载后复核 ok", chk3["status"] == "ok", str(chk3))
 
 print()
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

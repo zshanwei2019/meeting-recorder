@@ -77,6 +77,9 @@ MODEL_REGISTRY = [
         "id": "pyannote/speaker-diarization-3.1",
         "label": "pyannote 说话人分离主模型（需 HF 授权）",
         "kind": "optional", "provider": "huggingface",
+        # 该仓库是纯 pipeline 配置（只有 config.yaml），权重在它引用的
+        # segmentation-3.0 / wespeaker 子模型里，不能用“有无权重文件”判定。
+        "configOnly": True,
     },
     {
         "id": "pyannote/segmentation-3.0",
@@ -138,13 +141,28 @@ def hf_snapshot(model_id: str, base: Path | None = None) -> Path | None:
     return revs[-1] if revs else None
 
 
+def _has_config_file(snapshot: Path) -> bool:
+    """snapshot 里是否存在 pipeline/tokenizer 等配置文件（yaml/json）。"""
+    if not snapshot.is_dir():
+        return False
+    for root, _dirs, files in os.walk(snapshot):
+        for f in files:
+            if f.lower().endswith((".yaml", ".yml", ".json")) and f != ".gitkeep":
+                try:
+                    if (Path(root) / f).stat().st_size > 0:
+                        return True
+                except OSError:
+                    pass
+    return False
+
+
 def check_model(entry: dict, ms_base: Path | None = None,
                 hf_base: Path | None = None) -> dict:
     """检查单个模型的本地就绪状态。
 
     status:
-      ok       —— snapshot 存在且含真权重
-      partial  —— 目录存在但没有合格权重（典型：下载中断 / 只剩元数据）
+      ok       —— snapshot 存在且含真权重（configOnly 仓库则为含有效配置文件）
+      partial  —— 目录存在但没有合格权重/配置（典型：下载中断 / 只剩元数据）
       missing  —— 完全没有
     """
     mid = entry["id"]
@@ -159,6 +177,23 @@ def check_model(entry: dict, ms_base: Path | None = None,
                 snap = root
 
     size = _dir_size_mb(snap) if snap and snap.is_dir() else 0.0
+
+    # 纯配置型仓库（如 pyannote pipeline 主仓库，权重在子模型里）：
+    # 只要存在非空配置文件即算就绪。
+    if entry.get("configOnly"):
+        ready = bool(snap and snap.is_dir() and _has_config_file(snap))
+        if ready:
+            status, detail = "ok", f"已就绪（配置型，{size:g} MB）"
+        elif snap and snap.is_dir():
+            status, detail = "partial", "下载不完整（缺少配置文件），建议重新下载"
+        else:
+            status, detail = "missing", "未下载"
+        return {
+            "id": mid, "label": entry["label"], "kind": entry["kind"],
+            "provider": entry["provider"], "status": status, "sizeMb": size,
+            "weightCount": 0, "detail": detail, "configOnly": True,
+        }
+
     weight, wcount = _find_weight_file(snap) if snap else (None, 0)
 
     if weight is not None:
@@ -356,94 +391,151 @@ def run_health_check(config: dict | None = None,
 
 
 # ── 缺失模型下载 ─────────────────────────────────────────────
-# 说明：只支持 modelscope 公开模型（核心转写链路 + cam++）。pyannote 是
-# HuggingFace gated 模型，必须先在网页接受条款 + 填 token，不能在这里静默拉取。
-class ModelDownloader:
-    """后台串行下载 modelscope 模型，内存里跟踪进度供前端轮询。
+# modelscope 公开模型可直接拉取；pyannote 是 HuggingFace gated 模型，必须
+# 本人先在网页接受条款 + 提供有效 token（授权失败时给出具体模型页面链接）。
 
-    downloader_fn 可注入（单测里传一个假函数，避免真的联网）；生产传 None
-    则惰性 import modelscope.snapshot_download。
+def _hf_accept_url(model_id: str) -> str:
+    return "https://huggingface.co/" + model_id
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    if any(k in name for k in ("gated", "unauthorized", "authentication", "permission")):
+        return True
+    status = getattr(exc, "response", None)
+    code = getattr(getattr(status, "status_code", None), "value", lambda: None)
+    try:
+        sc = status.status_code if status is not None else None
+    except Exception:
+        sc = None
+    if sc in (401, 403):
+        return True
+    low = str(exc).lower()
+    return any(k in low for k in ("401", "403", "gated", "unauthorized", "access denied"))
+
+
+class ModelDownloader:
+    """后台串行下载缺失模型（modelscope 公开 + HuggingFace gated），内存跟踪进度。
+
+    可注入下载函数便于单测：downloader_fn(model_id) 用于 modelscope、
+    hf_downloader_fn(model_id, token) 用于 HuggingFace；生产传 None 则惰性 import。
     """
 
-    def __init__(self, downloader_fn=None):
+    def __init__(self, downloader_fn=None, hf_downloader_fn=None):
         # RLock：start() 持锁后还要调 status()，同线程可重入，避免自锁死锁
         self._lock = threading.RLock()
         self._jobs = {}          # model_id -> 状态 dict
-        self._queue = []         # 待下载 model_id 顺序
+        self._queue = []         # 待下载任务 [{id, provider, token}]
         self._worker_started = False
         self._downloader_fn = downloader_fn
+        self._hf_downloader_fn = hf_downloader_fn
 
-    # 内部：真正的下载函数（惰性 import，避免健康检查强依赖 modelscope）
-    def _real_download(self, model_id: str) -> str:
+    # ── 真正的下载函数（惰性 import，避免健康检查强依赖模型库）──
+    def _real_download_ms(self, model_id: str) -> str:
         from modelscope import snapshot_download
         return snapshot_download(model_id)
 
-    def _download(self, model_id: str) -> str:
-        if self._downloader_fn is not None:
-            return self._downloader_fn(model_id)
-        return self._real_download(model_id)
+    def _real_download_hf(self, model_id: str, token: str) -> str:
+        from huggingface_hub import snapshot_download as hf_snapshot_download
+        return hf_snapshot_download(model_id, token=token)
 
-    def _known_ids(self):
-        return {m["id"] for m in MODEL_REGISTRY if m["provider"] == "modelscope"}
+    def _download_ms(self, model_id: str) -> str:
+        return self._downloader_fn(model_id) if self._downloader_fn is not None \
+            else self._real_download_ms(model_id)
 
-    def start(self, model_ids, ms_base: Path | None = None, hf_base: Path | None = None) -> dict:
-        """请求下载一批模型（去重、只接受已知 modelscope 模型）。返回 {started, skipped, jobs}。"""
-        known = self._known_ids()
+    def _download_hf(self, model_id: str, token: str) -> str:
+        if self._hf_downloader_fn is not None:
+            return self._hf_downloader_fn(model_id, token)
+        return self._real_download_hf(model_id, token)
+
+    def _registry(self):
+        return {m["id"]: m for m in MODEL_REGISTRY}
+
+    def start(self, model_ids, ms_base: Path | None = None, hf_base: Path | None = None,
+              hf_token: str = "") -> dict:
+        """请求下载一批模型。返回 {started, skipped, jobs}。
+
+        hf_token 用于 HuggingFace gated 模型；modelscope 模型忽略它。
+        """
+        registry = self._registry()
+        hf_token = (hf_token or "").strip()
         started, skipped = [], []
         should_start_worker = False
         with self._lock:
             for raw in model_ids or []:
                 mid = str(raw or "").strip()
-                if mid not in known:
-                    skipped.append({"id": mid, "reason": "不支持的模型（可能是 gated 模型）"})
+                entry = registry.get(mid)
+                if entry is None:
+                    skipped.append({"id": mid, "reason": "未知模型，不支持下载"})
                     continue
+                provider = entry["provider"]
                 st = self._jobs.get(mid)
                 if st and st["status"] in ("queued", "downloading"):
                     skipped.append({"id": mid, "reason": "已在下载队列中"})
                     continue
                 # 已就绪的不必重下
-                entry = next(m for m in MODEL_REGISTRY if m["id"] == mid)
                 chk = check_model(entry, ms_base, hf_base)
                 if chk["status"] == "ok":
                     skipped.append({"id": mid, "reason": "已就绪"})
                     continue
+                # gated 模型必须先有 token（条款是否接受只能下载时才知道）
+                if provider == "huggingface" and not hf_token:
+                    skipped.append({
+                        "id": mid,
+                        "reason": "需先在设置里填写 HuggingFace Token，并在网页接受模型条款",
+                        "acceptUrl": _hf_accept_url(mid),
+                    })
+                    continue
                 self._jobs[mid] = {
-                    "id": mid, "status": "queued", "message": "排队等待下载…",
+                    "id": mid, "status": "queued",
+                    "message": "排队等待下载…", "provider": provider,
                     "startedAt": time.time(),
                 }
-                if mid not in self._queue:
-                    self._queue.append(mid)
+                if not any(q["id"] == mid for q in self._queue):
+                    self._queue.append({"id": mid, "provider": provider, "token": hf_token})
                 started.append(mid)
             if started and not self._worker_started:
                 self._worker_started = True
                 should_start_worker = True
         # 线程启动与 status() 都放到锁外，避免持锁做阻塞/重入操作
         if should_start_worker:
-            threading.Thread(target=self._worker, daemon=True).start()
+            threading.Thread(target=self._worker, daemon=True,
+                             args=(ms_base, hf_base)).start()
         return {"started": started, "skipped": skipped,
                 "jobs": self.status(ms_base=ms_base, hf_base=hf_base)}
 
-    def _worker(self):
+    def _worker(self, ms_base=None, hf_base=None):
         while True:
             with self._lock:
                 if not self._queue:
                     self._worker_started = False
                     return
-                mid = self._queue.pop(0)
-                self._jobs[mid] = {**self._jobs.get(mid, {}),
-                                   "id": mid, "status": "downloading",
+                item = self._queue.pop(0)
+                mid = item["id"]
+                self._jobs[mid] = {**self._jobs.get(mid, {}), "id": mid,
+                                   "status": "downloading",
                                    "message": "正在下载，请保持网络畅通…"}
             try:
-                path = self._download(mid)
+                if item["provider"] == "huggingface":
+                    path = self._download_hf(mid, item.get("token", ""))
+                else:
+                    path = self._download_ms(mid)
                 with self._lock:
                     self._jobs[mid] = {**self._jobs.get(mid, {}), "id": mid,
                                        "status": "done", "message": f"下载完成：{path}",
                                        "finishedAt": time.time()}
             except Exception as e:  # noqa: BLE001
+                msg = self._friendly_error(mid, e)
                 with self._lock:
                     self._jobs[mid] = {**self._jobs.get(mid, {}), "id": mid,
-                                       "status": "error", "message": f"下载失败：{e}",
+                                       "status": "error", "message": msg,
                                        "finishedAt": time.time()}
+
+    def _friendly_error(self, mid: str, exc: Exception) -> str:
+        if _is_auth_error(exc):
+            return ("授权失败：请确认 HuggingFace Token 有效，且已在网页点 “Agree” 接受该模型条款后重试："
+                    + _hf_accept_url(mid) + f"（{str(exc)[:100]}）")
+        return f"下载失败：{exc}"
 
     def status(self, ms_base: Path | None = None, hf_base: Path | None = None) -> list:
         """返回所有任务状态；done 的再用 check_model 复核（防止假成功）。"""
@@ -451,12 +543,12 @@ class ModelDownloader:
             jobs = [dict(v) for v in self._jobs.values()]
         for j in jobs:
             if j["status"] == "done":
-                entry = next((m for m in MODEL_REGISTRY if m["id"] == j["id"]), None)
+                entry = self._registry().get(j["id"])
                 if entry is not None:
                     chk = check_model(entry, ms_base, hf_base)
                     if chk["status"] != "ok":
                         j["status"] = "error"
-                        j["message"] = "下载结束但未检测到完整权重，请重试"
+                        j["message"] = "下载结束但未检测到完整文件，请重试"
         # 稳定排序：进行中在前，再按开始时间
         order = {"downloading": 0, "queued": 1, "error": 2, "done": 3}
         jobs.sort(key=lambda j: (order.get(j["status"], 9), j.get("startedAt", 0)))
