@@ -3478,6 +3478,43 @@ def create_app():
                 await state.push_event_sync(ws, "log", {"message": "自动监控未在运行"})
 
         # ─── 会后处理（postmeeting）WS actions ───
+        elif action == "pm_retranscribe":
+            # 对录音库里已有录音用当前设置（热词/大模型/说话人分离）高质量重转
+            data = msg.get("data", {}) or {}
+            wav_name = (data.get("wav_name") or "").strip()
+            if state.is_recording or getattr(state, "is_transcribing", False):
+                await state.push_event_sync(
+                    ws, "postmeeting_error",
+                    {"message": "当前有录音或转写任务在进行，请完成后再重转"})
+            else:
+                rec_path = _safe_recording_path(wav_name)
+                if rec_path is None or not rec_path.exists():
+                    await state.push_event_sync(
+                        ws, "postmeeting_error",
+                        {"message": f"找不到录音文件：{wav_name}"})
+                else:
+                    state.is_transcribing = True
+                    _target = str(rec_path)
+
+                    def _run_retranscribe():
+                        try:
+                            state.push_from_thread("status", "转写中")
+                            state.push_from_thread("log", {"message": f"开始高质量重转：{wav_name}"})
+                            # 录音本身就是可直接转的 wav，复用文件转写全链路（含分离/热词）
+                            _transcribe_file_task(_target, None)
+                        except Exception as e:
+                            import traceback as _tb
+                            print(f"[ERROR] retranscribe: {e}")
+                            _tb.print_exc()
+                            state.push_from_thread("log", {"message": f"重转失败：{e}"})
+                            state.push_from_thread("status", "就绪")
+                        finally:
+                            state.is_transcribing = False
+
+                    threading.Thread(target=_run_retranscribe, daemon=True).start()
+                    await state.push_event_sync(
+                        ws, "log", {"message": f"已提交高质量重转：{wav_name}"})
+
         elif action == "pm_save_edit":
             ok, payload = _pm_core_update_recording(msg.get("data", {}))
             if ok:

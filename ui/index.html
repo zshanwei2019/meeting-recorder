@@ -538,6 +538,15 @@ html, body {
 .pm-item.active { border-color: #6366f1; background: #252940; }
 .pm-item .pm-item-sub { color: #64748b; font-size: 11px; margin-top: 2px; }
 .pm-item .pm-item-title { color: #e2e8f0; font-weight: 600; }
+.pm-item-row { display: flex; align-items: center; gap: 8px; }
+.pm-item-main { flex: 1; min-width: 0; }
+.pm-retrans-btn {
+  flex: none; padding: 3px 10px; font-size: 11px; cursor: pointer;
+  color: #a5b4fc; background: rgba(99,102,241,0.12);
+  border: 1px solid rgba(99,102,241,0.35); border-radius: 5px;
+}
+.pm-retrans-btn:hover { background: rgba(99,102,241,0.28); color: #e0e7ff; }
+.pm-retrans-btn:disabled { opacity: 0.5; cursor: default; }
 .pm-textarea {
   width: 100%; min-height: 120px; resize: vertical;
   background: #1c1f2e; border: 1px solid rgba(148,163,184,0.12);
@@ -1462,6 +1471,12 @@ function onTranscriptReady(data) {
     updateWordCount();
     appendLog('转写完成');
   }
+
+  // 重转/转写完成后，若会后处理面板开着，自动刷新录音库列表（更新“未转写”/引擎/说话人数）
+  const _pmOv = document.getElementById('pmOverlay');
+  if (_pmOv && _pmOv.classList.contains('visible')) {
+    pmLoadRecordings();
+  }
 }
 
 function formatMs(ms) {
@@ -1791,8 +1806,13 @@ async function pmLoadRecordings() {
       const spk = r.speaker_count > 0 ? ` · ${r.speaker_count}位说话人` : '';
       const done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
       return `<div class="pm-item" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
-        <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
-        <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(r.engine || '未知引擎')}${spk}</div>
+        <div class="pm-item-row">
+          <div class="pm-item-main">
+            <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
+            <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(r.engine || '未知引擎')}${spk}</div>
+          </div>
+          <button class="pm-retrans-btn" title="用当前设置（热词/大模型/说话人分离）重新转写" onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}')">重转</button>
+        </div>
       </div>`;
     }).join('');
   }
@@ -1805,6 +1825,19 @@ async function pmLoadRecordings() {
     const hit = pmRecordings.find(r => r.wav_name === pmLastWavName);
     if (hit) pmSelectRecording(hit.id);
   }
+}
+
+// 录音库「高质量重转」：用当前设置（热词/大模型/说话人分离）对已有录音重跑
+function pmRetranscribe(wavName) {
+  const btn = (typeof event !== 'undefined' && event && event.currentTarget) ? event.currentTarget : null;
+  if (btn) { btn.disabled = true; btn.textContent = '排队中'; }
+  appendLog('已提交高质量重转：' + wavName);
+  // 转写完成事件 transcript_ready 到达后由 onTranscriptReady 触发列表刷新
+  sendAction('pm_retranscribe', { wav_name: wavName });
+  // 兜底：3 秒后恢复按钮（成功/失败的最终状态以列表刷新为准）
+  setTimeout(() => {
+    document.querySelectorAll('.pm-retrans-btn').forEach(b => { b.disabled = false; b.textContent = '重转'; });
+  }, 3000);
 }
 
 async function pmSelectRecording(id) {
