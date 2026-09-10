@@ -64,6 +64,18 @@ if getattr(sys, "frozen", False):
     except Exception:
         pass
 
+# 打包为 Tauri sidecar / frozen exe 时，stdout/stderr 写到 NUL（见 main.rs）。
+# 即使如此，也在源头关掉 tqdm 进度条：FunASR 处理长音频会刷几十万行进 stderr，
+# 既浪费 CPU，也防止任何残留管道写满后把转写子进程阻塞死（短录音输出少不触发，
+# 长录音必现）。与 pyannote_chunk_worker.py 的 TQDM_DISABLE 保持一致。
+if getattr(sys, "frozen", False) or os.environ.get("ASR_SIDECAR", "0") == "1":
+    os.environ["TQDM_DISABLE"] = "1"
+    try:
+        import tqdm as _tqdm_frozen
+        _tqdm_frozen.tqdm.monitor_interval = 0
+    except Exception:
+        pass
+
 # ─── 配置 ───
 APP_NAME = "会议录音转写助手"
 try:

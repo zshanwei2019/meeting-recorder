@@ -199,13 +199,20 @@ fn locate_sidecar(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// 启动 sidecar，注入 ASR_SIDECAR=1；stdout/stderr 继承到控制台便于排查。
+/// 启动 sidecar，注入 ASR_SIDECAR=1。
+///
+/// stdout/stderr 必须丢弃到 NUL，不能用 Stdio::inherit()：release 是
+/// windows_subsystem="windows" 的 GUI 程序、没有控制台，子进程继承到的是
+/// 无人读取的句柄。FunASR/tqdm 处理长音频时会往 stderr 狂刷进度条（实测
+/// 103 分钟音频刷出几十万行 / 近 1MB），管道缓冲写满后子进程在转写阶段被
+/// 永久阻塞（表现为模型已加载占数 GB 内存却 0 CPU、无结果、短音频因输出少
+/// 侥幸不触发）。写 NUL 永不阻塞。
 fn spawn_sidecar(exe: &std::path::Path) -> std::io::Result<Child> {
     Command::new(exe)
         .env("ASR_SIDECAR", "1")
         .current_dir(exe.parent().unwrap_or_else(|| std::path::Path::new(".")))
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
 }
 
