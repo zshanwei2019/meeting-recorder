@@ -1635,6 +1635,27 @@ def _resolve_hf_token(config_token=""):
     return None
 
 
+def _hf_repo_cached_locally(repo_id):
+    """判断 HF 模型（如 pyannote/speaker-diarization-3.1）是否已在本地缓存、
+    可直接离线加载。命中 config 快照文件即认为可离线。
+
+    背景：pyannote 即使权重已缓存，Pipeline.from_pretrained 默认仍会联网到
+    huggingface.co 做校验；国内网络不通时该请求会长时间挂起（不报错，因此
+    “失败回退”也触发不了），表现为点“重转”没反应。命中缓存时强制离线即可
+    秒加载（与 pyannote_chunk_worker / healthcheck 的做法一致）。
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        for cfg_name in ("config.yaml", "config.json"):
+            obj = try_to_load_from_cache(repo_id, cfg_name)
+            # huggingface_hub 1.x 返回本地路径（str/Path），未命中返回 None
+            if obj:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _overlap_ms(a_start, a_end, b_start, b_end):
     """两个区间的重叠长度（毫秒）。"""
     return max(0, min(a_end, b_end) - max(a_start, b_start))
@@ -1811,8 +1832,21 @@ class PyannoteDiarizer:
             if self._pipeline is not None and self._model_name == model_name:
                 return True
             try:
-                if status_callback:
-                    status_callback("loading", "加载 pyannote 说话人分离模型（首次需下载）...")
+                # 模型已在本地缓存时强制离线：pyannote 即使权重齐全，默认仍会联网
+                # 到 huggingface.co 校验；国内网络不通时会长时间挂起（不报错，连
+                # “失败回退”都触发不了）。worker/healthcheck 早就是离线模式，这里
+                # 补齐主进程（≤10分钟录音）路径。未命中缓存才联网（首次下载），
+                # 并设较短超时，避免网络不通时无限挂死。
+                cached = _hf_repo_cached_locally(model_name)
+                if cached:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    if status_callback:
+                        status_callback("loading", "加载本地缓存的 pyannote 说话人分离模型...")
+                else:
+                    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+                    if status_callback:
+                        status_callback("loading", "首次加载 pyannote 模型（需联网下载）...")
                 from pyannote.audio import Pipeline
                 kwargs = {}
                 if hf_token:
@@ -2240,6 +2274,7 @@ class PyannoteDiarizer:
         环境变量），短音频整段提取，供 _cluster_speakers_global 做簇原型。
         """
         import torch
+        import gc
         embed_model = os.environ.get(
             "PYANNOTE_EMBED_MODEL",
             "pyannote/wespeaker-voxceleb-resnet34-LM")
