@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 
 # ─── 基础版本号（发版时手动 bump；仅此一处） ───
-BASE_VERSION = "3.2.2"
+BASE_VERSION = "3.2.3"
 
 _THIS_DIR = Path(__file__).resolve().parent
 
