@@ -69,6 +69,12 @@ a = Analysis(
         'sounddevice',
         'numpy',
         'scipy._lib.messagestream',
+        # pyannote 聚类与 funasr campplus(ClusterBackend via sklearn HDBSCAN) 在
+        # import 期就需要 scipy.spatial / scipy.ndimage；此前被错误 exclude，导致
+        # frozen 下 pyannote 加载失败、回退 FunASR 分离又 NameError(ClusterBackend)。
+        'scipy.spatial',
+        'scipy.ndimage',
+        'sklearn.cluster',
         'websockets',
         'websocket',
         'websocket_client',
@@ -77,8 +83,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib', 'tkinter', 'PIL', 'scipy.spatial',
-        'scipy.ndimage', 'IPython', 'notebook',
+        'matplotlib', 'tkinter', 'PIL', 'IPython', 'notebook',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

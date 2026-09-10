@@ -7,6 +7,16 @@
 """
 import sys
 import os
+
+# 必须在 import torch / onnxruntime 等任何自带 OpenMP 的数值库之前设置。
+# PyInstaller onefile 下，torch(libiomp5md) 与 onnxruntime 各自加载一份 OpenMP
+# 运行时，重复初始化在进入并行区时会死锁：表现为模型加载成功后，FunASR 对长音频
+# generate() 时 0 CPU 永久挂起（短音频计算量小、不真正进并行区而侥幸不触发）。
+# KMP_DUPLICATE_LIB_OK=TRUE 允许重复加载、消除该死锁且保留多核速度。
+# （真机 A/B 验证：frozen 默认必现卡死；设该变量后 12 分钟录音顺利越过 ASR。）
+if getattr(sys, "frozen", False) or os.environ.get("ASR_SIDECAR", "0") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import re
 import json
 import time

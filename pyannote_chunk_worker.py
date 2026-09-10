@@ -20,6 +20,8 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 os.environ["TQDM_DISABLE"] = "1"  # suppress progress bars to avoid pipe issues
+# torch 与 onnxruntime 各带一份 libiomp，frozen onefile 下重复初始化会在并行区死锁
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 def log(msg):
     sys.stderr.write(f"[worker] {msg}\n")
