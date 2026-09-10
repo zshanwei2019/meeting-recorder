@@ -77,6 +77,9 @@ MODEL_REGISTRY = [
         "id": "pyannote/speaker-diarization-3.1",
         "label": "pyannote 说话人分离主模型（需 HF 授权）",
         "kind": "optional", "provider": "huggingface",
+        # 该仓库是纯 pipeline 配置（只有 config.yaml），权重在它引用的
+        # segmentation-3.0 / wespeaker 子模型里，不能用“有无权重文件”判定。
+        "configOnly": True,
     },
     {
         "id": "pyannote/segmentation-3.0",
@@ -138,13 +141,28 @@ def hf_snapshot(model_id: str, base: Path | None = None) -> Path | None:
     return revs[-1] if revs else None
 
 
+def _has_config_file(snapshot: Path) -> bool:
+    """snapshot 里是否存在 pipeline/tokenizer 等配置文件（yaml/json）。"""
+    if not snapshot.is_dir():
+        return False
+    for root, _dirs, files in os.walk(snapshot):
+        for f in files:
+            if f.lower().endswith((".yaml", ".yml", ".json")) and f != ".gitkeep":
+                try:
+                    if (Path(root) / f).stat().st_size > 0:
+                        return True
+                except OSError:
+                    pass
+    return False
+
+
 def check_model(entry: dict, ms_base: Path | None = None,
                 hf_base: Path | None = None) -> dict:
     """检查单个模型的本地就绪状态。
 
     status:
-      ok       —— snapshot 存在且含真权重
-      partial  —— 目录存在但没有合格权重（典型：下载中断 / 只剩元数据）
+      ok       —— snapshot 存在且含真权重（configOnly 仓库则为含有效配置文件）
+      partial  —— 目录存在但没有合格权重/配置（典型：下载中断 / 只剩元数据）
       missing  —— 完全没有
     """
     mid = entry["id"]
@@ -159,6 +177,23 @@ def check_model(entry: dict, ms_base: Path | None = None,
                 snap = root
 
     size = _dir_size_mb(snap) if snap and snap.is_dir() else 0.0
+
+    # 纯配置型仓库（如 pyannote pipeline 主仓库，权重在子模型里）：
+    # 只要存在非空配置文件即算就绪。
+    if entry.get("configOnly"):
+        ready = bool(snap and snap.is_dir() and _has_config_file(snap))
+        if ready:
+            status, detail = "ok", f"已就绪（配置型，{size:g} MB）"
+        elif snap and snap.is_dir():
+            status, detail = "partial", "下载不完整（缺少配置文件），建议重新下载"
+        else:
+            status, detail = "missing", "未下载"
+        return {
+            "id": mid, "label": entry["label"], "kind": entry["kind"],
+            "provider": entry["provider"], "status": status, "sizeMb": size,
+            "weightCount": 0, "detail": detail, "configOnly": True,
+        }
+
     weight, wcount = _find_weight_file(snap) if snap else (None, 0)
 
     if weight is not None:

@@ -84,6 +84,21 @@ with tempfile.TemporaryDirectory() as td:
     rp = hc.check_model(entry_py, ms, hf)
     check("HF 完整=ok", rp["status"] == "ok" and rp["sizeMb"] >= 2.9, str(rp))
 
+    # configOnly 仓库（pyannote pipeline 主仓库天生只有 config.yaml，权重在子模型）
+    cfg_id = "pyannote/speaker-diarization-3.1"
+    entry_cfg = {"id": cfg_id, "label": "p", "kind": "optional",
+                 "provider": "huggingface", "configOnly": True}
+    cfg_rev = hf / "models--pyannote--speaker-diarization-3.1" / "snapshots" / "cfg001"
+    cfg_rev.mkdir(parents=True)
+    check("configOnly 空快照=partial", hc.check_model(entry_cfg, ms, hf)["status"] == "partial")
+    (cfg_rev / "config.yaml").write_text("version: 3.1.0\n", encoding="utf-8")
+    rc = hc.check_model(entry_cfg, ms, hf)
+    check("configOnly 仅 config.yaml 即=ok（不误报残缺）", rc["status"] == "ok", str(rc))
+    check("configOnly 标记透传", rc.get("configOnly") is True)
+    # 0 字节配置不算就绪
+    (cfg_rev / "config.yaml").write_bytes(b"")
+    check("configOnly 0字节配置仍=partial", hc.check_model(entry_cfg, ms, hf)["status"] == "partial")
+
     print("=== 3. run_health_check 总判定 ===")
     rep = hc.run_health_check(config={}, ms_base=ms, hf_base=hf, data_dir=Path(td) / "data")
     # 临时目录里只有 fsmn 一个核心模型完整，punct 残缺 => 总体不 ok
