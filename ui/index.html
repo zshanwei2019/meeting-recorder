@@ -615,6 +615,7 @@ html, body {
       <button class="btn-secondary" onclick="transcribeFile()">转写文件</button>
       <button class="btn-secondary" onclick="generateMinutes()">AI 纪要</button>
     </div>
+    <input type="file" id="transcribeFileInput" style="display:none" accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma,.amr,.mp4,.mov,.mkv,.webm,.ts" onchange="onTranscribeFilePicked(event)">
     <div class="btn-row">
       <button class="btn-secondary" id="btnMonitor" onclick="toggleMonitor()">
         <span id="monitorIcon">&#128065;</span> 自动监控
@@ -1172,7 +1173,29 @@ function toggleRealtime() {
 }
 
 function transcribeFile() {
-  sendAction('transcribe_file');
+  // 打开系统文件选择器；选中后由 onTranscribeFilePicked 上传转写。
+  const inp = document.getElementById('transcribeFileInput');
+  inp.value = ''; // 允许重复选同一个文件
+  inp.click();
+}
+
+async function onTranscribeFilePicked(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  appendLog('已选择文件：' + file.name + '（' + (file.size / 1048576).toFixed(1) + 'MB），上传中…');
+  try {
+    const resp = await fetch('/api/transcribe/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+      body: file,
+    });
+    const r = await resp.json().catch(() => ({}));
+    if (!resp.ok || r.error) throw new Error(r.error || ('HTTP ' + resp.status));
+    appendLog('上传完成，服务器开始转写，请稍候…');
+    // 转写进度与结果通过现有 WebSocket 事件（status/log/transcript_ready）回显。
+  } catch (e) {
+    appendLog('文件转写启动失败：' + (e.message || e));
+  }
 }
 
 function generateMinutes() {

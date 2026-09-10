@@ -78,6 +78,14 @@ UI_DIR = BASE_DIR / "ui"
 DATA_DIR = Path.home() / "MeetingRecorder"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+# 允许上传转写的音频扩展名（PyAV/ffmpeg 可解码）；统一重采样成 16k 单声道 wav 再转写。
+ALLOWED_UPLOAD_EXTS = (
+    ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+    ".wma", ".amr", ".mp4", ".mov", ".mkv", ".webm", ".ts",
+)
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024  # 512MB，防超大文件撑爆磁盘/内存
 
 # 会后处理层（编辑持久化 / 结构化纪要 / 全文检索 / 声纹库）。
 # 该模块顶层只依赖标准库，重模型（numpy/torch/funasr）全部惰性 import。
@@ -2851,6 +2859,7 @@ class AppState:
     def __init__(self):
         self.is_recording = False
         self.is_realtime = False
+        self.is_transcribing = False  # 文件转写忙标志（上传转写互斥用）
         self.recording_start = None
         self.transcript_text = ""
         self.sentence_info = []     # 说话人分离结果
@@ -2907,6 +2916,52 @@ class AppState:
             print(f"[WARN] push_from_thread error: {e}")
 
 state = AppState()
+
+# ─── 上传音频转写：任意格式统一转 16k 单声道 wav ───
+def _safe_upload_name(raw_name: str) -> str:
+    """净化上传文件名：只留主干，防路径穿越；返回安全的文件名（不含目录）。"""
+    base = os.path.basename(raw_name or "audio")
+    base = base.replace("\\", "_").replace("/", "_")
+    stem, ext = os.path.splitext(base)
+    stem = re.sub(r'[^\w\u4e00-\u9fa5.-]+', "_", stem).strip("_.") or "audio"
+    return stem + ext.lower()
+
+
+def _transcode_to_wav16k(src: Path, dst: Path) -> None:
+    """用 PyAV 解码任意音视频文件，重采样为 16kHz 单声道 PCM wav。
+
+    PyAV(FFmpeg) 随包发布，不依赖用户机器安装 ffmpeg；转出的 wav 可被
+    FunASR / pyannote 路径（soundfile）直接读取。
+    """
+    import numpy as np
+    import av
+
+    container = av.open(str(src))
+    try:
+        in_stream = next((s for s in container.streams if s.type == "audio"), None)
+        if in_stream is None:
+            raise ValueError("文件里没有找到音轨")
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        out_container = av.open(str(dst), "w")
+        try:
+            out_stream = out_container.add_stream("pcm_s16le", rate=16000)
+            out_stream.layout = "mono"  # mono 已隐含单声道；PyAV 中 channels 只读，不可赋值
+            for packet in container.demux(in_stream):
+                for frame in packet.decode():
+                    resampled = resampler.resample(frame)
+                    for rf in resampled:
+                        for opacket in out_stream.encode(rf):
+                            out_container.mux(opacket)
+            for rf in resampler.resample(None):
+                for opacket in out_stream.encode(rf):
+                    out_container.mux(opacket)
+            for opacket in out_stream.encode(None):
+                out_container.mux(opacket)
+        finally:
+            out_container.close()
+    finally:
+        container.close()
+
 
 # ─── FastAPI 后端 ───
 def create_app():
@@ -2999,6 +3054,77 @@ def create_app():
         if _model_downloader is None:
             return JSONResponse({"jobs": []})
         return JSONResponse({"jobs": _model_downloader.status()})
+
+    # ── 上传音频文件转写（「转写文件」按钮）──
+    # 前端以原始字节 POST 上来（文件名走 X-Filename 头），避开 python-multipart 依赖；
+    # 后端落盘后用 PyAV 转 16k 单声道 wav，再复用 _transcribe_file_task，
+    # 转写进度/结果走既有 WebSocket 事件回显。
+    @app.post("/api/transcribe/upload")
+    async def api_transcribe_upload(request: Request):
+        if getattr(state, "is_transcribing", False) or state.is_recording:
+            return JSONResponse(
+                {"error": "当前已有转写或录音任务在进行，请完成后再试"}, status_code=409)
+        raw_name = request.headers.get("x-filename", "audio")
+        try:
+            from urllib.parse import unquote
+            raw_name = unquote(raw_name)
+        except Exception:
+            pass
+        safe_name = _safe_upload_name(raw_name)
+        ext = os.path.splitext(safe_name)[1].lower()
+        if ext not in ALLOWED_UPLOAD_EXTS:
+            return JSONResponse(
+                {"error": f"不支持的音频格式 {ext or '（无扩展名）'}，"
+                          f"支持：{'/'.join(e.lstrip('.') for e in ALLOWED_UPLOAD_EXTS)}"},
+                status_code=415)
+        body = await request.body()
+        if not body:
+            return JSONResponse({"error": "文件为空"}, status_code=400)
+        if len(body) > MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": f"文件过大（{len(body)/1048576:.0f}MB），上限 512MB"}, status_code=413)
+
+        try:
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            stem = os.path.splitext(safe_name)[0]
+            src_path = UPLOADS_DIR / f"upload_{ts}_{safe_name}"
+            wav_path = UPLOADS_DIR / f"upload_{ts}_{stem}.wav"
+            with open(src_path, "wb") as f:
+                f.write(body)
+        except OSError as e:
+            return JSONResponse({"error": f"保存上传文件失败：{e}"}, status_code=500)
+
+        # 转码在后台线程做（PyAV 是同步阻塞调用），避免阻塞事件循环。
+        def _prepare_and_run():
+            try:
+                state.push_from_thread("status", "正在处理文件")
+                state.push_from_thread("log", {"message": f"已接收文件 {safe_name}（{len(body)/1048576:.1f}MB），正在转码为 16k 单声道…"})
+                if ext != ".wav":
+                    _transcode_to_wav16k(src_path, wav_path)
+                    target = wav_path
+                    state.push_from_thread("log", {"message": "转码完成，开始转写…"})
+                else:
+                    # wav 也统一过一道，保证采样率/声道满足下游要求
+                    try:
+                        _transcode_to_wav16k(src_path, wav_path)
+                        target = wav_path
+                    except Exception:
+                        target = src_path
+                state.is_transcribing = True
+                _transcribe_file_task(str(target), None)
+            except Exception as e:
+                import traceback as _tb
+                print(f"[ERROR] upload prepare/transcribe: {e}")
+                _tb.print_exc()
+                state.push_from_thread("log", {"message": f"文件处理失败：{e}"})
+                state.push_from_thread("status", "就绪")
+            finally:
+                state.is_transcribing = False
+
+        state.is_transcribing = True
+        threading.Thread(target=_prepare_and_run, daemon=True).start()
+        return JSONResponse({"ok": True, "filename": safe_name, "sizeBytes": len(body)})
 
     # ── 录音库 REST ──
     @app.get("/api/recordings")
