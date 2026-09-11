@@ -651,10 +651,13 @@ html, body {
       <div>
         <div class="setting-label">引擎</div>
         <select class="setting-select" id="engineSelect" onchange="onEngineChange(); saveConfig()">
-          <option value="FunASR">FunASR</option>
-          <option value="xfyun">讯飞 API</option>
-          <option value="Whisper">Whisper</option>
-          <option value="Qwen3">Qwen3-ASR（中英混合）</option>
+          <option value="FunASR">FunASR（本地）</option>
+          <option value="xfyun">讯飞实时 API</option>
+          <option value="Whisper">Whisper（本地）</option>
+          <option value="Qwen3">Qwen3-ASR（本地，中英混合）</option>
+          <option value="aliyun">阿里云 Paraformer（云端文件）</option>
+          <option value="volc">火山豆包（云端文件）</option>
+          <option value="tencent">腾讯云（云端文件）</option>
         </select>
       </div>
       <div id="funasrModelRow">
@@ -681,17 +684,81 @@ html, body {
           <option value="Qwen/Qwen3-ASR-1.7B-hf">1.7B（更准，慢一倍）</option>
         </select>
       </div>
-      <div>
-        <div class="setting-label">讯飞 APP_ID</div>
-        <input class="setting-input" id="xfyunAppId" placeholder="APP_ID" oninput="saveConfig()">
+      <div id="xfyunCredRows">
+        <div>
+          <div class="setting-label">讯飞 APP_ID</div>
+          <input class="setting-input" id="xfyunAppId" placeholder="APP_ID" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">讯飞 API_SECRET</div>
+          <input class="setting-input" id="xfyunApiSecret" type="password" placeholder="API_SECRET" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">讯飞 API_KEY</div>
+          <input class="setting-input" id="xfyunApiKey" type="password" placeholder="API_KEY" oninput="saveConfig()">
+        </div>
       </div>
-      <div>
-        <div class="setting-label">讯飞 API_SECRET</div>
-        <input class="setting-input" id="xfyunApiSecret" placeholder="API_SECRET" oninput="saveConfig()">
+      <div id="aliyunCredRows" style="display:none;">
+        <div>
+          <div class="setting-label">百炼 API Key（DashScope）</div>
+          <input class="setting-input" id="aliyunAsrApiKey" type="password" placeholder="sk-..." oninput="saveConfig()">
+        </div>
+        <div class="setting-label" style="font-size:12px; margin-top:6px;">阿里云音频必须公网可下载，以下 OSS 仅用于临时托管（转写后自动删除）</div>
+        <div>
+          <div class="setting-label">OSS AccessKey ID</div>
+          <input class="setting-input" id="ossAccessKeyId" type="password" placeholder="AccessKey ID" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">OSS AccessKey Secret</div>
+          <input class="setting-input" id="ossAccessKeySecret" type="password" placeholder="AccessKey Secret" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">OSS Bucket 名称</div>
+          <input class="setting-input" id="ossBucket" placeholder="如 meeting-asr" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">OSS Endpoint</div>
+          <input class="setting-input" id="ossEndpoint" placeholder="oss-cn-beijing.aliyuncs.com" oninput="saveConfig()">
+        </div>
       </div>
-      <div>
-        <div class="setting-label">讯飞 API_KEY</div>
-        <input class="setting-input" id="xfyunApiKey" placeholder="API_KEY" oninput="saveConfig()">
+      <div id="volcCredRows" style="display:none;">
+        <div>
+          <div class="setting-label">火山语音 API Key（新版控制台）</div>
+          <input class="setting-input" id="volcAsrApiKey" type="password" placeholder="X-Api-Key" oninput="saveConfig()">
+        </div>
+        <div class="setting-label" style="font-size:12px; margin-top:6px;">旧版控制台填下面两项（可留空）</div>
+        <div>
+          <div class="setting-label">火山 APP ID</div>
+          <input class="setting-input" id="volcAsrAppKey" placeholder="App ID" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">火山 Access Token</div>
+          <input class="setting-input" id="volcAsrAccessKey" type="password" placeholder="Access Token" oninput="saveConfig()">
+        </div>
+        <div class="setting-label" style="font-size:12px; margin-top:6px;">极速版直接上传，≤2 小时；超过 2 小时需复用上面的阿里云 OSS 配置走标准版</div>
+      </div>
+      <div id="tencentCredRows" style="display:none;">
+        <div>
+          <div class="setting-label">腾讯云 SecretId</div>
+          <input class="setting-input" id="tencentSecretId" type="password" placeholder="SecretId" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">腾讯云 SecretKey</div>
+          <input class="setting-input" id="tencentSecretKey" type="password" placeholder="SecretKey" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">ASR 地域</div>
+          <input class="setting-input" id="tencentAsrRegion" placeholder="ap-beijing" oninput="saveConfig()">
+        </div>
+        <div class="setting-label" style="font-size:12px; margin-top:6px;">压缩后 ≤4.7MB 可直传；更长的录音需 COS 中转（密钥需有该桶读写权限）</div>
+        <div>
+          <div class="setting-label">COS 存储桶（含 APPID，如 asr-1250000000）</div>
+          <input class="setting-input" id="cosBucket" placeholder="留空则仅支持短录音直传" oninput="saveConfig()">
+        </div>
+        <div>
+          <div class="setting-label">COS 地域</div>
+          <input class="setting-input" id="cosRegion" placeholder="ap-beijing" oninput="saveConfig()">
+        </div>
       </div>
       <label class="checkbox-row">
         <input type="checkbox" id="autoTranscribe" checked>
@@ -1057,9 +1124,10 @@ function applyConfig(config) {
   if (config.audio_source && srcMap[config.audio_source] !== undefined)
     document.getElementById('audioSource').selectedIndex = srcMap[config.audio_source];
   if (config.engine) {
-    const engMap = {'FunASR': 0, 'xfyun': 1, 'Whisper': 2, 'Qwen3': 3};
-    const idx = engMap[config.engine];
-    if (idx !== undefined) document.getElementById('engineSelect').selectedIndex = idx;
+    const engSel = document.getElementById('engineSelect');
+    for (let i = 0; i < engSel.options.length; i++) {
+      if (engSel.options[i].value === config.engine) { engSel.selectedIndex = i; break; }
+    }
   }
   // 根据引擎显示对应模型选择
   const eng = document.getElementById('engineSelect').value;
@@ -1084,6 +1152,20 @@ function applyConfig(config) {
   if (config.xfyun_app_id) document.getElementById('xfyunAppId').value = config.xfyun_app_id;
   if (config.xfyun_api_secret) document.getElementById('xfyunApiSecret').value = config.xfyun_api_secret;
   if (config.xfyun_api_key) document.getElementById('xfyunApiKey').value = config.xfyun_api_key;
+  const fill = (id, v) => { if (v) document.getElementById(id).value = v; };
+  fill('aliyunAsrApiKey', config.aliyun_asr_api_key);
+  fill('ossAccessKeyId', config.oss_access_key_id);
+  fill('ossAccessKeySecret', config.oss_access_key_secret);
+  fill('ossBucket', config.oss_bucket);
+  fill('ossEndpoint', config.oss_endpoint);
+  fill('volcAsrApiKey', config.volc_asr_api_key);
+  fill('volcAsrAppKey', config.volc_asr_app_key);
+  fill('volcAsrAccessKey', config.volc_asr_access_key);
+  fill('tencentSecretId', config.tencent_secret_id);
+  fill('tencentSecretKey', config.tencent_secret_key);
+  fill('tencentAsrRegion', config.tencent_asr_region);
+  fill('cosBucket', config.cos_bucket);
+  fill('cosRegion', config.cos_region);
   if (config.hot_words) document.getElementById('hotWords').value = config.hot_words;
   if (config.domain) {
     const dIdx = ['通用','金融','科技','医疗','教育','法院'].indexOf(config.domain);
@@ -1104,6 +1186,7 @@ function applyConfig(config) {
   if (config.diarization_backend) document.getElementById('diarBackend').value = config.diarization_backend;
   if (config.hf_token) document.getElementById('hfToken').value = config.hf_token;
   onDiarBackendChange();
+  onEngineChange();
 }
 
 function onDiarBackendChange() {
@@ -1122,6 +1205,10 @@ function onEngineChange() {
   document.getElementById('funasrModelRow').style.display = (eng === 'FunASR') ? '' : 'none';
   document.getElementById('whisperModelRow').style.display = (eng === 'Whisper') ? '' : 'none';
   document.getElementById('qwen3ModelRow').style.display = (eng === 'Qwen3') ? '' : 'none';
+  document.getElementById('xfyunCredRows').style.display = (eng === 'xfyun') ? '' : 'none';
+  document.getElementById('aliyunCredRows').style.display = (eng === 'aliyun') ? '' : 'none';
+  document.getElementById('volcCredRows').style.display = (eng === 'volc') ? '' : 'none';
+  document.getElementById('tencentCredRows').style.display = (eng === 'tencent') ? '' : 'none';
 }
 
 function saveConfig() {
@@ -1135,6 +1222,19 @@ function saveConfig() {
     xfyun_app_id: document.getElementById('xfyunAppId').value,
     xfyun_api_secret: document.getElementById('xfyunApiSecret').value,
     xfyun_api_key: document.getElementById('xfyunApiKey').value,
+    aliyun_asr_api_key: document.getElementById('aliyunAsrApiKey').value,
+    oss_access_key_id: document.getElementById('ossAccessKeyId').value,
+    oss_access_key_secret: document.getElementById('ossAccessKeySecret').value,
+    oss_bucket: document.getElementById('ossBucket').value,
+    oss_endpoint: document.getElementById('ossEndpoint').value,
+    volc_asr_api_key: document.getElementById('volcAsrApiKey').value,
+    volc_asr_app_key: document.getElementById('volcAsrAppKey').value,
+    volc_asr_access_key: document.getElementById('volcAsrAccessKey').value,
+    tencent_secret_id: document.getElementById('tencentSecretId').value,
+    tencent_secret_key: document.getElementById('tencentSecretKey').value,
+    tencent_asr_region: document.getElementById('tencentAsrRegion').value,
+    cos_bucket: document.getElementById('cosBucket').value,
+    cos_region: document.getElementById('cosRegion').value,
     auto_transcribe: document.getElementById('autoTranscribe').checked,
     speaker_diarization: document.getElementById('speakerDiarization').checked,
     preset_spk_num: parseInt(document.getElementById('presetSpkNum').value) || 0,
