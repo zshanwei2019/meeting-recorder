@@ -78,6 +78,9 @@ a = Analysis(
         'websockets',
         'websocket',
         'websocket_client',
+        # 云端文件转写适配层（oss2 在 cloud_asr 内部惰性 import，无需收子模块）
+        'cloud_asr',
+        'oss2',
     ] + funasr_hiddenimports + modelscope_hiddenimports + pyannote_hiddenimports,
     hookspath=[],
     hooksconfig={},

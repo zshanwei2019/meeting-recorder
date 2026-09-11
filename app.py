@@ -38,6 +38,13 @@ except ImportError:
     _rf_fuzz = None
     _POSTPROCESS_HOTWORDS_AVAILABLE = False
 
+# 云端录音文件识别（阿里 Paraformer / 火山豆包 / 腾讯云），重依赖在模块内惰性导入
+try:
+    import cloud_asr as _cloud_asr
+except Exception as _cloud_asr_err:  # requests 缺失等极端环境
+    _cloud_asr = None
+    print(f"[WARN] cloud_asr 不可用: {_cloud_asr_err}")
+
 # ─── PyInstaller + FunASR 兼容补丁 ───
 # funasr/register.py 在每个类注册时调用 inspect.getfile() 和
 # inspect.getsourcelines() 来记录类位置元数据。PyInstaller 打包后
@@ -614,6 +621,24 @@ DEFAULT_CONFIG = {
     "funasr_model": FILE_MODEL_PARAFORMER_LARGE,
     "whisper_model": WHISPER_DEFAULT_MODEL,
     "qwen3_model": QWEN3_DEFAULT_MODEL,
+    # ── 云端文件转写（engine = aliyun / volc / tencent 时生效；仅文件转写，不支持实时）──
+    # 阿里云百炼 Paraformer（DashScope API Key）+ OSS 临时托管音频（预签名 URL）
+    "aliyun_asr_api_key": "",
+    "oss_access_key_id": "",
+    "oss_access_key_secret": "",
+    "oss_bucket": "",
+    "oss_endpoint": "oss-cn-beijing.aliyuncs.com",
+    # 火山引擎豆包语音（新版控制台 X-Api-Key；旧版用 app_key + access_key）
+    "volc_asr_api_key": "",
+    "volc_asr_app_key": "",
+    "volc_asr_access_key": "",
+    # 腾讯云录音文件识别（访问管理 API 密钥）；>5MB 需 COS 存储桶中转
+    "tencent_secret_id": "",
+    "tencent_secret_key": "",
+    "tencent_asr_region": "ap-beijing",
+    "cos_bucket": "",
+    "cos_region": "ap-beijing",
+    "cloud_tmp_prefix": "asr-temp",
     "auto_transcribe": True,
     "xfyun_app_id": "",
     "xfyun_api_key": "",
@@ -3350,8 +3375,11 @@ def create_app():
                 return
             state.is_realtime = True
             engine = state.config.get("engine", "FunASR")
-            if engine in ("Whisper", "Qwen3"):
-                engine_label = "Whisper" if engine == "Whisper" else "Qwen3-ASR"
+            if engine in ("Whisper", "Qwen3") or engine in ("aliyun", "volc", "tencent"):
+                if engine in ("aliyun", "volc", "tencent"):
+                    engine_label = _cloud_asr.CLOUD_ENGINE_LABELS.get(engine, engine) if _cloud_asr else engine
+                else:
+                    engine_label = "Whisper" if engine == "Whisper" else "Qwen3-ASR"
                 await state.push_event_sync(ws, "realtime_status", {"status": "error", "message": f"{engine_label} 不支持实时转写，请使用 FunASR 或讯飞引擎进行实时转写；{engine_label} 用于录音结束后的文件转写。"})
                 await state.push_event_sync(ws, "status", "就绪")
                 state.is_realtime = False
@@ -4210,8 +4238,57 @@ def _transcribe_file_task(filepath, ws):
                 else:
                     state.push_from_thread("status", "就绪")
                     state.push_from_thread("log", {"message": "转写失败，未获得结果"})
+        elif engine in ("aliyun", "volc", "tencent"):
+            if _cloud_asr is None:
+                state.push_from_thread("log", {"message": "云端转写模块加载失败，请检查安装（requests/oss2）"})
+                state.push_from_thread("status", "就绪")
+                return
+            engine_label = _cloud_asr.CLOUD_ENGINE_LABELS.get(engine, engine)
+
+            def status_cb(status, msg):
+                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+
+            try:
+                state.push_from_thread("log", {"message": f"使用{engine_label}云端转写…"})
+                result = _cloud_asr.transcribe(
+                    engine, filepath, state.config, status_callback=status_cb)
+            except _cloud_asr.CloudASRError as e:
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": f"{engine_label}转写失败：{e}"})
+                return
+            except Exception as e:
+                traceback.print_exc()
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": f"{engine_label}转写异常：{e}"})
+                return
+
+            text = (result.get("text") or "").strip()
+            sentence_info = result.get("sentence_info") or []
+            speaker_count = int(result.get("speaker_count") or 0)
+            if not text:
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": f"{engine_label}未识别到有效语音（可能是静音音频）"})
+                return
+            state.set_transcript(text)
+            state.sentence_info = sentence_info
+            state.speaker_count = speaker_count
+            save_recording_meta(filepath, text=text, engine=engine,
+                                sentence_info=sentence_info, speaker_count=speaker_count)
+            if sentence_info:
+                state.push_from_thread("transcript_ready", {
+                    "text": text,
+                    "sentence_info": sentence_info,
+                    "speaker_count": speaker_count,
+                    "wav_name": Path(filepath).name,
+                })
+            else:
+                state.push_from_thread("transcript_ready", text)
+            state.push_from_thread("status", "就绪")
+            spk_info = f"，识别{speaker_count}位说话人" if speaker_count > 0 else ""
+            state.push_from_thread("log", {
+                "message": f"{engine_label}转写完成，共{len(text)}字{spk_info}"})
         else:
-            state.push_from_thread("log", {"message": "讯飞文件转写暂未实现，请使用FunASR引擎"})
+            state.push_from_thread("log", {"message": "讯飞仅支持实时转写，文件转写请选择其他引擎"})
             state.push_from_thread("status", "就绪")
     except Exception as e:
         print(f"[ERROR] _transcribe_file_task: {e}")
