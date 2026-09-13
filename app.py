@@ -624,6 +624,7 @@ DEFAULT_CONFIG = {
     # ── 云端文件转写（engine = aliyun / volc / tencent 时生效；仅文件转写，不支持实时）──
     # 阿里云百炼 Paraformer（DashScope API Key）+ OSS 临时托管音频（预签名 URL）
     "aliyun_asr_api_key": "",
+    "aliyun_vocabulary_id": "",
     "oss_access_key_id": "",
     "oss_access_key_secret": "",
     "oss_bucket": "",
