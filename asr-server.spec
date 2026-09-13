@@ -81,6 +81,10 @@ a = Analysis(
         # 云端文件转写适配层（oss2 在 cloud_asr 内部惰性 import，无需收子模块）
         'cloud_asr',
         'oss2',
+        # 运行日志 / DPAPI 密钥加密 / 新版本检查（均被 app.py try-import，显式列出防漏打包）
+        'app_logging',
+        'secret_store',
+        'update_check',
     ] + funasr_hiddenimports + modelscope_hiddenimports + pyannote_hiddenimports,
     hookspath=[],
     hooksconfig={},

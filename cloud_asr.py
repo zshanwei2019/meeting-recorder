@@ -105,6 +105,27 @@ class CloudASRError(Exception):
     """云端转写业务错误（鉴权/参数/任务失败），文案可直接展示给用户。"""
 
 
+class CloudASRCancelled(Exception):
+    """用户主动取消。
+
+    三家录音文件识别均无可靠的公开“撤销已提交任务”接口，取消只能做到：
+    立即停止本地轮询/等待、清理临时托管对象；云端任务可能仍执行并计费。
+    单独成类以便上层给出与“失败”不同的提示，且不当作错误写红日志。
+    """
+    def __init__(self, provider=""):
+        self.provider = provider
+        label = CLOUD_ENGINE_LABELS.get(provider, "云端") if provider else "云端"
+        super().__init__(
+            f"已取消{label}转写等待。注意：任务可能已提交到云端，"
+            "厂商仍可能执行本次识别并计费，结果不再回填。")
+
+
+def _check_cancel(cancel_event):
+    """轮询循环里调用；事件置位则抛 CloudASRCancelled 尽快退出。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise CloudASRCancelled()
+
+
 # ─── 音频预处理：16k 单声道 WAV → mp3 ────────────────────────────────────────
 
 def encode_mp3_for_cloud(wav_path, mp3_path=None, bit_rate=MP3_BIT_RATE):
@@ -305,7 +326,7 @@ def _oss_cleanup(config, key):
 # ─── 阿里云百炼 Paraformer（paraformer-v2）──────────────────────────────────
 
 def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
-                      diarization=False, speaker_count=0):
+                      diarization=False, speaker_count=0, cancel_event=None):
     """提交 Paraformer 录音文件识别任务并轮询到结束。file_url 必须公网可下载。"""
     api_key = (config.get("aliyun_asr_api_key") or config.get("dashscope_api_key") or "").strip()
     if not api_key:
@@ -349,6 +370,7 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     deadline = time.time() + ASR_TASK_TIMEOUT_S
     last_log = 0.0
     while time.time() < deadline:
+        _check_cancel(cancel_event)
         resp = _http("get", f"{base}/tasks/{task_id}", inject=http, headers=headers)
         data = _as_json(resp)
         output = data.get("output") or {}
@@ -457,7 +479,7 @@ def _volc_parse_result(data, diarization):
 
 
 def volc_transcribe_flash(mp3_bytes, config, *, status_callback=None, http=None,
-                          diarization=False, hot_words=""):
+                          diarization=False, hot_words="", cancel_event=None):
     """火山极速版：一次 HTTP 请求直接返回全文（≤2h、≤100MB）。"""
     t0 = time.time()
     request_id = str(uuid.uuid4())
@@ -467,6 +489,7 @@ def volc_transcribe_flash(mp3_bytes, config, *, status_callback=None, http=None,
 
     if status_callback:
         status_callback("transcribing", "正在调用火山豆包极速版转写…")
+    _check_cancel(cancel_event)
     log.info("火山极速版提交 request_id=%s 大小=%.1fMB diarization=%s",
              request_id, len(mp3_bytes) / 1048576, diarization)
     url = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
@@ -488,7 +511,7 @@ def volc_transcribe_flash(mp3_bytes, config, *, status_callback=None, http=None,
 
 
 def volc_transcribe_standard(file_url, config, *, status_callback=None, http=None,
-                             diarization=False, hot_words=""):
+                             diarization=False, hot_words="", cancel_event=None):
     """火山标准版：submit 音频链接 + query 轮询，用于 >2h 长录音。"""
     request_id = str(uuid.uuid4())
     # 标准版资源 ID 与极速版不同：豆包录音文件识别 1.0 = volc.bigasr.auc
@@ -515,6 +538,7 @@ def volc_transcribe_standard(file_url, config, *, status_callback=None, http=Non
     deadline = time.time() + ASR_TASK_TIMEOUT_S
     last_log = 0.0
     while time.time() < deadline:
+        _check_cancel(cancel_event)
         resp = _http("post", query_url, inject=http, headers=query_headers, json={})
         code = _headers(resp, "X-Api-Status-Code")
         if code == "20000000":
@@ -619,7 +643,8 @@ def _cos_presigned_url(method, bucket, region, secret_id, secret_key, key, expir
 
 
 def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
-                       diarization=False, speaker_count=0, hot_words="", put_fn=None):
+                       diarization=False, speaker_count=0, hot_words="", put_fn=None,
+                       cancel_event=None):
     """腾讯云录音文件识别：小文件 base64 直传，大文件走 COS 预签名 URL。"""
     secret_id = (config.get("tencent_secret_id") or "").strip()
     secret_key = (config.get("tencent_secret_key") or "").strip()
@@ -692,6 +717,7 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
     deadline = time.time() + ASR_TASK_TIMEOUT_S
     last_log = 0.0
     while time.time() < deadline:
+        _check_cancel(cancel_event)
         data = tencent_call("DescribeTaskStatus", {"TaskId": task_id},
                             secret_id, secret_key, region, http=http)
         status = data.get("Status")
@@ -729,13 +755,15 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
 # ─── 统一入口 ───────────────────────────────────────────────────────────────
 
 def transcribe(provider, wav_path, config, *, status_callback=None,
-               http=None, put_fn=None):
+               http=None, put_fn=None, cancel_event=None):
     """云端文件转写统一入口。
 
     provider: aliyun / volc / tencent
     wav_path: 16k 单声道 WAV（内部压成 mp3 再投递）
     config:   state.config
-    返回 {"text", "sentence_info", "speaker_count"}；失败抛 CloudASRError。
+    cancel_event: 可选 threading.Event，置位后协作式取消（停止轮询/等待）。
+    返回 {"text", "sentence_info", "speaker_count"}；失败抛 CloudASRError，
+    用户取消抛 CloudASRCancelled。
     """
     provider = (provider or "").strip().lower()
     if provider not in CLOUD_ENGINES:
@@ -774,19 +802,21 @@ def transcribe(provider, wav_path, config, *, status_callback=None,
                 try:
                     result = volc_transcribe_standard(
                         file_url, config, status_callback=status_callback, http=http,
-                        diarization=diarization, hot_words=hot_words)
+                        diarization=diarization, hot_words=hot_words,
+                        cancel_event=cancel_event)
                 finally:
                     _oss_cleanup(config, key)
             else:
                 result = volc_transcribe_flash(
                     mp3_bytes, config, status_callback=status_callback, http=http,
-                    diarization=diarization, hot_words=hot_words)
+                    diarization=diarization, hot_words=hot_words,
+                    cancel_event=cancel_event)
 
         elif provider == "tencent":
             result = tencent_transcribe(
                 mp3_bytes, config, status_callback=status_callback, http=http,
                 diarization=diarization, speaker_count=speaker_count,
-                hot_words=hot_words, put_fn=put_fn)
+                hot_words=hot_words, put_fn=put_fn, cancel_event=cancel_event)
 
         elif provider == "aliyun":
             if status_callback:
@@ -795,7 +825,8 @@ def transcribe(provider, wav_path, config, *, status_callback=None,
             try:
                 result = aliyun_transcribe(
                     file_url, config, status_callback=status_callback, http=http,
-                    diarization=diarization, speaker_count=speaker_count)
+                    diarization=diarization, speaker_count=speaker_count,
+                    cancel_event=cancel_event)
             finally:
                 _oss_cleanup(config, key)
 

@@ -38,6 +38,62 @@ const SIDECAR_PORT: u16 = 18765;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// 壳诊断日志。
+///
+/// Release 是 `windows_subsystem = "windows"` 的 GUI 程序、没有控制台，`eprintln!`
+/// 用户根本看不到——sidecar 找不到/拉起失败/60s 未就绪这类问题此前无从排查。
+/// 这里追加写到与 Python 端 `app.log` 同一目录的 `shell.log`，失败静默绝不影响壳启动。
+fn shell_log(msg: &str) {
+    eprintln!("{msg}"); // 开发态（tauri dev / 控制台）仍可见
+    let stamp = chrono_like_timestamp();
+    let line = format!("{stamp} {msg}\n");
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let dir = std::path::Path::new(&home).join("MeetingRecorder").join("logs");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(dir.join("shell.log"))
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+/// 不引入 chrono 依赖的简易本地时间戳 `YYYY-MM-DD HH:MM:SS`（SystemTime 转秒数自拼）。
+fn chrono_like_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format_unix_local(secs)
+}
+
+/// 把 Unix 秒转成 `YYYY-MM-DD HH:MM:SS`（按本地时区 UTC+8，即发行目标环境）。
+fn format_unix_local(secs: u64) -> String {
+    // 转为东八区墙钟再做公历换算（民用日期算法）。
+    let s = secs + 8 * 3600;
+    let days = (s / 86400) as i64;
+    let rem = s % 86400;
+    let (h, mi, se) = (rem / 3600, (rem / 60) % 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{se:02}")
+}
+
+/// Howard Hinnant 的 days-from-civil 逆算法：天数 -> (年, 月, 日)。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
 // Windows：把 sidecar 整棵进程树挂进 KILL_ON_JOB_CLOSE 作业对象。
 // PyInstaller onefile 的 asr-server.exe 是「引导进程→真正的服务进程（孙进程，占 18765）」
 // 两层结构，std 的 Child::kill 只杀直接子进程，孙进程会成为孤儿。
@@ -317,27 +373,23 @@ fn main() {
         .setup(|app| {
             // 托盘启动即显示（不依赖 sidecar / 主窗口是否就绪）。
             if let Err(e) = build_tray(app.handle()) {
-                eprintln!("[shell] failed to create tray icon: {e}");
+                shell_log(&format!("[shell] failed to create tray icon: {e}"));
             }
 
             // 定位并启动 sidecar。
             let Some(exe) = locate_sidecar(app.handle()) else {
-                // 开发态没有打包资源、也没构建 dist 时的友好提示。
-                eprintln!(
-                    "ASR server not found. Package asr-server.exe or run from development environment"
-                );
-                eprintln!(
-                    "  - 生产：应为 <resource_dir>/asr-server/asr-server.exe"
-                );
-                eprintln!("  - 开发：先 `pyinstaller asr-server.spec` 生成 dist/asr-server.exe，");
-                eprintln!("         或直接在仓库根 `python app.py` 后用浏览器访问。");
+                // 开发态没有打包资源、也没构建 dist 时的友好提示（写入 shell.log 便于排查）。
+                shell_log("[shell] ASR server not found: asr-server.exe missing. \
+                    生产应为 <resource_dir>/asr-server/asr-server.exe；") ;
+                shell_log("[shell] 开发态先 pyinstaller asr-server.spec 生成 dist/asr-server.exe，");
+                shell_log("[shell] 或直接在仓库根 python app.py 后用浏览器访问。");
                 // 仍然建窗，指向目标地址（服务不在时窗口会显示无法访问，便于排查）。
                 build_main_window(app.handle())?;
                 app.manage(SidecarState(Mutex::new(None)));
                 return Ok(());
             };
 
-            println!("[shell] launching sidecar: {}", exe.display());
+            shell_log(&format!("[shell] launching sidecar: {}", exe.display()));
             match spawn_sidecar(&exe) {
                 Ok(child) => {
                     // Windows：把 sidecar（及其以后派生的全部子孙）挂进 KILL_ON_JOB_CLOSE 作业。
@@ -356,7 +408,7 @@ fn main() {
                     }))));
                 }
                 Err(e) => {
-                    eprintln!("[shell] failed to spawn sidecar: {e}");
+                    shell_log(&format!("[shell] failed to spawn sidecar: {e}"));
                     app.manage(SidecarState(Mutex::new(None)));
                 }
             }
@@ -366,16 +418,16 @@ fn main() {
             std::thread::spawn(move || {
                 let ready = wait_until_ready(Instant::now() + READY_TIMEOUT);
                 if !ready {
-                    eprintln!(
+                    shell_log(&format!(
                         "[shell] sidecar did not become ready within {}s",
                         READY_TIMEOUT.as_secs()
-                    );
+                    ));
                 }
                 // 在主线程创建窗口（克隆 handle 移入闭包，避免借用/移动冲突）。
                 let win_handle = handle.clone();
                 let _ = handle.run_on_main_thread(move || {
                     if let Err(e) = build_main_window(&win_handle) {
-                        eprintln!("[shell] failed to create window: {e}");
+                        shell_log(&format!("[shell] failed to create window: {e}"));
                     }
                 });
             });
@@ -405,4 +457,32 @@ fn build_main_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWind
         .min_inner_size(1000.0, 700.0)
         .resizable(true)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_date_known_values() {
+        // 1970-01-01 00:00 UTC = unix 0；加东八区后仍是 1970-01-01 08:00
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2000-01-01（闰年）：距 1970-01-01 共 10957 天
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+        // 2024-02-29（闰年存在）
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+        // 2026-09-13
+        assert_eq!(civil_from_days(20709), (2026, 9, 13));
+        // 月末边界：2026-12-31
+        assert_eq!(civil_from_days(20818), (2026, 12, 31));
+    }
+
+    #[test]
+    fn format_unix_local_midnight() {
+        // unix 0 -> 东八区 1970-01-01 08:00:00
+        assert_eq!(format_unix_local(0), "1970-01-01 08:00:00");
+        // 2026-09-13 12:00:00 UTC = 20:00 东八区（unix 1789300800）
+        let s = format_unix_local(1_789_300_800);
+        assert!(s.starts_with("2026-09-13 20:00:00"), "got {s}");
+    }
 }

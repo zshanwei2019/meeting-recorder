@@ -560,6 +560,73 @@ mp3, dur = cloud_asr.encode_mp3_for_cloud(wav, str(Path(tmpdir) / "out.mp3"))
 check("PyAV 编码出非空 mp3", os.path.getsize(mp3) > 0)
 check("时长约等于源 WAV（0.5s）", abs(dur - 0.5) < 0.1, dur)
 
+# ── 14b. 协作式取消（停止轮询 + 计费提示）─────────────────────────────────
+
+print("\n=== 14b. 云端任务协作式取消 ===")
+import threading as _threading
+
+# _check_cancel：未置位不拦，置位抛 CloudASRCancelled
+ev_ok = _threading.Event()
+cloud_asr._check_cancel(ev_ok)  # 不抛即通过
+check("未置位的取消事件不拦截", True)
+
+ev_set = _threading.Event()
+ev_set.set()
+try:
+    cloud_asr._check_cancel(ev_set)
+    check("置位后抛 CloudASRCancelled", False)
+except cloud_asr.CloudASRCancelled:
+    check("置位后抛 CloudASRCancelled", True)
+
+# 取消异常文案明确告知“云端可能仍计费”
+try:
+    cloud_asr._check_cancel(ev_set)
+except cloud_asr.CloudASRCancelled as e:
+    check("取消文案提示仍可能计费", "计费" in str(e), str(e))
+
+# 阿里轮询：预置置位事件，第一次查询前即退出（不应出现成功结果）
+state["n"] = 0
+try:
+    cloud_asr.aliyun_transcribe("https://audio/cancel.mp3", cfg_ali,
+                                http=http_ali, cancel_event=ev_set)
+    check("阿里任务在取消事件下退出", False)
+except cloud_asr.CloudASRCancelled as e:
+    check("阿里任务在取消事件下抛取消异常", "阿里云" in str(e) or "云端" in str(e), str(e))
+
+# 腾讯轮询取消（DescribeTaskStatus 一直排队的假响应）
+def fake_tc_pending(url, **kw):
+    return FakeResp({"Response": {"Data": {"TaskId": 99, "Status": 1, "StatusStr": "waiting"},
+                                     "RequestId": "r1"}})
+
+try:
+    cloud_asr.tencent_transcribe(b"small", cfg_tc,
+                                 http={"post": fake_tc_pending}, cancel_event=ev_set)
+    check("腾讯任务在取消事件下退出", False)
+except cloud_asr.CloudASRCancelled:
+    check("腾讯任务在取消事件下抛取消异常", True)
+
+# 火山极速版：提交前检查取消，不应发出 HTTP 请求
+flash_called = {"n": 0}
+
+
+def fake_flash_should_not_run(url, **kw):
+    flash_called["n"] += 1
+    return FakeResp({}, status_code=200)
+
+
+try:
+    cloud_asr.volc_transcribe_flash(b"x", {"volc_asr_api_key": "k"},
+                                    http={"post": fake_flash_should_not_run},
+                                    cancel_event=ev_set)
+    check("火山极速版取消时不发起请求", False)
+except cloud_asr.CloudASRCancelled:
+    check("火山极速版取消时不发起请求", flash_called["n"] == 0)
+
+# cancel_event=None（旧调用方）行为完全不变
+state["n"] = 0
+out_nc = cloud_asr.aliyun_transcribe("https://audio/a.mp3", cfg_ali, http=http_ali)
+check("cancel_event=None 时阿里转写照常成功", out_nc["text"] == "第一段。第二段。")
+
 # ── 15. HTTP 重试与错误分类 ────────────────────────────────────────────────
 
 print("\n=== 15. HTTP 重试与错误分类 ===")
