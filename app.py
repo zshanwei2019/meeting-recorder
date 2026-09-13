@@ -38,6 +38,13 @@ except ImportError:
     _rf_fuzz = None
     _POSTPROCESS_HOTWORDS_AVAILABLE = False
 
+# 新版本检查（GitHub Releases，失败静默）
+try:
+    import update_check as _update_check
+except Exception as _uc_err:  # pragma: no cover
+    _update_check = None
+    print(f"[WARN] update_check 不可用: {_uc_err}")
+
 # 云端录音文件识别（阿里 Paraformer / 火山豆包 / 腾讯云），重依赖在模块内惰性导入
 try:
     import cloud_asr as _cloud_asr
@@ -672,21 +679,44 @@ DEFAULT_CONFIG = {
 # ─── 配置持久化 ───
 CONFIG_FILE = DATA_DIR / "config.json"
 
+# 敏感字段落盘用 Windows DPAPI 加密（绑定当前用户，换机/换人解不开）。
+try:
+    import secret_store as _secret_store
+except Exception as _ss_err:  # pragma: no cover
+    _secret_store = None
+    print(f"[WARN] secret_store 不可用，密钥将以明文落盘: {_ss_err}")
+
 def load_config():
-    """加载配置，优先从持久化文件读取，缺失字段用默认值填充"""
+    """加载配置，优先从持久化文件读取，缺失字段用默认值填充。
+
+    敏感字段在文件里是 DPAPI 密文，读出后解密到内存供业务/UI 使用。
+    旧明文配置原样可读，下次保存时自动迁移成密文。
+    """
     config = dict(DEFAULT_CONFIG)
     if CONFIG_FILE.exists():
         try:
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if _secret_store is not None:
+                try:
+                    saved = _secret_store.unprotect_config(saved)
+                except Exception as _de:
+                    print(f"[WARN] 配置解密异常（按原值读入）: {_de}")
             config.update(saved)
         except Exception:
             pass
     return config
 
 def save_config(config):
-    """保存配置到文件"""
+    """保存配置到文件；敏感字段先 DPAPI 加密，其余明文，避免 AK/SK 裸奔。"""
     try:
-        CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        to_write = config
+        if _secret_store is not None:
+            try:
+                to_write = _secret_store.protect_config(config)
+            except Exception as _pe:
+                print(f"[WARN] 配置加密失败，回退明文保存: {_pe}")
+        CONFIG_FILE.write_text(
+            json.dumps(to_write, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -2953,6 +2983,10 @@ class AppState:
         self.is_recording = False
         self.is_realtime = False
         self.is_transcribing = False  # 文件转写忙标志（上传转写互斥用）
+        # 云端文件转写取消信号：每个云端任务启动时新建一个 threading.Event，
+        # /api/transcribe/cancel 置位，透传到 cloud_asr 轮询循环让其尽快停下。
+        self.cloud_cancel_event = None
+        self.cloud_task_engine = None   # 当前云端任务引擎（用于提示可否真正取消）
         self.recording_start = None
         self.transcript_text = ""
         self.sentence_info = []     # 说话人分离结果
@@ -3089,6 +3123,23 @@ def create_app():
     async def get_version():
         return JSONResponse(_APP_VERSION_INFO)
 
+    # REST: 检查 GitHub Releases 是否有新版本（失败静默，不报错打扰用户）
+    @app.get("/api/update/check")
+    async def api_update_check():
+        if _update_check is None:
+            return JSONResponse({"update_available": False})
+        import asyncio
+        import functools
+        try:
+            loop = asyncio.get_event_loop()
+            current = _APP_VERSION_INFO.get("version") or ""
+            report = await loop.run_in_executor(
+                None, functools.partial(_update_check.check_for_update, current))
+            return JSONResponse(report)
+        except Exception as e:
+            applog.warning("版本检查失败（忽略）：%s", e)
+            return JSONResponse({"update_available": False})
+
     # REST: list audio devices
     @app.get("/api/devices")
     async def list_devices():
@@ -3097,6 +3148,24 @@ def create_app():
             return JSONResponse(devices)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # REST: 取消正在进行的云端文件转写（协作式：停止本地轮询；云端任务可能仍计费）
+    @app.post("/api/transcribe/cancel")
+    async def api_transcribe_cancel():
+        ev = state.cloud_cancel_event
+        engine = state.cloud_task_engine
+        if ev is None:
+            return JSONResponse({"cancelled": False, "message": "当前没有进行中的云端转写"})
+        ev.set()
+        label = (_cloud_asr.CLOUD_ENGINE_LABELS.get(engine, "云端")
+                 if _cloud_asr is not None else "云端")
+        applog.info("收到云端转写取消请求 engine=%s", engine)
+        return JSONResponse({
+            "cancelled": True,
+            "engine": engine,
+            "message": (f"正在取消{label}转写等待。注意：任务可能已提交到云端，"
+                        "厂商仍可能执行并计费。"),
+        })
 
     # REST: 环境自检（模型就绪 / 音频设备 / 磁盘），重检查在后台线程跑避免阻塞事件循环
     @app.get("/api/health")
@@ -4263,11 +4332,22 @@ def _transcribe_file_task(filepath, ws):
             def status_cb(status, msg):
                 state.push_from_thread("realtime_status", {"status": status, "message": msg})
 
+            # 每个云端任务一个取消事件；/api/transcribe/cancel 置位后轮询尽快退出。
+            cancel_event = threading.Event()
+            state.cloud_cancel_event = cancel_event
+            state.cloud_task_engine = engine
+            state.push_from_thread("cloud_task", {"active": True, "engine": engine_label})
             try:
                 state.push_from_thread("log", {"message": f"使用{engine_label}云端转写…"})
                 applog.info("云端文件转写开始 engine=%s file=%s", engine, Path(filepath).name)
                 result = _cloud_asr.transcribe(
-                    engine, filepath, state.config, status_callback=status_cb)
+                    engine, filepath, state.config, status_callback=status_cb,
+                    cancel_event=cancel_event)
+            except _cloud_asr.CloudASRCancelled as e:
+                applog.info("云端转写被用户取消 engine=%s file=%s", engine, Path(filepath).name)
+                state.push_from_thread("status", "就绪")
+                state.push_from_thread("log", {"message": str(e)})
+                return
             except _cloud_asr.CloudASRError as e:
                 applog.error("云端转写业务失败 engine=%s file=%s err=%s",
                              engine, Path(filepath).name, e)
@@ -4280,6 +4360,11 @@ def _transcribe_file_task(filepath, ws):
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": f"{engine_label}转写异常：{e}"})
                 return
+            finally:
+                if state.cloud_cancel_event is cancel_event:
+                    state.cloud_cancel_event = None
+                    state.cloud_task_engine = None
+                state.push_from_thread("cloud_task", {"active": False})
 
             text = (result.get("text") or "").strip()
             sentence_info = result.get("sentence_info") or []

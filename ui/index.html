@@ -591,6 +591,10 @@ html, body {
         <div class="logo-version" id="logoVersion">v3.1.0</div>
       </div>
     </div>
+    <a id="updateBanner" target="_blank" rel="noopener"
+       style="display:none;margin:2px 12px 6px;padding:6px 10px;border-radius:8px;
+              background:#ecfdf5;color:#047857;font-size:12px;text-decoration:none;
+              border:1px solid #a7f3d0;"></a>
 
     <div class="status-section">
       <div class="status-row">
@@ -622,6 +626,7 @@ html, body {
 
     <div class="btn-row">
       <button class="btn-secondary" onclick="transcribeFile()">转写文件</button>
+      <button class="btn btn-pause" id="btnCancelCloud" onclick="cancelCloud()" style="display:none;">取消云端转写</button>
       <button class="btn-secondary" onclick="generateMinutes()">AI 纪要</button>
     </div>
     <input type="file" id="transcribeFileInput" style="display:none" accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma,.amr,.mp4,.mov,.mkv,.webm,.ts" onchange="onTranscribeFilePicked(event)">
@@ -1065,6 +1070,9 @@ function handleEvent(ev) {
     case 'realtime_status':
       onRealtimeStatus(ev.data);
       break;
+    case 'cloud_task':
+      onCloudTaskChanged(ev.data);
+      break;
     case 'transcript_partial':
       onTranscriptPartial(ev.data);
       break;
@@ -1298,6 +1306,29 @@ function transcribeFile() {
   const inp = document.getElementById('transcribeFileInput');
   inp.value = ''; // 允许重复选同一个文件
   inp.click();
+}
+
+// 云端任务开始/结束：控制取消按钮显隐
+function onCloudTaskChanged(data) {
+  const btn = document.getElementById('btnCancelCloud');
+  if (!btn) return;
+  if (data && data.active) {
+    btn.style.display = '';
+    btn.textContent = '取消' + (data.engine || '云端') + '转写';
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+// 协作式取消云端文件转写（停止本地等待；云端可能仍计费，后端会提示）
+async function cancelCloud() {
+  try {
+    const resp = await fetch('/api/transcribe/cancel', { method: 'POST' });
+    const r = await resp.json().catch(() => ({}));
+    appendLog((r && r.message) || '已请求取消');
+  } catch (e) {
+    appendLog('取消请求失败：' + (e.message || e));
+  }
 }
 
 async function onTranscribeFilePicked(ev) {
@@ -2146,6 +2177,7 @@ function onPmMinutesExported(data) {
 window.addEventListener('load', function() {
   connectWs();
   loadVersion();
+  checkUpdate();
 });
 
 // 拉取后端真实版本（含 git commit/日期），替换界面上的占位版本号
@@ -2160,6 +2192,24 @@ async function loadVersion() {
     if (logoEl) logoEl.textContent = label;
     if (footEl) footEl.textContent = '会议录音转写助手 ' + label;
   } catch (e) { /* 版本拉取失败不影响使用，保留占位 */ }
+}
+
+// 检查 GitHub Releases 新版本；失败静默，不打扰用户
+async function checkUpdate() {
+  try {
+    const resp = await fetch('/api/update/check');
+    if (!resp.ok) return;
+    const info = await resp.json();
+    if (info && info.update_available) {
+      const el = document.getElementById('updateBanner');
+      if (el) {
+        el.textContent = '⬆ 有新版本 ' + (info.latest_version || '') + '，点击下载';
+        el.href = info.release_url || '#';
+        el.style.display = '';
+      }
+      appendLog('检测到新版本 ' + (info.latest_version || '') + '，可前往更新（当前版本仍可正常使用）');
+    }
+  } catch (e) { /* 离线/限流时静默 */ }
 }
 </script>
 </body>
