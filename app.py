@@ -45,6 +45,16 @@ except Exception as _cloud_asr_err:  # requests 缺失等极端环境
     _cloud_asr = None
     print(f"[WARN] cloud_asr 不可用: {_cloud_asr_err}")
 
+# 统一运行日志（写 ~/MeetingRecorder/logs/app.log，打包后也能排查）
+try:
+    import app_logging as _app_logging
+    applog = _app_logging.get_logger("app")
+except Exception:  # pragma: no cover
+    _app_logging = None
+    import logging as _logging
+    applog = _logging.getLogger("meeting_recorder.app")
+    applog.addHandler(_logging.NullHandler())
+
 # ─── PyInstaller + FunASR 兼容补丁 ───
 # funasr/register.py 在每个类注册时调用 inspect.getfile() 和
 # inspect.getsourcelines() 来记录类位置元数据。PyInstaller 打包后
@@ -3861,7 +3871,11 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
     run_label._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
     run_label.font.bold = True
     run_label.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-    run_value = p_left.add_run(datetime.now().strftime('%Y年%m月%d日 %H:%M'))
+    # 中文字符不能放进 strftime 格式串：Windows strftime 对字面中文走 locale 编码，
+    # 非中文区域（英文系统/GitHub runner）会 UnicodeEncodeError 崩溃。用字段拼接规避。
+    _now = datetime.now()
+    _stamp = f"{_now.year}年{_now.month}月{_now.day}日 {_now.strftime('%H:%M')}"
+    run_value = p_left.add_run(_stamp)
     run_value.font.size = Pt(10)
     run_value.font.name = "宋体"
     run_value._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
@@ -4251,13 +4265,17 @@ def _transcribe_file_task(filepath, ws):
 
             try:
                 state.push_from_thread("log", {"message": f"使用{engine_label}云端转写…"})
+                applog.info("云端文件转写开始 engine=%s file=%s", engine, Path(filepath).name)
                 result = _cloud_asr.transcribe(
                     engine, filepath, state.config, status_callback=status_cb)
             except _cloud_asr.CloudASRError as e:
+                applog.error("云端转写业务失败 engine=%s file=%s err=%s",
+                             engine, Path(filepath).name, e)
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": f"{engine_label}转写失败：{e}"})
                 return
             except Exception as e:
+                applog.exception("云端转写异常 engine=%s file=%s", engine, Path(filepath).name)
                 traceback.print_exc()
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": f"{engine_label}转写异常：{e}"})
@@ -4286,12 +4304,16 @@ def _transcribe_file_task(filepath, ws):
                 state.push_from_thread("transcript_ready", text)
             state.push_from_thread("status", "就绪")
             spk_info = f"，识别{speaker_count}位说话人" if speaker_count > 0 else ""
+            applog.info("云端文件转写成功 engine=%s file=%s 字数=%d 说话人=%d",
+                        engine, Path(filepath).name, len(text), speaker_count)
             state.push_from_thread("log", {
                 "message": f"{engine_label}转写完成，共{len(text)}字{spk_info}"})
         else:
             state.push_from_thread("log", {"message": "讯飞仅支持实时转写，文件转写请选择其他引擎"})
             state.push_from_thread("status", "就绪")
     except Exception as e:
+        applog.exception("文件转写任务异常 engine=%s file=%s",
+                         state.config.get("engine"), filepath)
         print(f"[ERROR] _transcribe_file_task: {e}")
         traceback.print_exc()
         state.push_from_thread("log", {"message": f"转写失败: {str(e)}"})
@@ -5186,6 +5208,15 @@ def main():
 
 def _main_inner(log_error):
     ensure_dirs()
+
+    # 尽早初始化文件日志：后续启动/转写/云端错误都落盘，打包 GUI 无控制台也能排查
+    if _app_logging is not None:
+        try:
+            _app_logging.setup_logging()
+            applog.info("===== 会议录音转写助手启动 %s sidecar=%s =====",
+                        APP_VERSION, os.environ.get("ASR_SIDECAR", "0"))
+        except Exception as _le:
+            print(f"[WARN] 日志初始化失败: {_le}")
 
     # Check if FastAPI is installed
     try:

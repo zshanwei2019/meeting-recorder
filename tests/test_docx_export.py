@@ -142,6 +142,11 @@ src = io.open(ROOT / "app.py", encoding="utf-8").read()
 check("不再用 append 挂 tblBorders", src.count("tblPr.append(borders)"), 0)
 check_true("改用 insert_element_before", "insert_element_before" in src)
 check("裸秒数格式已清除", src.count('f"{dur:.1f}秒"'), 0)
+# Windows strftime 对格式串里的字面中文走 locale 编码，非中文区域直接
+# UnicodeEncodeError（CI 在英文 runner 上实测崩溃）。禁止再往 strftime 里塞中文。
+import re as _re
+_bad_strftime = _re.findall(r"strftime\([^)]*[\u4e00-\u9fff][^)]*\)", src)
+check("strftime 格式串不含中文（跨区域崩溃回归）", len(_bad_strftime), 0)
 # 整段正文输出必须被 per_sentence 守卫，避免与逐句输出双写
 i_guard = src.find("per_sentence = timestamp_precision ==")
 i_body = src.find('text_run = p.add_run(f"  {merged_text}")')

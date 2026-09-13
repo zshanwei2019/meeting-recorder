@@ -31,6 +31,18 @@ from pathlib import Path
 
 import requests
 
+try:
+    from app_logging import get_logger
+except Exception:  # pragma: no cover - 极端环境缺模块时退回空日志
+    import logging
+    def get_logger(name=""):
+        lg = logging.getLogger(f"meeting_recorder.{name}" if name else "meeting_recorder")
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
+        return lg
+
+log = get_logger("cloud_asr")
+
 # ─── 常量 ───────────────────────────────────────────────────────────────────
 
 CLOUD_ENGINES = ("aliyun", "volc", "tencent")
@@ -51,6 +63,42 @@ VOLC_FLASH_MAX_BYTES = 100 * 1024 * 1024
 VOLC_FLASH_MAX_SECONDS = 2 * 3600
 
 MP3_BIT_RATE = 32_000  # 16k 单声道人声 32kbps 足够，1 小时约 14MB
+
+# HTTP 重试（仅对网络错误 / 429 / 5xx；4xx 参数/鉴权错误立即失败，不重试）
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+
+
+def _retry_sleep(attempt):
+    """指数退避；测试可 monkeypatch 本函数实现零等待。attempt 从 0 起。"""
+    time.sleep(min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** attempt)))
+
+
+def _is_retryable_status(code):
+    return code == 429 or 500 <= code < 600
+
+
+def classify_http_error(status, body=None, label=""):
+    """把 HTTP 状态码/响应体翻译成人话，供用户排查（密钥/权限/限流/服务端）。"""
+    prefix = f"{label}：" if label else ""
+    if status in (401, 403):
+        return (f"{prefix}鉴权失败（HTTP {status}），请检查 API Key / SecretId / SecretKey "
+                "是否正确、对应云服务是否已开通、密钥是否有该资源权限")
+    if status == 404:
+        return f"{prefix}接口或资源不存在（HTTP 404），请确认服务已开通或音频 URL 可被公网下载"
+    if status == 429:
+        return f"{prefix}触发云端限流（HTTP 429），请稍后重试或降低并发"
+    if status == 413:
+        return f"{prefix}音频过大（HTTP 413）"
+    if 400 <= status < 500:
+        msg = ""
+        if isinstance(body, dict):
+            msg = body.get("message") or (body.get("Response") or {}).get("Error", {}).get("Message") or ""
+        return f"{prefix}请求被拒绝（HTTP {status}）{('：' + msg) if msg else ''}"
+    if 500 <= status < 600:
+        return f"{prefix}云端服务暂时不可用（HTTP {status}），已重试仍失败，请稍后再试"
+    return f"{prefix}HTTP {status}"
 
 
 class CloudASRError(Exception):
@@ -111,12 +159,47 @@ def split_hot_words(raw, limit=None):
     return parts[:limit] if limit else parts
 
 
-def _http(method, url, *, inject=None, timeout=60, **kwargs):
-    """发起 HTTP 请求；inject 给定时用假函数（测试），否则用 requests。"""
+def _http(method, url, *, inject=None, timeout=60, retry=True, label="", request_fn=None, **kwargs):
+    """发起 HTTP 请求。
+
+    - inject：注入假函数时直接返回、完全绕过重试（供既有业务单测快速跑）；
+    - request_fn：替换 requests.<method> 但仍走重试/分类逻辑（供重试机制单测）；
+    真实请求对网络错误 / 429 / 5xx 做有限次指数退避重试，非重试类 4xx 原样返回。
+    """
     fn = (inject or {}).get(method.lower())
     if fn is not None:
         return fn(url, **kwargs)
-    return getattr(requests, method.lower())(url, timeout=timeout, **kwargs)
+    caller = request_fn or getattr(requests, method.lower())
+    attempts = RETRY_MAX_ATTEMPTS if retry else 1
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            resp = caller(url, timeout=timeout, **kwargs)
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                log.warning("%s 请求异常（第 %d 次）：%s，将重试", label or url, attempt + 1, e)
+                _retry_sleep(attempt)
+                continue
+            raise CloudASRError(
+                f"{label + '：' if label else ''}网络连接失败：{e}（已重试 {attempts} 次），"
+                "请检查网络/代理后重试") from e
+        if retry and _is_retryable_status(resp.status_code) and attempt < attempts - 1:
+            log.warning("%s 返回 %s（第 %d 次），将重试", label or url, resp.status_code, attempt + 1)
+            _retry_sleep(attempt)
+            continue
+        if retry and _is_retryable_status(resp.status_code):
+            raise CloudASRError(classify_http_error(resp.status_code, _safe_json(resp), label))
+        return resp
+    # 理论不可达
+    raise CloudASRError(f"{label} 请求失败：{last_exc}")
+
+
+def _safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return None
 
 
 def _as_json(resp):
@@ -193,20 +276,20 @@ def oss_upload(wav_or_bytes, config, key, *, put_fn=None, mp3_path=None):
     auth = oss2.Auth(ak, sk)
     bucket = oss2.Bucket(auth, endpoint, bucket_name)
     put_url = bucket.sign_url("PUT", key, 600, slash_safe=True)
-    if put_fn is not None:
-        r = put_fn(put_url, data=data,
-                   headers={"Content-Type": "audio/mpeg"})
-    else:
-        r = requests.put(put_url, data=data,
-                         headers={"Content-Type": "audio/mpeg"}, timeout=300)
+    log.info("OSS 上传开始：bucket=%s key=%s 大小=%.1fMB", bucket_name, key, len(data) / 1048576)
+    r = _http("put", put_url, inject=( {"put": put_fn} if put_fn is not None else None),
+              data=data, headers={"Content-Type": "audio/mpeg"},
+              timeout=300, label="OSS 上传")
     status = r.status_code if hasattr(r, "status_code") else r.get("status_code", 200)
     if status >= 300:
-        raise CloudASRError(f"OSS 上传失败（HTTP {status}），请检查 Bucket/Endpoint/权限")
+        raise CloudASRError(classify_http_error(status, _safe_json(r), "OSS 上传")
+                            + "，请检查 Bucket/Endpoint/权限")
+    log.info("OSS 上传成功：%s", key)
     return bucket.sign_url("GET", key, 24 * 3600, slash_safe=True), data
 
 
 def _oss_cleanup(config, key):
-    """转写结束后尽力清理临时文件，失败不影响主流程。"""
+    """转写结束后尽力清理临时文件，失败不影响主流程，仅记日志。"""
     try:
         import oss2
         auth = oss2.Auth(config["oss_access_key_id"].strip(), config["oss_access_key_secret"].strip())
@@ -214,8 +297,9 @@ def _oss_cleanup(config, key):
                              config["oss_endpoint"].strip().replace("https://", "").replace("http://", ""),
                              config["oss_bucket"].strip())
         bucket.delete_object(key)
-    except Exception:
-        pass
+        log.info("OSS 临时对象已清理：%s", key)
+    except Exception as e:
+        log.warning("OSS 临时对象清理失败（预签名 24h 后失效）：%s %s", key, e)
 
 
 # ─── 阿里云百炼 Paraformer（paraformer-v2）──────────────────────────────────
@@ -243,6 +327,7 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
         if status_callback:
             status_callback("transcribing", msg)
 
+    t0 = time.time()
     cb("正在提交阿里云 Paraformer 任务…")
     body = {
         "model": "paraformer-v2",
@@ -251,7 +336,7 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     }
     submit_headers = dict(headers, **{"X-DashScope-Async": "enable"})
     resp = _http("post", f"{base}/services/audio/asr/transcription",
-                 inject=http, headers=submit_headers, json=body)
+                 inject=http, headers=submit_headers, json=body, label="阿里云任务提交")
     data = _as_json(resp)
     if not isinstance(resp, dict) and getattr(resp, "status_code", 200) >= 400:
         raise CloudASRError(f"阿里云任务提交失败：{data.get('message') or _brief(resp)}")
@@ -259,6 +344,7 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     task_id = output.get("task_id")
     if not task_id:
         raise CloudASRError(f"阿里云未返回任务 ID：{data.get('message') or data}")
+    log.info("阿里云任务已提交 task_id=%s diarization=%s", task_id, diarization)
 
     deadline = time.time() + ASR_TASK_TIMEOUT_S
     last_log = 0.0
@@ -279,11 +365,13 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     if status == "FAILED":
         results = output.get("results") or []
         msg = (results[0].get("message") if results else None) or output.get("message") or "任务失败"
+        log.error("阿里云任务失败 task_id=%s msg=%s 耗时=%.1fs", task_id, msg, time.time() - t0)
         raise CloudASRError(f"阿里云转写失败：{msg}")
 
     results = output.get("results") or []
     if not results or results[0].get("subtask_status") == "FAILED":
         msg = (results[0].get("message") if results else None) or "未返回识别结果"
+        log.error("阿里云子任务失败 task_id=%s msg=%s", task_id, msg)
         raise CloudASRError(f"阿里云转写失败：{msg}")
     transcription_url = results[0].get("transcription_url")
     if not transcription_url:
@@ -295,6 +383,8 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     transcripts = result_json.get("transcripts") or []
     text = (transcripts[0].get("content") if transcripts else "") or ""
     sentence_info, spk_count = _normalize_sentences(result_json.get("sentences"), diarization)
+    log.info("阿里云转写成功 task_id=%s 字数=%d 说话人=%d 耗时=%.1fs",
+             task_id, len(text), spk_count, time.time() - t0)
     return {"text": text.strip(), "sentence_info": sentence_info, "speaker_count": spk_count}
 
 
@@ -369,6 +459,7 @@ def _volc_parse_result(data, diarization):
 def volc_transcribe_flash(mp3_bytes, config, *, status_callback=None, http=None,
                           diarization=False, hot_words=""):
     """火山极速版：一次 HTTP 请求直接返回全文（≤2h、≤100MB）。"""
+    t0 = time.time()
     request_id = str(uuid.uuid4())
     headers, uid = _volc_headers(config, request_id, sequence=-1)
     audio_field = {"data": base64.b64encode(mp3_bytes).decode("ascii")}
@@ -376,16 +467,24 @@ def volc_transcribe_flash(mp3_bytes, config, *, status_callback=None, http=None,
 
     if status_callback:
         status_callback("transcribing", "正在调用火山豆包极速版转写…")
+    log.info("火山极速版提交 request_id=%s 大小=%.1fMB diarization=%s",
+             request_id, len(mp3_bytes) / 1048576, diarization)
     url = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
-    resp = _http("post", url, inject=http, headers=headers, json=body, timeout=600)
+    resp = _http("post", url, inject=http, headers=headers, json=body, timeout=600,
+                 label="火山极速版")
     code = _headers(resp, "X-Api-Status-Code")
     message = _headers(resp, "X-Api-Message")
     if code == "20000003":
+        log.info("火山极速版静音音频 request_id=%s", request_id)
         return {"text": "", "sentence_info": [], "speaker_count": 0}
     if code != "20000000":
         logid = _headers(resp, "X-Tt-Logid")
+        log.error("火山极速版失败 code=%s msg=%s logid=%s", code, message, logid)
         raise CloudASRError(f"火山转写失败（{code or 'HTTP错误'} {message}），logid: {logid}")
-    return _volc_parse_result(_as_json(resp), diarization)
+    out = _volc_parse_result(_as_json(resp), diarization)
+    log.info("火山极速版成功 request_id=%s 字数=%d 耗时=%.1fs logid=%s",
+             request_id, len(out["text"]), time.time() - t0, _headers(resp, "X-Tt-Logid"))
+    return out
 
 
 def volc_transcribe_standard(file_url, config, *, status_callback=None, http=None,
@@ -437,7 +536,8 @@ def _tc3_sign(key, msg):
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def tencent_call(action, payload_dict, secret_id, secret_key, region, *, http=None, timeout=60):
+def tencent_call(action, payload_dict, secret_id, secret_key, region, *, http=None,
+                 timeout=60, label=""):
     """调用 asr.tencentcloudapi.com 的 TC3 v3 接口，返回 Response 对象内容。"""
     host = "asr.tencentcloudapi.com"
     endpoint = f"https://{host}"
@@ -475,12 +575,17 @@ def tencent_call(action, payload_dict, secret_id, secret_key, region, *, http=No
         "X-TC-Region": region,
     }
     resp = _http("post", endpoint, inject=http, headers=headers, data=payload.encode("utf-8"),
-                 timeout=timeout)
+                 timeout=timeout, label=label or f"腾讯云 {action}")
     data = _as_json(resp)
     response = data.get("Response", data)
     if "Error" in response:
         err = response["Error"]
-        raise CloudASRError(f"腾讯云接口错误：{err.get('Code')} {err.get('Message')}")
+        rid = response.get("RequestId", "")
+        log.error("腾讯云接口错误 action=%s code=%s msg=%s requestId=%s",
+                  action, err.get('Code'), err.get('Message'), rid)
+        raise CloudASRError(
+            f"腾讯云接口错误：{err.get('Code')} {err.get('Message')}"
+            + (f"（RequestId: {rid}）" if rid else ""))
     return response.get("Data", response)
 
 
@@ -544,13 +649,17 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
         get_url = _cos_presigned_url("get", bucket, cos_region, secret_id, secret_key,
                                      key, expires=24 * 3600)
         cb("正在上传音频到腾讯云 COS…")
-        r = put_fn(put_url, data=mp3_bytes,
-                   headers={"Content-Type": "audio/mpeg"}) if put_fn else \
-            requests.put(put_url, data=mp3_bytes,
-                         headers={"Content-Type": "audio/mpeg"}, timeout=300)
+        log.info("COS 上传开始：bucket=%s key=%s 大小=%.1fMB", bucket, key,
+                 len(mp3_bytes) / 1048576)
+        r = _http("put", put_url,
+                  inject=({"put": put_fn} if put_fn is not None else None),
+                  data=mp3_bytes, headers={"Content-Type": "audio/mpeg"},
+                  timeout=300, label="COS 上传")
         status = r.status_code if hasattr(r, "status_code") else r.get("status_code", 200)
         if status >= 300:
-            raise CloudASRError(f"COS 上传失败（HTTP {status}），请检查存储桶名称/地域/密钥权限")
+            raise CloudASRError(classify_http_error(status, _safe_json(r), "COS 上传")
+                                + "，请检查存储桶名称/地域/密钥权限")
+        log.info("COS 上传成功：%s", key)
         source_type = 0
         audio_field = {"Url": get_url}
 
@@ -572,10 +681,13 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
         params["HotwordList"] = ",".join(f"{w[:30]}|5" for w in words[:128])
 
     cb("正在提交腾讯云转写任务…")
+    t0 = time.time()
     data = tencent_call("CreateRecTask", params, secret_id, secret_key, region, http=http)
     task_id = data.get("TaskId")
     if not task_id:
         raise CloudASRError(f"腾讯云未返回任务 ID：{data}")
+    log.info("腾讯云任务已提交 task_id=%s engine=%s source=%s diarization=%s",
+             task_id, engine_model, source_type, diarization)
 
     deadline = time.time() + ASR_TASK_TIMEOUT_S
     last_log = 0.0
@@ -586,6 +698,8 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
         if status == 2:
             break
         if status == 3:
+            log.error("腾讯云任务失败 task_id=%s msg=%s 耗时=%.1fs",
+                      task_id, data.get('ErrorMsg'), time.time() - t0)
             raise CloudASRError(f"腾讯云转写失败：{data.get('ErrorMsg') or '未知错误'}")
         if time.time() - last_log > 15:
             cb(f"腾讯云转写中（{data.get('StatusStr') or '排队中'}）…")
@@ -607,6 +721,8 @@ def tencent_transcribe(mp3_bytes, config, *, status_callback=None, http=None,
     sentence_info, spk_count = _normalize_sentences(raw_detail, diarization)
     if not text and sentence_info:
         text = "".join(s["text"] for s in sentence_info)
+    log.info("腾讯云转写成功 task_id=%s 字数=%d 说话人=%d 耗时=%.1fs",
+             task_id, len(text), spk_count, time.time() - t0)
     return {"text": text, "sentence_info": sentence_info, "speaker_count": spk_count}
 
 
@@ -628,6 +744,11 @@ def transcribe(provider, wav_path, config, *, status_callback=None,
     diarization = bool(config.get("speaker_diarization", False))
     speaker_count = int(config.get("preset_spk_num", 0) or 0)
     hot_words = config.get("hot_words", "")
+    label = CLOUD_ENGINE_LABELS.get(provider, provider)
+    t_all = time.time()
+    log.info("云端转写开始 provider=%s 文件=%s 分离=%s 热词=%d个",
+             provider, os.path.basename(str(wav_path)), diarization,
+             len(split_hot_words(hot_words)))
 
     if status_callback:
         status_callback("loading", "正在压缩音频为 mp3…")
@@ -682,6 +803,9 @@ def transcribe(provider, wav_path, config, *, status_callback=None,
         if not diarization:
             result["sentence_info"] = []
             result["speaker_count"] = 0
+        log.info("云端转写结束 provider=%s 字数=%d 说话人=%d 总耗时=%.1fs",
+                 provider, len(result.get("text", "")), result.get("speaker_count", 0),
+                 time.time() - t_all)
         return result
 
     finally:

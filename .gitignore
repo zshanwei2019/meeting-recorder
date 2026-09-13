@@ -43,6 +43,7 @@ config.json
 
 # 虚拟环境
 .venv/
+.venv-ci/
 venv/
 env/
 
