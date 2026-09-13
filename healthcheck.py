@@ -316,11 +316,16 @@ def check_disk_and_dirs(data_dir: Path | None = None):
 def run_health_check(config: dict | None = None,
                      ms_base: Path | None = None,
                      hf_base: Path | None = None,
-                     data_dir: Path | None = None) -> dict:
-    """跑全部检查，返回给前端的健康报告。"""
+                     data_dir: Path | None = None,
+                     device_check=None) -> dict:
+    """跑全部检查，返回给前端的健康报告。
+
+    device_check：可注入的音频设备检查函数（测试/无音频硬件的 CI 用），
+    默认用真实的 check_audio_devices；注入函数需返回同构 dict。
+    """
     config = config or {}
     models = check_all_models(ms_base, hf_base)
-    devices = check_audio_devices()
+    devices = (device_check or check_audio_devices)()
     disk = check_disk_and_dirs(data_dir)
 
     checks = []

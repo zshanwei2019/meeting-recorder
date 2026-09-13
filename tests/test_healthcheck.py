@@ -100,7 +100,12 @@ with tempfile.TemporaryDirectory() as td:
     check("configOnly 0字节配置仍=partial", hc.check_model(entry_cfg, ms, hf)["status"] == "partial")
 
     print("=== 3. run_health_check 总判定 ===")
-    rep = hc.run_health_check(config={}, ms_base=ms, hf_base=hf, data_dir=Path(td) / "data")
+    # CI/无头环境无真实音频设备，注入假设备检查，保证总判定只反映模型状态
+    def _fake_devices_ok():
+        return {"status": "ok", "inputs": [], "hasLoopback": True,
+                "loopbackNames": ["fake"], "detail": "注入"}
+    rep = hc.run_health_check(config={}, ms_base=ms, hf_base=hf,
+                              data_dir=Path(td) / "data", device_check=_fake_devices_ok)
     # 临时目录里只有 fsmn 一个核心模型完整，punct 残缺 => 总体不 ok
     check("核心缺失时 ok=False", rep["ok"] is False, str(rep["summary"]))
     check("summary 记录 coreMissing", bad_id in rep["summary"]["coreMissing"], str(rep["summary"]))
@@ -113,7 +118,8 @@ with tempfile.TemporaryDirectory() as td:
     plsnap = hc.modelscope_snapshot(pld, ms)
     plsnap.mkdir(parents=True)
     (plsnap / "model.pt").write_bytes(b"q" * (2 * 1024 * 1024))
-    rep2 = hc.run_health_check(config={}, ms_base=ms, hf_base=hf, data_dir=Path(td) / "data2")
+    rep2 = hc.run_health_check(config={}, ms_base=ms, hf_base=hf,
+                               data_dir=Path(td) / "data2", device_check=_fake_devices_ok)
     check("核心齐全时 ok=True", rep2["ok"] is True, str(rep2["summary"]))
 
 print("=== 4. 环回设备关键词识别 ===")

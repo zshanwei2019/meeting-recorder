@@ -1,0 +1,17 @@
+# CI 精简依赖：仅用于在不安装 torch/funasr/pyannote（约数 GB）的环境跑单测。
+# 重 ASR 依赖在业务代码里全部惰性导入，测试不加载真实模型。
+# 完整运行/打包依赖仍以 requirements.txt 为准。
+numpy>=1.24
+requests>=2.28
+oss2>=2.18
+python-docx>=1.0
+fastapi>=0.100
+uvicorn>=0.20
+websocket-client>=1.0
+pypinyin>=0.50
+rapidfuzz>=3.0
+av>=11.0
+# 健康检查会探测音频设备（sounddevice 缺失会被判 error）；聚类测试走 sklearn
+# 两者都是轻量包（不含 torch/funasr），CI 需要装
+sounddevice>=0.4
+scikit-learn>=1.3

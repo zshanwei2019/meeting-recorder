@@ -511,7 +511,7 @@ try:
                          put_fn=lambda u, **k: FakeResp({}, status_code=403))
     check("OSS PUT 失败报错", False)
 except cloud_asr.CloudASRError as e:
-    check("OSS PUT 失败报错", "OSS 上传失败" in str(e))
+    check("OSS PUT 失败报错（含分类话术与 403）", "OSS 上传" in str(e) and "403" in str(e))
 
 # ── 14. 统一入口 transcribe()：真实 WAV→mp3 + 三家假后端 ────────────────────
 
@@ -560,9 +560,106 @@ mp3, dur = cloud_asr.encode_mp3_for_cloud(wav, str(Path(tmpdir) / "out.mp3"))
 check("PyAV 编码出非空 mp3", os.path.getsize(mp3) > 0)
 check("时长约等于源 WAV（0.5s）", abs(dur - 0.5) < 0.1, dur)
 
-# ── 15. app.py / UI 接线静态校验（不 import 整个重型 app）──────────────────
+# ── 15. HTTP 重试与错误分类 ────────────────────────────────────────────────
 
-print("\n=== 15. 接线静态校验 ===")
+print("\n=== 15. HTTP 重试与错误分类 ===")
+import requests as _requests
+
+# 15a. 5xx 重试到第 3 次成功
+calls5xx = {"n": 0}
+
+
+def fake_flaky(url, **kw):
+    calls5xx["n"] += 1
+    if calls5xx["n"] < 3:
+        return FakeResp({}, status_code=503)
+    return FakeResp({"ok": 1}, status_code=200)
+
+
+cloud_asr._retry_sleep = lambda a: None  # 测试零等待
+r = cloud_asr._http("post", "https://x/y", request_fn=fake_flaky, label="测试接口")
+check("5xx 重试后成功（共调用 3 次）", calls5xx["n"] == 3 and r.status_code == 200)
+
+# 15b. 429 重试，持续限流则报错并归类
+calls429 = {"n": 0}
+
+
+def fake_rate_limited(url, **kw):
+    calls429["n"] += 1
+    return FakeResp({}, status_code=429)
+
+
+try:
+    cloud_asr._http("get", "https://x/z", request_fn=fake_rate_limited, label="火山极速版")
+    check("持续 429 最终报错", False)
+except cloud_asr.CloudASRError as e:
+    check("持续 429 报限流错误", calls429["n"] == 3 and "限流" in str(e) and "火山极速版" in str(e),
+          str(e))
+
+# 15c. 4xx 鉴权错误不重试（立即失败，避免浪费）
+calls4xx = {"n": 0}
+
+
+def fake_auth_fail(url, **kw):
+    calls4xx["n"] += 1
+    return FakeResp({"message": "InvalidApiKey"}, status_code=401)
+
+
+r2 = cloud_asr._http("post", "https://x/a", request_fn=fake_auth_fail, label="阿里")
+check("4xx 不重试直接返回响应（调用 1 次）", calls4xx["n"] == 1 and r2.status_code == 401)
+
+# 15d. 网络异常重试 3 次后转 CloudASRError
+calls_net = {"n": 0}
+
+
+def fake_conn_error(url, **kw):
+    calls_net["n"] += 1
+    raise _requests.ConnectionError("reset by peer")
+
+
+try:
+    cloud_asr._http("post", "https://x/c", request_fn=fake_conn_error, label="COS 上传")
+    check("网络异常重试后报错", False)
+except cloud_asr.CloudASRError as e:
+    check("网络异常重试 3 次并报人话错误",
+          calls_net["n"] == 3 and "网络连接失败" in str(e) and "COS 上传" in str(e), str(e))
+
+# 15e. retry=False 不重试
+calls_once = {"n": 0}
+
+
+def fake_once_500(url, **kw):
+    calls_once["n"] += 1
+    return FakeResp({}, status_code=500)
+
+
+r3 = cloud_asr._http("get", "https://x/d", request_fn=fake_once_500, retry=False)
+check("retry=False 时不重试", calls_once["n"] == 1 and r3.status_code == 500)
+
+# 15f. 注入假函数时完全绕过重试逻辑（既有 mock 路径零影响）
+inject_calls = {"n": 0}
+
+
+def fake_injected(url, **kw):
+    inject_calls["n"] += 1
+    return {"direct": True}
+
+
+out = cloud_asr._http("post", "u", inject={"post": fake_injected})
+check("inject 假函数直返不走 requests/重试", out == {"direct": True} and inject_calls["n"] == 1)
+
+# 15g. 错误分类话术
+check("401→鉴权话术", "鉴权失败" in cloud_asr.classify_http_error(401))
+check("404→URL/资源话术", "404" in cloud_asr.classify_http_error(404))
+check("413→音频过大", "过大" in cloud_asr.classify_http_error(413))
+check("500→服务端不可用", "不可用" in cloud_asr.classify_http_error(500))
+check("400 带上 body.message",
+      "参数错误" in cloud_asr.classify_http_error(400, {"message": "参数错误"}))
+check("label 前缀透传", cloud_asr.classify_http_error(403, label="OSS 上传").startswith("OSS 上传"))
+
+# ── 16. app.py / UI 接线静态校验（不 import 整个重型 app）──────────────────
+
+print("\n=== 16. 接线静态校验 ===")
 root = Path(__file__).resolve().parent.parent
 app_src = (root / "app.py").read_text(encoding="utf-8")
 ui_src = (root / "ui" / "index.html").read_text(encoding="utf-8")
