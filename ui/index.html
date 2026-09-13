@@ -703,6 +703,10 @@ html, body {
           <div class="setting-label">百炼 API Key（DashScope）</div>
           <input class="setting-input" id="aliyunAsrApiKey" type="password" placeholder="sk-..." oninput="saveConfig()">
         </div>
+        <div>
+          <div class="setting-label">热词表 ID（vocabulary_id，可选）</div>
+          <input class="setting-input" id="aliyunVocabularyId" placeholder="在百炼控制台「定制热词」创建后填写" oninput="saveConfig()">
+        </div>
         <div class="setting-label" style="font-size:12px; margin-top:6px;">阿里云音频必须公网可下载，以下 OSS 仅用于临时托管（转写后自动删除）</div>
         <div>
           <div class="setting-label">OSS AccessKey ID</div>
@@ -1154,6 +1158,7 @@ function applyConfig(config) {
   if (config.xfyun_api_key) document.getElementById('xfyunApiKey').value = config.xfyun_api_key;
   const fill = (id, v) => { if (v) document.getElementById(id).value = v; };
   fill('aliyunAsrApiKey', config.aliyun_asr_api_key);
+  fill('aliyunVocabularyId', config.aliyun_vocabulary_id);
   fill('ossAccessKeyId', config.oss_access_key_id);
   fill('ossAccessKeySecret', config.oss_access_key_secret);
   fill('ossBucket', config.oss_bucket);
@@ -1223,6 +1228,7 @@ function saveConfig() {
     xfyun_api_secret: document.getElementById('xfyunApiSecret').value,
     xfyun_api_key: document.getElementById('xfyunApiKey').value,
     aliyun_asr_api_key: document.getElementById('aliyunAsrApiKey').value,
+    aliyun_vocabulary_id: document.getElementById('aliyunVocabularyId').value,
     oss_access_key_id: document.getElementById('ossAccessKeyId').value,
     oss_access_key_secret: document.getElementById('ossAccessKeySecret').value,
     oss_bucket: document.getElementById('ossBucket').value,
@@ -1891,6 +1897,19 @@ function pmEscape(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+// 录音库里存的是引擎内部 key，这里映射成人话；未知/空值给友好兜底
+function engineLabel(key) {
+  const map = {
+    'FunASR': 'FunASR（本地）',
+    'xfyun': '讯飞实时',
+    'Whisper': 'Whisper（本地）',
+    'Qwen3': 'Qwen3-ASR（本地）',
+    'aliyun': '阿里云 Paraformer',
+    'volc': '火山豆包',
+    'tencent': '腾讯云',
+  };
+  return map[key] || (key ? key : '未知引擎');
+}
 function pmFmtTime(ts) {
   if (!ts) return '';
   const d = new Date(ts * (ts > 1e12 ? 1 : 1000));
@@ -1920,7 +1939,7 @@ async function pmLoadRecordings() {
         <div class="pm-item-row">
           <div class="pm-item-main">
             <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
-            <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(r.engine || '未知引擎')}${spk}</div>
+            <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(engineLabel(r.engine))}${spk}</div>
           </div>
           <button class="pm-retrans-btn" title="用当前设置（热词/大模型/说话人分离）重新转写"${busy ? ' disabled' : ''} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${busy ? '重转中…' : '重转'}</button>
         </div>

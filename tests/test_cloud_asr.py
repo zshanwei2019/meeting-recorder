@@ -393,6 +393,21 @@ check("阿里云结果全文", out["text"] == "第一段。第二段。")
 check("阿里云分句说话人", out["speaker_count"] == 2
       and out["sentence_info"][1]["spk"] == 1)
 
+# 热词表 ID（paraformer-v2 只支持 vocabulary_id，不支持请求内直传热词）
+state["n"] = 0
+ali_calls.clear()
+cfg_vocab = dict(cfg_ali, aliyun_vocabulary_id="voc-123")
+cloud_asr.aliyun_transcribe("https://audio/b.mp3", cfg_vocab, http=http_ali)
+vocab_body = ali_calls[0][2]["json"]
+check("热词表 ID 透传到 parameters.vocabulary_id",
+      vocab_body["parameters"].get("vocabulary_id") == "voc-123")
+# 未配置时不应出现该字段
+state["n"] = 0
+ali_calls.clear()
+cloud_asr.aliyun_transcribe("https://audio/c.mp3", cfg_ali, http=http_ali)
+check("未配热词表时不带 vocabulary_id",
+      "vocabulary_id" not in ali_calls[0][2]["json"]["parameters"])
+
 # 任务级失败
 def fake_ali_failed(method, url, **kwargs):
     if method == "post":
@@ -577,6 +592,13 @@ check("UI 凭据随引擎显隐",
       and "getElementById('tencentCredRows')" in ui_src)
 check("UI saveConfig 收集云端凭据",
       "aliyun_asr_api_key" in ui_src and "tencent_secret_id" in ui_src)
+check("UI 含阿里热词表 ID 输入与收集",
+      'id="aliyunVocabularyId"' in ui_src and "aliyun_vocabulary_id" in ui_src)
+check("UI 有引擎中文名映射 engineLabel", "function engineLabel(" in ui_src)
+for kv in ("'aliyun': '阿里云 Paraformer'", "'volc': '火山豆包'",
+          "'tencent': '腾讯云'", "'xfyun': '讯飞实时'"):
+    check(f"UI 引擎映射 {kv.split(':')[0].strip()}", kv in ui_src)
+check("录音库用 engineLabel 显示引擎", "engineLabel(r.engine)" in ui_src)
 
 print(f"\n通过 {passed} 条，失败 {failed} 条")
 sys.exit(1 if failed else 0)

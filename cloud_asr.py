@@ -230,6 +230,10 @@ def aliyun_transcribe(file_url, config, *, status_callback=None, http=None,
     base = "https://dashscope.aliyuncs.com/api/v1"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     parameters = {"language_hints": ["zh", "en"]}
+    # paraformer-v2 文件转写不支持请求内直传热词，只能传百炼控制台热词表 ID
+    vocabulary_id = (config.get("aliyun_vocabulary_id") or "").strip()
+    if vocabulary_id:
+        parameters["vocabulary_id"] = vocabulary_id
     if diarization:
         parameters["diarization_enabled"] = True
         if speaker_count and int(speaker_count) > 0:
