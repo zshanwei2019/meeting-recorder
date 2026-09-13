@@ -3871,7 +3871,11 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
     run_label._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
     run_label.font.bold = True
     run_label.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-    run_value = p_left.add_run(datetime.now().strftime('%Y年%m月%d日 %H:%M'))
+    # 中文字符不能放进 strftime 格式串：Windows strftime 对字面中文走 locale 编码，
+    # 非中文区域（英文系统/GitHub runner）会 UnicodeEncodeError 崩溃。用字段拼接规避。
+    _now = datetime.now()
+    _stamp = f"{_now.year}年{_now.month}月{_now.day}日 {_now.strftime('%H:%M')}"
+    run_value = p_left.add_run(_stamp)
     run_value.font.size = Pt(10)
     run_value.font.name = "宋体"
     run_value._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
