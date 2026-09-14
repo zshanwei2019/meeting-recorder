@@ -4459,6 +4459,13 @@ def _transcribe_file_task(filepath, ws):
         traceback.print_exc()
         state.push_from_thread("log", {"message": f"转写失败: {str(e)}"})
         state.push_from_thread("status", "就绪")
+    finally:
+        # 文件转写（含会后处理重转）的引擎阶段回调可能把“实时转写”徽标/按钮切成
+        # “说话人分离中…”（diarizing）。文件任务结束时必须复位，否则会一直卡在
+        # “说话人分离中…”，连实时转写按钮都残留 active。真正在跑实时转写时不动它。
+        if not getattr(state, "is_realtime", False):
+            state.push_from_thread(
+                "realtime_status", {"status": "stopped", "message": ""})
 
 
 def _realtime_transcribe_task(ws, engine="FunASR"):

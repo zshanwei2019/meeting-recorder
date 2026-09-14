@@ -108,6 +108,37 @@ try:
           getattr(st, "is_transcribing", False) is True)
     st.transcribe_end()
 
+    print("\n=== 6. 文件转写结束必复位实时徽标（修复“说话人分离中…”不消失）===")
+    # 用不加载任何 ASR 的引擎走函数末尾 else 分支，捕获推送，不起线程/不碰音频。
+    _orig_push = st.push_from_thread
+    _orig_config = st.config
+    _orig_rt = st.is_realtime
+    try:
+        events = []
+        st.push_from_thread = lambda et, d=None: events.append((et, d))
+
+        # 6a. 非实时（文件重转/上传）：finally 必推 realtime_status=stopped
+        st.is_realtime = False
+        st.config = {"engine": "xfyun"}  # 讯飞仅支持实时，文件转写走安全 else
+        events.clear()
+        app._transcribe_file_task("dummy.wav", None)
+        rt_events = [d for et, d in events if et == "realtime_status"]
+        check("文件转写推送了 realtime_status", len(rt_events) >= 1, events)
+        check("最后一个 realtime_status 是 stopped（徽标复位）",
+              rt_events and rt_events[-1].get("status") == "stopped", rt_events)
+
+        # 6b. 真正在实时转写时：不能误推 stopped 把实时徽标关掉
+        st.is_realtime = True
+        events.clear()
+        app._transcribe_file_task("dummy.wav", None)
+        rt_events2 = [d for et, d in events if et == "realtime_status"]
+        check("实时转写中不推送 stopped（不干扰实时会话）",
+              all(d.get("status") != "stopped" for d in rt_events2), rt_events2)
+    finally:
+        st.push_from_thread = _orig_push
+        st.config = _orig_config
+        st.is_realtime = _orig_rt
+
 finally:
     # 还原全局状态，避免污染同进程其它测试
     st.is_transcribing = _saved["is_transcribing"]
