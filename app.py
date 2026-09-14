@@ -5011,6 +5011,26 @@ def _build_annotated_transcript(sentence_info, max_chars=None):
     return "\n".join(lines)
 
 
+def _friendly_llm_error(raw: str) -> str:
+    """把 LLM 调用异常文本翻译成用户能看懂的提示（纪要失败时弹给前端，而非只进日志）。"""
+    s = (raw or "").strip()
+    low = s.lower()
+    # HTTP 402：账户余额/额度不足（DeepSeek 实测返回 “API返回402: ... Insufficient Balance”）
+    if "402" in s or "insufficient balance" in low or "余额" in s or "quota" in low:
+        return "AI 纪要生成失败：服务商返回 402，账户余额/额度不足，请充值或更换有额度的 API Key。"
+    # 401/403：Key 无效或无权限
+    if "401" in s or "403" in s or "unauthorized" in low or "invalid api key" in low or "authentication" in low:
+        return "AI 纪要生成失败：API Key 无效或无权限（401/403），请检查设置中的 Key。"
+    # 429：限流
+    if "429" in s or "rate limit" in low or "too many requests" in low:
+        return "AI 纪要生成失败：请求过于频繁被服务商限流（429），请稍后重试。"
+    # 超时/网络
+    if "timeout" in low or "timed out" in low or "connection" in low or "max retries" in low or "网络" in s:
+        return "AI 纪要生成失败：网络连接超时或无法访问服务商，请检查网络后重试。"
+    # 其它：保留原始信息前 160 字
+    return f"AI 纪要生成失败：{s[:160]}" if s else "AI 纪要生成失败：未知错误，请展开日志查看详情。"
+
+
 def _generate_minutes_task(text, domain, ws, sentence_info=None):
     """后台线程：AI生成会议纪要（支持超长会议，分段摘要+汇总）"""
     def push(event_type, data=None):
@@ -5047,7 +5067,9 @@ def _generate_minutes_task(text, domain, ws, sentence_info=None):
     try:
         llm_key = state.config.get("llm_api_key", "")
         if not llm_key:
-            push("log", {"message": "请先在设置中填写AI纪要API Key"})
+            msg = "请先在设置中填写 AI 纪要 API Key"
+            push("log", {"message": msg})
+            push("minutes_error", {"message": msg})
             push("status", "就绪")
             return
 
@@ -5182,7 +5204,9 @@ def _generate_minutes_task(text, domain, ws, sentence_info=None):
                 continue
 
         if not summaries:
+            msg = "所有分段处理失败，无法生成纪要（详见日志）"
             push("log", {"message": "所有分段处理失败，无法生成纪要"})
+            push("minutes_error", {"message": msg})
             push("status", "就绪")
             return
 
@@ -5200,7 +5224,10 @@ def _generate_minutes_task(text, domain, ws, sentence_info=None):
         push("log", {"message": f"AI纪要生成完成（{cfg['name']}，全文{text_len}字分{len(chunks)}段处理）"})
 
     except Exception as e:
-        push("log", {"message": f"AI纪要生成失败: {str(e)}"})
+        raw = str(e)
+        friendly = _friendly_llm_error(raw)
+        push("log", {"message": f"AI纪要生成失败: {raw}"})
+        push("minutes_error", {"message": friendly})
         push("status", "就绪")
 
 

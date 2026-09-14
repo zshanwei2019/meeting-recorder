@@ -578,9 +578,37 @@ html, body {
 }
 .conn-indicator.connected { background: rgba(34,197,94,0.2); color: #22c55e; }
 .conn-indicator.disconnected { background: rgba(239,68,68,0.2); color: #ef4444; }
+
+/* 非阻塞全局提示条（AI 纪要失败等关键反馈） */
+.toast-stack {
+  position: fixed; top: 16px; right: 16px; z-index: 10000;
+  display: flex; flex-direction: column; gap: 10px; max-width: 380px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto; display: flex; align-items: flex-start; gap: 10px;
+  padding: 11px 12px; border-radius: 9px; font-size: 13px; line-height: 1.55;
+  color: #e2e8f0; background: rgba(30,33,46,0.97);
+  border: 1px solid rgba(148,163,184,0.25); border-left: 4px solid #818cf8;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+  opacity: 0; transform: translateX(14px);
+  transition: opacity .2s ease, transform .2s ease;
+}
+.toast.show { opacity: 1; transform: translateX(0); }
+.toast.hide { opacity: 0; transform: translateX(14px); }
+.toast-err { border-left-color: #f87171; background: rgba(54,26,30,0.98); }
+.toast-ok { border-left-color: #4ade80; background: rgba(24,44,33,0.98); }
+.toast-msg { flex: 1; min-width: 0; word-break: break-word; white-space: pre-wrap; }
+.toast-x {
+  flex: none; border: none; background: transparent; color: #94a3b8;
+  font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.toast-x:hover { color: #f1f5f9; }
 </style>
 </head>
 <body>
+<!-- 非阻塞全局提示条（纪要失败等关键错误，避免只写进收起的日志面板） -->
+<div id="toastStack" class="toast-stack"></div>
 <div class="app">
   <!-- Sidebar -->
   <div class="sidebar">
@@ -1084,6 +1112,11 @@ function handleEvent(ev) {
       updateWordCount();
       appendLog('AI纪要生成完成');
       break;
+    case 'minutes_error':
+      // 纪要失败（缺 Key / 402 余额不足 / 401 / 网络）明确弹红条，不再静默进日志
+      showToast((ev.data && ev.data.message) || 'AI 纪要生成失败', 'err');
+      appendLog((ev.data && ev.data.message) || 'AI 纪要生成失败');
+      break;
     case 'monitor_status':
       onMonitorStatus(ev.data);
       break;
@@ -1435,6 +1468,32 @@ function appendLog(msg) {
   el.innerHTML += '<div>['+ts+'] '+msg+'</div>';
   el.scrollTop = el.scrollHeight;
   document.getElementById('logPreview').textContent = msg;
+}
+
+// 非阻塞全局提示条（type: 'err' 红 / 'ok' 绿 / '' 中性）；默认 8s 自动消失，可点 × 关
+function showToast(message, type, ttlMs) {
+  const stack = document.getElementById('toastStack');
+  if (!stack) { appendLog(message); return; }
+  const t = document.createElement('div');
+  t.className = 'toast' + (type === 'err' ? ' toast-err' : type === 'ok' ? ' toast-ok' : '');
+  const body = document.createElement('span');
+  body.className = 'toast-msg';
+  body.textContent = message;
+  const close = document.createElement('button');
+  close.className = 'toast-x';
+  close.textContent = '×';
+  close.title = '关闭';
+  const dismiss = () => {
+    t.classList.add('hide');
+    setTimeout(() => t.remove(), 220);
+  };
+  close.onclick = dismiss;
+  t.appendChild(body);
+  t.appendChild(close);
+  stack.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  const ttl = typeof ttlMs === 'number' ? ttlMs : (type === 'err' ? 12000 : 8000);
+  setTimeout(dismiss, ttl);
 }
 
 function updateStatus(status) {
