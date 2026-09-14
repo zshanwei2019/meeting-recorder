@@ -1152,6 +1152,10 @@ function handleEvent(ev) {
       showToast((ev.data && ev.data.message) || 'AI 纪要生成失败', 'err');
       appendLog((ev.data && ev.data.message) || 'AI 纪要生成失败');
       break;
+    case 'model_preload':
+      // 启动后台预加载（=首次约 2.9GB 下载）状态：下载中走状态栏，失败必弹红条
+      onModelPreload(ev.data);
+      break;
     case 'monitor_status':
       onMonitorStatus(ev.data);
       break;
@@ -1525,6 +1529,36 @@ function showToast(message, type, ttlMs) {
   requestAnimationFrame(() => t.classList.add('show'));
   const ttl = typeof ttlMs === 'number' ? ttlMs : (type === 'err' ? 12000 : 8000);
   setTimeout(dismiss, ttl);
+}
+
+// 启动后台预加载（首次约 2.9GB 下载）状态处理。
+// loading：顶部状态栏持续提示“下载模型中”，不弹 toast（下载会持续很久）；
+// error：弹一次红条（同一条错误不重复弹），并记入日志；ready：复位状态栏。
+let _mpLastStatus = null;
+let _mpErrShown = '';
+function onModelPreload(data) {
+  data = data || {};
+  const st = data.status;
+  const msg = data.message || '';
+  if (st === 'loading') {
+    _mpLastStatus = 'loading';
+    updateStatus(msg || '正在准备语音模型（首次需下载）…');
+    appendLog(msg || '正在后台准备语音模型…');
+  } else if (st === 'error') {
+    _mpLastStatus = 'error';
+    const full = msg || '语音模型加载/下载失败，请保持网络畅通后重启重试';
+    updateStatus('语音模型未就绪');
+    appendLog(full);
+    // 同一条错误只弹一次，避免重连/补发时重复红条
+    if (_mpErrShown !== full) {
+      _mpErrShown = full;
+      showToast(full + '（可点“环境自检”查看模型状态）', 'err', 20000);
+    }
+  } else if (st === 'ready') {
+    if (_mpLastStatus === 'loading') appendLog('语音模型准备完成');
+    _mpLastStatus = 'ready';
+    updateStatus('就绪');
+  }
 }
 
 function updateStatus(status) {

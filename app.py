@@ -2992,6 +2992,13 @@ class AppState:
         # /api/transcribe/cancel 置位，透传到 cloud_asr 轮询循环让其尽快停下。
         self.cloud_cancel_event = None
         self.cloud_task_engine = None   # 当前云端任务引擎（用于提示可否真正取消）
+        # 启动后台预加载语音模型（=首次约 2.9GB 下载）的持久化状态。
+        # 旧版预加载线程不传回调，下载失败只 print 到不存在的控制台→用户毫无感知。
+        # 持久化后：后台线程实时推事件，且 UI 晚于预加载启动（WS 后连上）也能在
+        # 连接时补发到当前状态（下载中/失败原因）。status: idle/loading/error/ready。
+        self.model_preload = {
+            "status": "idle", "message": "", "started": None, "finished": None,
+        }
         self.recording_start = None
         self.transcript_text = ""
         self.sentence_info = []     # 说话人分离结果
@@ -3065,6 +3072,35 @@ class AppState:
         self.transcribing_wav = None
         self.transcribing_start = None
         self.transcribing_stage = ""
+
+    # ── 启动模型预加载（首次下载）状态：持久化 + 实时推送，失败必达界面 ──
+    def _set_preload(self, status, message=""):
+        self.model_preload["status"] = status
+        if message:
+            self.model_preload["message"] = message
+        if status == "loading" and self.model_preload.get("started") is None:
+            self.model_preload["started"] = time.time()
+        if status in ("error", "ready"):
+            self.model_preload["finished"] = time.time()
+
+    def preload_event(self):
+        """供 WS 连接时补发的当前预加载状态快照。"""
+        return dict(self.model_preload)
+
+    def preload_callback(self, status, msg):
+        """传给 load_file_model 的状态回调：映射引擎 loading/ready/error，
+        既实时推 WS，又写入持久状态供晚连接的 UI 补发。"""
+        msg = (msg or "").strip()
+        if status in ("loading", "recording"):
+            self._set_preload("loading", msg or "正在加载/下载语音模型…")
+        elif status == "ready":
+            self._set_preload("ready", msg or "语音模型就绪")
+        elif status in ("error", "stopped"):
+            raw = msg or "语音模型加载/下载失败，请保持网络畅通后重启重试"
+            self._set_preload("error", _friendly_model_error(raw))
+        else:
+            return
+        self.push_from_thread("model_preload", self.preload_event())
 
 state = AppState()
 
@@ -3406,6 +3442,11 @@ def create_app():
             await state.push_event_sync(ws, "recording_changed", {"is_recording": True})
         if state.is_realtime:
             await state.push_event_sync(ws, "realtime_status", {"status": "recording", "message": "实时转写中"})
+        # 补发启动模型预加载状态：预加载在本 WS 连接前就开始，若正在下载/曾失败，
+        # 不补发的话 UI 会错过事件（旧版首次下载失败正是因此毫无提示）。
+        _pl = state.preload_event()
+        if _pl.get("status") in ("loading", "error"):
+            await state.push_event_sync(ws, "model_preload", _pl)
         await state.push_event_sync(ws, "status", "就绪")
         try:
             while True:
@@ -5094,6 +5135,36 @@ def _friendly_llm_error(raw: str) -> str:
     return f"AI 纪要生成失败：{s[:160]}" if s else "AI 纪要生成失败：未知错误，请展开日志查看详情。"
 
 
+def _friendly_model_error(raw: str) -> str:
+    """把语音模型首次下载/加载异常翻译成用户能看懂的提示。
+
+    首次需从 ModelScope 下约 2.9GB，常见是断网/超时/代理/磁盘不足；原始异常多为
+    英文堆栈。函数幂等：传入已是含中文的人话时直接放行，不重复加前缀。
+    CJK 检测用 ord() 区间，不依赖正则 \\u 转义。
+    """
+    s = (raw or "").strip()
+    if any(0x4E00 <= ord(ch) <= 0x9FFF for ch in s):
+        return s
+    low = s.lower()
+
+    def _has(*tokens):
+        return any(t in low for t in tokens)
+
+    if _has("timeout", "timed out"):
+        return "语音模型下载超时：网络较慢或连接不稳定，请保持网络畅通后重启程序重试。"
+    if _has("connection", "max retries", "network is unreachable",
+            "failed to resolve", "getaddrinfo", "connection aborted",
+            "connection reset", "errno 101", "errno 110",
+            "errno 10054", "errno 10060", "errno 10061"):
+        return "语音模型下载失败：无法连接模型服务器（断网/代理/防火墙），请检查网络后重启程序重试。"
+    if _has("no space", "disk", "errno 28"):
+        return "语音模型下载失败：磁盘空间不足，首次约需 2.9GB，请清理后重启程序重试。"
+    if _has("permission", "access is denied", "errno 13"):
+        return "语音模型下载失败：没有写入权限，请检查用户目录权限后重试。"
+    if s:
+        return f"语音模型下载/加载失败：{s[:140]}"
+    return "语音模型下载/加载失败，请保持网络畅通后重启程序重试（可点“环境自检”查看详情）。"
+
 def _generate_minutes_task(text, domain, ws, sentence_info=None):
     """后台线程：AI生成会议纪要（支持超长会议，分段摘要+汇总）"""
     def push(event_type, data=None):
@@ -5452,12 +5523,21 @@ def _main_inner(log_error):
 
     # Pre-load FunASR model in background (saves 60+ seconds on first use)
     print("预加载语音模型...")
-    threading.Thread(
-        target=lambda: state.funasr.load_file_model(
-            _resolve_file_model(state.config.get("funasr_model"))
-        ),
-        daemon=True,
-    ).start()
+    def _startup_preload():
+        # 首次运行这一步会从 ModelScope 下载约 2.9GB。旧版不传回调，
+        # 下载失败只 print 到打包后不存在的控制台→用户毫无感知（README 已知坑）。
+        # 现持久化状态 + 推 model_preload 事件，WS 晚连接时也会在连接时补发。
+        state.preload_callback("loading", "正在后台准备语音模型（首次需联网下载约 2.9GB）…")
+        try:
+            ok = state.funasr.load_file_model(
+                _resolve_file_model(state.config.get("funasr_model")),
+                status_callback=state.preload_callback,
+            )
+            if not ok and state.model_preload.get("status") != "error":
+                state.preload_callback("error", "语音模型加载失败，请保持网络畅通后重启程序重试")
+        except Exception as _e:
+            state.preload_callback("error", f"语音模型加载/下载失败：{_e}")
+    threading.Thread(target=_startup_preload, daemon=True).start()
 
     # Open Edge browser
     url = f"http://127.0.0.1:{port}/"
