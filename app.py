@@ -2983,6 +2983,11 @@ class AppState:
         self.is_recording = False
         self.is_realtime = False
         self.is_transcribing = False  # 文件转写忙标志（上传转写互斥用）
+        # 文件转写（含会后处理重转）的权威状态，供 /api/transcribe/status 轮询对账。
+        # 前端不再靠本地短定时器猜状态——说话人分离可能跑十几分钟，短定时器会误复位。
+        self.transcribing_wav = None    # 正在转写的文件名（basename），无任务时 None
+        self.transcribing_start = None  # time.time() 起点，用于已用时长
+        self.transcribing_stage = ""    # 人类可读阶段，如“说话人分离中…”
         # 云端文件转写取消信号：每个云端任务启动时新建一个 threading.Event，
         # /api/transcribe/cancel 置位，透传到 cloud_asr 轮询循环让其尽快停下。
         self.cloud_cancel_event = None
@@ -3041,6 +3046,25 @@ class AppState:
             asyncio.run_coroutine_threadsafe(ws.send_json(event), loop)
         except Exception as e:
             print(f"[WARN] push_from_thread error: {e}")
+
+    def transcribe_begin(self, wav_name, stage="转写中…"):
+        """标记一个文件转写任务开始（服务端权威状态）。"""
+        self.is_transcribing = True
+        self.transcribing_wav = wav_name
+        self.transcribing_start = time.time()
+        self.transcribing_stage = stage
+
+    def transcribe_set_stage(self, stage):
+        """更新当前转写阶段（如“说话人分离中…”），仅在有任务时生效。"""
+        if self.is_transcribing and stage:
+            self.transcribing_stage = stage
+
+    def transcribe_end(self):
+        """任务结束（成功/失败/取消），清空权威转写状态。"""
+        self.is_transcribing = False
+        self.transcribing_wav = None
+        self.transcribing_start = None
+        self.transcribing_stage = ""
 
 state = AppState()
 
@@ -3261,6 +3285,7 @@ def create_app():
         def _prepare_and_run():
             try:
                 state.push_from_thread("status", "正在处理文件")
+                state.transcribe_set_stage("转码音频中…")
                 state.push_from_thread("log", {"message": f"已接收文件 {safe_name}（{len(body)/1048576:.1f}MB），正在转码为 16k 单声道…"})
                 if ext != ".wav":
                     _transcode_to_wav16k(src_path, wav_path)
@@ -3273,7 +3298,7 @@ def create_app():
                         target = wav_path
                     except Exception:
                         target = src_path
-                state.is_transcribing = True
+                state.transcribe_set_stage("转写中…")
                 _transcribe_file_task(str(target), None)
             except Exception as e:
                 import traceback as _tb
@@ -3282,9 +3307,9 @@ def create_app():
                 state.push_from_thread("log", {"message": f"文件处理失败：{e}"})
                 state.push_from_thread("status", "就绪")
             finally:
-                state.is_transcribing = False
+                state.transcribe_end()
 
-        state.is_transcribing = True
+        state.transcribe_begin(safe_name, "接收并转码音频中…")
         threading.Thread(target=_prepare_and_run, daemon=True).start()
         return JSONResponse({"ok": True, "filename": safe_name, "sizeBytes": len(body)})
 
@@ -3295,6 +3320,20 @@ def create_app():
             return JSONResponse(list_recordings())
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # 文件转写（含会后处理重转）权威状态：前端面板轮询对账，不靠本地短定时器猜
+    @app.get("/api/transcribe/status")
+    async def api_transcribe_status():
+        active = bool(getattr(state, "is_transcribing", False))
+        elapsed = 0
+        if active and getattr(state, "transcribing_start", None):
+            elapsed = max(0, int(time.time() - state.transcribing_start))
+        return JSONResponse({
+            "active": active,
+            "wav_name": getattr(state, "transcribing_wav", None) if active else None,
+            "stage": (getattr(state, "transcribing_stage", "") or "转写中…") if active else "",
+            "elapsed_s": elapsed,
+        })
 
     @app.get("/api/recordings/{name}/meta")
     async def api_recording_meta(name: str):
@@ -3658,7 +3697,7 @@ def create_app():
                         ws, "postmeeting_error",
                         {"message": f"找不到录音文件：{wav_name}"})
                 else:
-                    state.is_transcribing = True
+                    state.transcribe_begin(wav_name, "排队开始转写…")
                     _target = str(rec_path)
 
                     def _run_retranscribe():
@@ -3674,7 +3713,7 @@ def create_app():
                             state.push_from_thread("log", {"message": f"重转失败：{e}"})
                             state.push_from_thread("status", "就绪")
                         finally:
-                            state.is_transcribing = False
+                            state.transcribe_end()
 
                     threading.Thread(target=_run_retranscribe, daemon=True).start()
                     await state.push_event_sync(
@@ -4192,13 +4231,30 @@ def _save_transcript_docx(filepath, text, sentence_info=None, speaker_count=0, r
     doc.save(filepath)
 
 
+def _file_asr_status_cb(status, msg):
+    """本地文件转写引擎阶段回调：推 realtime_status，并同步服务端权威阶段。
+
+    前端会后处理面板轮询 /api/transcribe/status 读这个阶段，分离跑十几分钟也能
+    持续显示“说话人分离中”，而不是靠本地短定时器瞎猜导致按钮回弹。
+    """
+    state.push_from_thread("realtime_status", {"status": status, "message": msg})
+    stage = (msg or "").strip()
+    if not stage:
+        stage = {
+            "loading": "加载模型中…",
+            "diarizing": "说话人分离中…",
+            "transcribing": "转写中…",
+            "recording": "转写中…",
+        }.get(status, "转写中…")
+    state.transcribe_set_stage(stage)
+
+
 def _transcribe_file_task(filepath, ws):
     """后台线程：转写录音文件"""
     try:
         engine = state.config.get("engine", "FunASR")
         if engine == "Whisper":
-            def status_cb(status, msg):
-                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+            status_cb = _file_asr_status_cb
 
             whisper_model = state.config.get("whisper_model", WHISPER_DEFAULT_MODEL)
             state.push_from_thread("log", {"message": f"使用 Whisper {whisper_model} 转写..."})
@@ -4220,8 +4276,7 @@ def _transcribe_file_task(filepath, ws):
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": "Whisper 转写失败"})
         elif engine == "Qwen3":
-            def status_cb(status, msg):
-                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+            status_cb = _file_asr_status_cb
 
             qwen3_model = state.config.get("qwen3_model", QWEN3_DEFAULT_MODEL)
             state.push_from_thread("log", {"message": f"使用 Qwen3-ASR {qwen3_model.split('/')[-1]} 转写..."})
@@ -4243,8 +4298,7 @@ def _transcribe_file_task(filepath, ws):
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": "Qwen3-ASR 转写失败"})
         elif engine == "FunASR":
-            def status_cb(status, msg):
-                state.push_from_thread("realtime_status", {"status": status, "message": msg})
+            status_cb = _file_asr_status_cb
 
             speaker_diary = state.config.get("speaker_diarization", False)
             preset_spk = state.config.get("preset_spk_num", 0) or None
@@ -4331,6 +4385,8 @@ def _transcribe_file_task(filepath, ws):
 
             def status_cb(status, msg):
                 state.push_from_thread("realtime_status", {"status": status, "message": msg})
+                if (msg or "").strip():
+                    state.transcribe_set_stage(msg.strip())
 
             # 每个云端任务一个取消事件；/api/transcribe/cancel 置位后轮询尽快退出。
             cancel_event = threading.Event()

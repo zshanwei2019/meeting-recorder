@@ -547,6 +547,31 @@ html, body {
 }
 .pm-retrans-btn:hover { background: rgba(99,102,241,0.28); color: #e0e7ff; }
 .pm-retrans-btn:disabled { opacity: 0.5; cursor: default; }
+/* 重转进行中：脉冲高亮 + 转圈，状态由服务端 /api/transcribe/status 轮询驱动 */
+.pm-retrans-btn.busy {
+  opacity: 1; cursor: default; color: #c7d2fe;
+  background: rgba(99,102,241,0.22); border-color: rgba(129,140,248,0.7);
+  animation: pm-btn-pulse 1.6s ease-in-out infinite;
+}
+.pm-spin { display: inline-block; animation: pm-spin-rotate 1s linear infinite; }
+@keyframes pm-spin-rotate { to { transform: rotate(360deg); } }
+@keyframes pm-btn-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.0);} 50% { box-shadow: 0 0 0 3px rgba(99,102,241,0.18);} }
+/* 会后处理面板顶部的“正在转写”醒目横幅 */
+.pm-transcribe-banner {
+  display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
+  padding: 8px 12px; border-radius: 8px; font-size: 12.5px; line-height: 1.5;
+  color: #c7d2fe; background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(129,140,248,0.45); border-left: 3px solid #818cf8;
+}
+.pm-transcribe-banner .pm-tb-dot {
+  flex: none; width: 9px; height: 9px; border-radius: 50%; background: #818cf8;
+  animation: pm-dot-blink 1.2s ease-in-out infinite;
+}
+.pm-transcribe-banner .pm-tb-main { flex: 1; min-width: 0; }
+.pm-transcribe-banner .pm-tb-stage { color: #e0e7ff; font-weight: 600; }
+.pm-transcribe-banner .pm-tb-meta { color: #a5b4fc; font-size: 11.5px; word-break: break-all; }
+.pm-transcribe-banner .pm-tb-time { flex: none; font-variant-numeric: tabular-nums; color: #a5b4fc; font-size: 12px; }
+@keyframes pm-dot-blink { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .35; transform: scale(.75);} }
 .pm-textarea {
   width: 100%; min-height: 120px; resize: vertical;
   background: #1c1f2e; border: 1px solid rgba(148,163,184,0.12);
@@ -874,6 +899,16 @@ html, body {
     </div>
     <div class="pm-body">
 
+      <!-- 正在转写/重转状态横幅（由服务端权威状态轮询驱动） -->
+      <div class="pm-transcribe-banner" id="pmTranscribeBanner" style="display:none;">
+        <span class="pm-tb-dot"></span>
+        <span class="pm-tb-main">
+          <span class="pm-tb-stage" id="pmTbStage">转写中…</span>
+          <div class="pm-tb-meta" id="pmTbMeta"></div>
+        </span>
+        <span class="pm-tb-time" id="pmTbTime">00:00</span>
+      </div>
+
       <!-- 历史录音 -->
       <div class="pm-section">
         <div class="pm-section-title">历史录音
@@ -1116,12 +1151,8 @@ function handleEvent(ev) {
     case 'postmeeting_error':
       pmSetVpStatus((ev.data && ev.data.message) || '会后处理出错', 'err');
       appendLog('会后处理：' + ((ev.data && ev.data.message) || '未知错误'));
-      // 重转失败：复位“重转中”按钮并刷新列表
-      if (pmRetranscribing.size) {
-        pmRetranscribing.clear();
-        const _ovErr = document.getElementById('pmOverlay');
-        if (_ovErr && _ovErr.classList.contains('visible')) pmLoadRecordings();
-      }
+      // 重转失败时后端会清权威状态；立即拉一次让横幅/按钮同步
+      if (pmActiveTranscribe) pmPollTranscribeStatus();
       break;
   }
 }
@@ -1615,13 +1646,12 @@ function onTranscriptReady(data) {
     appendLog('转写完成');
   }
 
-  // 重转/转写完成后，若会后处理面板开着，自动刷新录音库列表（更新“未转写”/引擎/说话人数）
+  // 转写完成后，若会后处理面板开着，刷新录音库列表（更新“未转写”/引擎/说话人数）
+  // 忙状态由服务端轮询对账清除，不再用本地 set/定时器。
   const _pmOv = document.getElementById('pmOverlay');
   if (_pmOv && _pmOv.classList.contains('visible')) {
-    pmRetranscribing.clear();
+    pmPollTranscribeStatus();
     pmLoadRecordings();
-  } else {
-    pmRetranscribing.clear();
   }
 }
 
@@ -1677,15 +1707,88 @@ let pmRecordings = [];        // /api/recordings 列表缓存
 let pmCurrentId = null;       // 当前在面板中打开的录音 id
 let pmCurrentMeta = null;     // 当前录音详情（含 text/sentence_info/speaker_labels）
 let pmLastWavName = null;     // 最近一次转写完成的 wav_name（用于自动选中）
-let pmRetranscribing = new Set();  // 正在重转的 wav_name（按钮显示“重转中”）
+// 正在转写/重转的权威状态：来自 /api/transcribe/status 轮询（active/wav_name/stage/elapsed_s）。
+// 不再用本地 180s 定时器猜——说话人分离可能跑十几分钟，定时器会误把按钮复位。
+let pmActiveTranscribe = null;
+let pmPollTimer = null;
 
 function openPostMeeting() {
   document.getElementById('pmOverlay').classList.add('visible');
   pmLoadRecordings();
   pmRefreshVoiceprints();
+  pmPollTranscribeStatus();   // 立即拉一次，随后每 2s 对账
+  pmEnsurePolling();
 }
 function closePostMeeting() {
   document.getElementById('pmOverlay').classList.remove('visible');
+  pmStopPolling();
+}
+
+function pmEnsurePolling() {
+  if (pmPollTimer == null) pmPollTimer = setInterval(pmPollTranscribeStatus, 2000);
+}
+function pmStopPolling() {
+  if (pmPollTimer != null) { clearInterval(pmPollTimer); pmPollTimer = null; }
+}
+
+// 轮询服务端权威转写状态（仅在面板打开时有意义）
+async function pmPollTranscribeStatus() {
+  const ov = document.getElementById('pmOverlay');
+  if (!ov || !ov.classList.contains('visible')) { pmStopPolling(); return; }
+  try {
+    const resp = await fetch('/api/transcribe/status');
+    if (!resp.ok) return;
+    const st = await resp.json();
+    pmApplyTranscribeStatus(st);
+  } catch (e) { /* 瞬时网络问题忽略，下轮再拉 */ }
+}
+
+function pmClock(s) {
+  s = Math.max(0, parseInt(s || 0, 10));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = m.toString().padStart(2, '0'), ss = sec.toString().padStart(2, '0');
+  return h > 0 ? `${h.toString().padStart(2,'0')}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function pmRenderTranscribeBanner() {
+  const b = document.getElementById('pmTranscribeBanner');
+  if (!b) return;
+  if (!pmActiveTranscribe) { b.style.display = 'none'; return; }
+  b.style.display = 'flex';
+  document.getElementById('pmTbStage').textContent = pmActiveTranscribe.stage || '转写中…';
+  document.getElementById('pmTbMeta').textContent = pmActiveTranscribe.wav_name || '';
+  document.getElementById('pmTbTime').textContent = pmClock(pmActiveTranscribe.elapsed_s);
+}
+
+// 仅按权威状态更新按钮外观，不整表重绘（避免打断面板滚动/选中）。
+// 已是目标态的按钮跳过 DOM 写入，防止每 2s 轮询让转圈动画反复回弹闪烁。
+function pmRefreshBusyButtons() {
+  const busyWav = pmActiveTranscribe ? pmActiveTranscribe.wav_name : null;
+  document.querySelectorAll('#pmRecordingList .pm-retrans-btn').forEach(btn => {
+    const w = btn.getAttribute('data-wav');
+    const shouldBusy = !!(busyWav && w === busyWav);
+    const isBusy = btn.classList.contains('busy');
+    if (shouldBusy && isBusy) return;  // 已在忙态，不动 DOM（转圈不被打断）
+    if (shouldBusy) {
+      btn.disabled = true;
+      btn.classList.add('busy');
+      btn.innerHTML = '<span class="pm-spin">⟳</span>&nbsp;重转中';
+    } else if (isBusy || btn.disabled) {
+      btn.disabled = false;
+      btn.classList.remove('busy');
+      btn.textContent = '重转';
+    }
+  });
+}
+
+function pmApplyTranscribeStatus(st) {
+  const wasActive = !!pmActiveTranscribe;
+  const nowActive = !!(st && st.active);
+  pmActiveTranscribe = nowActive ? st : null;
+  pmRenderTranscribeBanner();
+  pmRefreshBusyButtons();
+  // 忙→闲 或 闲→忙 的跳变才整表刷新一次（拿新转写/把新行置忙）；轮询中途不刷
+  if (wasActive !== nowActive) pmLoadRecordings();
 }
 
 // ══════════════════════════════════════════
@@ -1965,14 +2068,17 @@ async function pmLoadRecordings() {
     listEl.innerHTML = pmRecordings.map(r => {
       const spk = r.speaker_count > 0 ? ` · ${r.speaker_count}位说话人` : '';
       const done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
-      const busy = pmRetranscribing.has(r.wav_name);
+      const busy = pmActiveTranscribe && pmActiveTranscribe.wav_name === r.wav_name;
+      const busyAttr = busy ? ' disabled' : '';
+      const busyCls = busy ? ' busy' : '';
+      const busyLabel = busy ? '<span class="pm-spin">⟳</span>&nbsp;重转中' : '重转';
       return `<div class="pm-item" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
         <div class="pm-item-row">
           <div class="pm-item-main">
             <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
             <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(engineLabel(r.engine))}${spk}</div>
           </div>
-          <button class="pm-retrans-btn" title="用当前设置（热词/大模型/说话人分离）重新转写"${busy ? ' disabled' : ''} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${busy ? '重转中…' : '重转'}</button>
+          <button class="pm-retrans-btn${busyCls}" data-wav="${pmEscape(r.wav_name)}" title="用当前设置（热词/大模型/说话人分离）重新转写"${busyAttr} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${busyLabel}</button>
         </div>
       </div>`;
     }).join('');
@@ -1990,19 +2096,13 @@ async function pmLoadRecordings() {
 
 // 录音库「高质量重转」：用当前设置（热词/大模型/说话人分离）对已有录音重跑
 function pmRetranscribe(wavName, btn) {
-  if (pmRetranscribing.has(wavName)) return;
-  pmRetranscribing.add(wavName);
-  if (btn) { btn.disabled = true; btn.textContent = '重转中…'; }
-  appendLog('已提交高质量重转：' + wavName + '（约需数十秒，完成后列表自动刷新）');
-  // 完成（transcript_ready）或失败（postmeeting_error）时清状态并刷新列表
+  // 以服务端权威状态为准，避免重复提交；本地乐观置忙，下一轮轮询会被服务端状态纠正
+  if (pmActiveTranscribe) { appendLog('当前已有转写任务在进行：' + (pmActiveTranscribe.wav_name || '')); return; }
+  appendLog('已提交高质量重转：' + wavName + '（说话人分离可能需要数分钟到十几分钟，状态见面板顶部）');
   sendAction('pm_retranscribe', { wav_name: wavName });
-  // 安全兏底：3 分钟后无论如何复位按钮，避免异常时永久卡住
-  setTimeout(() => {
-    if (pmRetranscribing.delete(wavName)) {
-      const ov = document.getElementById('pmOverlay');
-      if (ov && ov.classList.contains('visible')) pmLoadRecordings();
-    }
-  }, 180000);
+  // 乐观更新：立刻让该行进入忙态；2s 轮询会从服务端拿到真正的 stage/elapsed
+  pmApplyTranscribeStatus({ active: true, wav_name: wavName, stage: '排队开始转写…', elapsed_s: 0 });
+  pmEnsurePolling();
 }
 
 async function pmSelectRecording(id) {
