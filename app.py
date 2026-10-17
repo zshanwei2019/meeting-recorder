@@ -2613,16 +2613,113 @@ class WhisperTranscriber:
 
 
 # ─── Qwen3-ASR 文件转写（transformers）───
+def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
+    """纯逻辑：根据能力与环境变量决定 (device, dtype_tag)，不依赖 torch。
+
+    返回 device ∈ {xpu, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
+    抽成无 torch 依赖的纯函数，便于在不装重依赖的 CI 里覆盖全部分支。
+
+    选择规则（2026-10-17 本机实测）：
+    - Intel Arc XPU（xpu 版 torch>=2.14.1 可用，2.9.1 会在 LLM 算子回退卡死）：fp16；
+    - 否则 CPU bfloat16（比旧 fp32 快约 35 倍），老 CPU 不支持 bf16 时回退 fp32。
+    环境变量：QWEN3_ASR_DEVICE=xpu|cpu 强制设备；QWEN3_ASR_DTYPE=fp32 强制旧路径。
+    """
+    env = os.environ if env is None else env
+    forced = str(env.get("QWEN3_ASR_DEVICE", "")).strip().lower()
+    if str(env.get("QWEN3_ASR_DTYPE", "")).strip().lower() == "fp32":
+        return "cpu", "fp32"
+    if forced == "xpu":
+        return "xpu", "fp16"
+    if forced != "cpu" and has_xpu:
+        return "xpu", "fp16"
+    return "cpu", ("bf16" if cpu_bf16_ok else "fp32")
+
+
+def _select_qwen3_device():
+    """读取 torch 实际能力并返回 (device, torch_dtype)。仅在加载模型时惰性调用。"""
+    import torch
+    has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    cpu_bf16_ok = _cpu_bf16_supported(torch)
+    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok)
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+             "fp32": torch.float32}[tag]
+    return dev, dtype
+
+
+_CPU_BF16_OK = None
+
+
+def _cpu_bf16_supported(torch_mod):
+    """探测本机 CPU 能否正确跑 bfloat16（不支持的老 CPU 回退 fp32）。"""
+    global _CPU_BF16_OK
+    if _CPU_BF16_OK is not None:
+        return _CPU_BF16_OK
+    try:
+        a = torch_mod.randn(8, 8, dtype=torch_mod.bfloat16)
+        b = torch_mod.randn(8, 8, dtype=torch_mod.bfloat16)
+        _ = (a @ b).sum().item()
+        _CPU_BF16_OK = True
+    except Exception:
+        _CPU_BF16_OK = False
+    return _CPU_BF16_OK
+
+
+def _load_audio_for_qwen3(filepath):
+    """把任意输入音视频解码成 16 kHz 单声道 float32 波形。
+
+    不依赖 torchcodec（该环境的 libtorchcodec 常因 FFmpeg full-shared DLL
+    缺失而加载失败）：先试 soundfile 直读（wav 等），失败则用 ffmpeg 转成
+    临时 16k 单声道 wav 再读。CJK 路径安全（全程 Python 调用，不经 PS 字符串）。
+    """
+    import numpy as np
+    try:
+        import soundfile as sf
+        wav, sr = sf.read(str(filepath), dtype="float32", always_2d=False)
+        if getattr(wav, "ndim", 1) > 1:
+            wav = wav.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            wav = librosa.resample(wav.astype("float32"), orig_sr=sr, target_sr=16000)
+            sr = 16000
+        return wav.astype("float32"), sr
+    except Exception:
+        pass
+    # 非 wav（mp3/m4a/视频等）或 soundfile 无法解码：走 ffmpeg
+    import tempfile
+    import subprocess
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="qwen3asr_")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(filepath),
+             "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp],
+            check=True,
+        )
+        import soundfile as sf
+        wav, sr = sf.read(tmp, dtype="float32", always_2d=False)
+        if getattr(wav, "ndim", 1) > 1:
+            wav = wav.mean(axis=1)
+        return wav.astype("float32"), sr
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 class Qwen3ASRTranscriber:
     """Qwen3-ASR 后端，支持 52 语种自动检测，适合中英混合文件转写。
 
-    只做文件转写，不做实时流式。transformers 原生加载，CPU fp32 运行。
-    模型在无 CUDA 时自动退到 CPU。
+    只做文件转写，不做实时流式。transformers 原生加载。
+    设备/精度自动选择：Arc XPU -> fp16；否则 CPU bfloat16（比旧 fp32 快约 35 倍）；
+    可用 QWEN3_ASR_DEVICE / QWEN3_ASR_DTYPE 环境变量覆盖。详见 _select_qwen3_device。
     """
     def __init__(self):
         self._model = None
         self._processor = None
         self._model_name = None
+        self._device = None
+        self._dtype = None
         self._lock = threading.Lock()
 
     def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None):
@@ -2634,18 +2731,23 @@ class Qwen3ASRTranscriber:
             try:
                 import torch
                 from transformers import AutoProcessor, AutoModelForMultimodalLM
+                device, dtype = _select_qwen3_device()
+                dtype_tag = "fp16" if dtype == torch.float16 else (
+                    "bf16" if dtype == torch.bfloat16 else "fp32")
                 if status_callback:
-                    status_callback("loading", f"加载 Qwen3-ASR {model_name.split('/')[-1]}（首次需下载）...")
+                    status_callback("loading", f"加载 Qwen3-ASR {model_name.split('/')[-1]}（{device}/{dtype_tag}，首次需下载）...")
                 self._processor = AutoProcessor.from_pretrained(model_name)
                 self._model = AutoModelForMultimodalLM.from_pretrained(
                     model_name,
-                    device_map="cpu",
-                    dtype=torch.float32,
-                )
-                self._model.eval()
+                    dtype=dtype,
+                ).to(device).eval()
+                if device == "xpu":
+                    torch.xpu.synchronize()
+                self._device = device
+                self._dtype = dtype
                 self._model_name = model_name
                 if status_callback:
-                    status_callback("ready", f"Qwen3-ASR 就绪")
+                    status_callback("ready", f"Qwen3-ASR 就绪（{device}/{dtype_tag}）")
                 return True
             except ImportError as e:
                 self._model = None
@@ -2672,9 +2774,15 @@ class Qwen3ASRTranscriber:
             # hot_words 通过 initial_prompt 风格注入：Qwen3-ASR 暂无官方
             # hotword 参数，这里把热词拼到音频处理后的 prompt 里效果有限，
             # 暂不做特殊处理（与 Whisper 的 initial_prompt 不同）。
-            inputs = self._processor.apply_transcription_request(audio=filepath)
+            # 自己解码音频（绕开 torchcodec）；不传 language 以保留 52 语种自动检测。
+            wav, sr = _load_audio_for_qwen3(filepath)
+            inputs = self._processor.apply_transcription_request(
+                audio=wav, sampling_rate=sr)
+            inputs = inputs.to(self._device, self._dtype)
             with torch.no_grad():
                 output_ids = self._model.generate(**inputs, max_new_tokens=1024)
+            if self._device == "xpu":
+                torch.xpu.synchronize()
             generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
             text = self._processor.decode(
                 generated_ids, return_format="transcription_only"
