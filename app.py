@@ -2613,27 +2613,37 @@ class WhisperTranscriber:
 
 
 # ─── Qwen3-ASR 文件转写（transformers）───
-def _select_qwen3_device():
-    """选择 Qwen3-ASR 的运行设备与精度（2026-10-17 在本机实测）。
+def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
+    """纯逻辑：根据能力与环境变量决定 (device, dtype_tag)，不依赖 torch。
 
-    - Intel Arc XPU（需 xpu 版 torch，实测 2.14.1 可用）：fp16，稳态约 3 s/30 s 片；
-      注意 torch 2.9.1 xpu 的 LLM 算子会回退单核 CPU 卡死，xpu 环境须 >= 2.14.1。
-    - CPU：bfloat16（Core Ultra X7 实测比旧 fp32 快约 35 倍，5/5 片转写字词一致）。
-    环境变量：
-      QWEN3_ASR_DEVICE=xpu|cpu  强制设备；
-      QWEN3_ASR_DTYPE=fp32      回退旧的 CPU fp32 路径。
-    模型在进程内只加载一次并常驻，故检测到 XPU 即直接选用（初始化开销仅一次）。
+    返回 device ∈ {xpu, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
+    抽成无 torch 依赖的纯函数，便于在不装重依赖的 CI 里覆盖全部分支。
+
+    选择规则（2026-10-17 本机实测）：
+    - Intel Arc XPU（xpu 版 torch>=2.14.1 可用，2.9.1 会在 LLM 算子回退卡死）：fp16；
+    - 否则 CPU bfloat16（比旧 fp32 快约 35 倍），老 CPU 不支持 bf16 时回退 fp32。
+    环境变量：QWEN3_ASR_DEVICE=xpu|cpu 强制设备；QWEN3_ASR_DTYPE=fp32 强制旧路径。
     """
-    import torch
-    forced = os.environ.get("QWEN3_ASR_DEVICE", "").strip().lower()
-    if os.environ.get("QWEN3_ASR_DTYPE", "").strip().lower() == "fp32":
-        return "cpu", torch.float32
+    env = os.environ if env is None else env
+    forced = str(env.get("QWEN3_ASR_DEVICE", "")).strip().lower()
+    if str(env.get("QWEN3_ASR_DTYPE", "")).strip().lower() == "fp32":
+        return "cpu", "fp32"
     if forced == "xpu":
-        return "xpu", torch.float16
-    if forced != "cpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu", torch.float16
-    # CPU：bf16 仅在支持的 CPU 上又快又稳；旧 CPU 回退 fp32（实测一次后缓存）。
-    return "cpu", (torch.bfloat16 if _cpu_bf16_supported(torch) else torch.float32)
+        return "xpu", "fp16"
+    if forced != "cpu" and has_xpu:
+        return "xpu", "fp16"
+    return "cpu", ("bf16" if cpu_bf16_ok else "fp32")
+
+
+def _select_qwen3_device():
+    """读取 torch 实际能力并返回 (device, torch_dtype)。仅在加载模型时惰性调用。"""
+    import torch
+    has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    cpu_bf16_ok = _cpu_bf16_supported(torch)
+    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok)
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+             "fp32": torch.float32}[tag]
+    return dev, dtype
 
 
 _CPU_BF16_OK = None
