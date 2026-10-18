@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Tauri 2 构建时会把本文件 merge 进最终 .app 的 Info.plist。
+	     麦克风权限说明（TCC）：录音/BlackHole 回录都必须弹这个。 -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>会议录音转写助手需要访问麦克风，用于录制会议发言并转写成文字。</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>
