@@ -744,6 +744,14 @@ _WRITER_MAX_PENDING_BLOCKS = 1200   # _frames 里最多积压的块数（超过�
 # 根本没在跑（用户只录音没开实时转写），继续堆下去纯属浪费内存。
 _AUDIO_QUEUE_MAX_CHUNKS = 400
 
+# ── 实时电平表 / 静默守护阈值 ───────────────────────────────────────────
+# 这些阈值只用于“有没有声音”的 UX 提示，不影响录音与转写本身。
+_LEVEL_GUARD_PEAK = 0.01      # 全局峰值低于此（-40dBFS 量级）视为“没有有效声音”
+_LEVEL_GUARD_RMS = 0.003      # 单块 RMS 越过此（约 -50dBFS）即记为出现过语音
+_LEVEL_WARMUP_S = 5.0         # 开始采集后多少秒仍无声才预警（给正常开场留时间）
+_LEVEL_HOLD = 0.80            # 电平表慢衰减系数（每 150ms）
+_LEVEL_DECAY = 0.20           # 单块峰值随时间衰减底数
+
 
 class AudioRecorder:
     """使用 sounddevice 录制音频"""
@@ -778,6 +786,16 @@ class AudioRecorder:
         self._wav_lock = threading.Lock()
         self._wav_samples_written = 0
         self._writer_thread = None
+        # ── 实时电平 / 静默守护（所有音源模式都经 _enqueue_pcm 喂 16k 单声道 PCM，
+        # 在这个唯一漏斗口统计，避免 system/mic/both 各埋一份）──
+        self._level_lock = threading.Lock()
+        self._meter = 0.0              # 平滑后的电平表读数 0..1
+        self._last_chunk_peak = 0.0   # 最近一块的峰值
+        self._last_level_ts = None    # 最近一块到达时间
+        self._cap_start = None        # 本次采集起点（time.time）
+        self._cap_max_peak = 0.0      # 本次采集以来的全局峰值
+        self._cap_voiced = False      # 本次采集是否出现过有效电平块
+        self._silence_warned = False  # 本轮静默预警是否已发出
 
     def _import_deps(self):
         if self.sd is None:
@@ -815,6 +833,15 @@ class AudioRecorder:
         self._callback = callback
         self._mix_buffer = {}
         self._dropped_chunks = 0
+        # 复位电平/静默守护状态，开始一段全新的采集
+        with self._level_lock:
+            self._meter = 0.0
+            self._last_chunk_peak = 0.0
+            self._last_level_ts = None
+            self._cap_start = time.time()
+            self._cap_max_peak = 0.0
+            self._cap_voiced = False
+            self._silence_warned = False
 
         # 先打开 WAV 写入器并拉起落盘线程，使录音从第一块开始就能落盘。
         # 设备参数（_actual_sample_rate / _actual_channels）在下面才确定，
@@ -1099,6 +1126,78 @@ class AudioRecorder:
 
         return mono
 
+    def _update_level(self, pcm):
+        """从一块 16kHz 单声道 int16 PCM 统计峰值/RMS，馈送电帏表与静默守护。
+
+        调用方是 sounddevice 回调 / 混音线程，任何异常都不得影响采集。
+        """
+        if self.np is None:
+            return
+        try:
+            x = self.np.frombuffer(pcm, dtype=self.np.int16).astype(self.np.float32)
+            if x.size == 0:
+                return
+            x *= (1.0 / 32768.0)
+            peak = float(self.np.abs(x).max())
+            rms = float(self.np.sqrt((x.astype(self.np.float64) ** 2).mean()))
+        except Exception:
+            return
+        with self._level_lock:
+            self._last_chunk_peak = peak
+            self._last_level_ts = time.time()
+            if peak > self._cap_max_peak:
+                self._cap_max_peak = peak
+            # 任一块 RMS 越过“非静默”线即记为有声；阈值故意放得很宽（-50dB），
+            # 纯数字静默（实测 -65dB 以下）与正常语音（峰值常 >0.02）清晰分开。
+            if rms >= _LEVEL_GUARD_RMS:
+                self._cap_voiced = True
+
+    def get_level(self):
+        """返回平滑后的当前电平 0..1，前端约每 150ms 轮询一次。
+
+        快攻击、慢衰减：新块到达立即抬到该峰值，之后按时间指数衰减。
+        """
+        now = time.time()
+        with self._level_lock:
+            if not self._recording or self._last_level_ts is None:
+                self._meter = 0.0
+                return 0.0
+            age = max(0.0, now - self._last_level_ts)
+            instant = self._last_chunk_peak * (_LEVEL_DECAY ** (age / 0.15))
+            held = self._meter
+        self._meter = max(instant, held * _LEVEL_HOLD)
+        return min(1.0, self._meter)
+
+    def silence_snapshot(self):
+        """静默守护状态机。不在采集返回 None；否则 state 为
+        'warn'（开场 N 秒仍无有效声音，应预警）/ 'clear'（预警后检测到声音）
+        / ''（维持现状）。"""
+        now = time.time()
+        with self._level_lock:
+            if not self._recording or self._cap_start is None:
+                return None
+            elapsed = now - self._cap_start
+            max_peak = self._cap_max_peak
+            voiced = self._cap_voiced
+            warned = self._silence_warned
+        if not warned:
+            if elapsed >= _LEVEL_WARMUP_S and max_peak < _LEVEL_GUARD_PEAK and not voiced:
+                return {"state": "warn", "elapsed": round(elapsed, 1),
+                        "max_peak": round(max_peak, 4)}
+        elif max_peak >= _LEVEL_GUARD_PEAK or voiced:
+            return {"state": "clear", "elapsed": round(elapsed, 1),
+                    "max_peak": round(max_peak, 4)}
+        return {"state": "", "elapsed": round(elapsed, 1),
+                "max_peak": round(max_peak, 4)}
+
+    def mark_silence_warned(self):
+        with self._level_lock:
+            self._silence_warned = True
+
+    def mark_silence_cleared(self):
+        with self._level_lock:
+            self._silence_warned = False
+
     def _enqueue_pcm(self, pcm):
         """把一块 PCM 送进实时转写队列，队列满时丢最旧的一块。
 
@@ -1107,6 +1206,7 @@ class AudioRecorder:
         没开实时转写），此时丢弃是正确选择——录音完整性由 WAV 落盘保证，
         而不是靠这个队列。
         """
+        self._update_level(pcm)
         try:
             self._audio_queue.put_nowait(pcm)
             return True
@@ -3498,6 +3598,31 @@ def create_app():
             "elapsed_s": elapsed,
         })
 
+    # 录音/实时转写中的实时电平 + 静默守护状态（前端约每 150ms 轮询）。
+    # 纯内存读取，不开设备、不碰模型，轮询代价极小。
+    @app.get("/api/capture/level")
+    async def api_capture_level():
+        rec = getattr(state, "recorder", None)
+        if rec is None or not getattr(rec, "is_recording", False):
+            return JSONResponse({
+                "active": False, "level": 0.0, "elapsed_s": 0.0,
+                "silence": "", "max_peak": 0.0,
+            })
+        level = float(rec.get_level())
+        snap = rec.silence_snapshot() or {}
+        sstate = snap.get("state", "")
+        if sstate == "warn":
+            rec.mark_silence_warned()
+        elif sstate == "clear":
+            rec.mark_silence_cleared()
+        return JSONResponse({
+            "active": True,
+            "level": round(level, 4),
+            "elapsed_s": float(snap.get("elapsed", 0.0)),
+            "silence": sstate,
+            "max_peak": float(snap.get("max_peak", 0.0)),
+        })
+
     @app.get("/api/recordings/{name}/meta")
     async def api_recording_meta(name: str):
         p = _safe_recording_path(name)
@@ -4417,6 +4542,59 @@ def _file_asr_status_cb(status, msg):
     state.transcribe_set_stage(stage)
 
 
+def analyze_recording_audio(filepath, silence_peak=_LEVEL_GUARD_PEAK,
+                            silence_rms=_LEVEL_GUARD_RMS):
+    """读取录音 wav，返回 {duration_s, peak, rms_db, is_silent}。
+
+    用于转写结束后区分“没识别到语音”到底是静音输入还是引擎问题。
+    走 soundfile 直读（与项目其它路径一致），任何异常都降级为 unknown，
+    绝不让这个 UX 提示影响主转写流程。
+    """
+    out = {"duration_s": 0.0, "peak": 0.0, "rms_db": None, "is_silent": False}
+    try:
+        import soundfile as sf
+        import numpy as _np
+        y, sr = sf.read(str(filepath), dtype="float32")
+        if y is None or getattr(y, "size", 0) == 0:
+            out["is_silent"] = True
+            return out
+        if getattr(y, "ndim", 1) > 1:
+            y = y.mean(axis=1)
+        y64 = y.astype(_np.float64)
+        peak = float(_np.abs(y64).max()) if y64.size else 0.0
+        rms = float(_np.sqrt((y64 ** 2).mean())) if y64.size else 0.0
+        out["duration_s"] = round(len(y64) / float(sr), 1) if sr else 0.0
+        out["peak"] = round(peak, 4)
+        out["rms_db"] = round(20.0 * _np.log10(rms + 1e-12), 1)
+        out["is_silent"] = peak < silence_peak and rms < silence_rms
+        return out
+    except Exception:
+        # 这只是 UX 提示辅助，文件缺失/损坏时安静降级，不打印整段堆栈污染日志
+        return out
+
+
+def _empty_transcript_advisory(filepath):
+    """转写结果为空时，结合录音电平给出明确原因（静音输入 vs 有声音但没识别），
+    并推 transcript_empty 事件让前端在结果区显著提示。返回电平分析 dict。"""
+    info = analyze_recording_audio(filepath)
+    dur = info.get("duration_s") or 0.0
+    if info.get("is_silent"):
+        msg = (f"未识别到语音：这段 {dur:.0f} 秒录音几乎是静音，"
+               f"请检查音源选择 / 是否戴了耳机导致系统声走耳机 / 麦克风是否被静音")
+    else:
+        msg = (f"未识别到清晰语音（录音 {dur:.0f} 秒，平均电平 {info.get('rms_db')}dB），"
+               f"可能全程无人说话、背景噪声过大或音源不对")
+    state.push_from_thread("log", {"message": msg})
+    state.push_from_thread("transcript_empty", {
+        "message": msg,
+        "duration_s": dur,
+        "is_silent": bool(info.get("is_silent")),
+        "rms_db": info.get("rms_db"),
+        "wav_name": Path(filepath).name,
+    })
+    return info
+
+
 def _transcribe_file_task(filepath, ws):
     """后台线程：转写录音文件"""
     try:
@@ -4437,6 +4615,8 @@ def _transcribe_file_task(filepath, ws):
                 state.sentence_info = []
                 state.speaker_count = 0
                 save_recording_meta(filepath, text=result, engine="Whisper")
+                if not (result or "").strip():
+                    _empty_transcript_advisory(filepath)
                 state.push_from_thread("transcript_ready", result)
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": f"Whisper 转写完成，共{len(result)}字"})
@@ -4459,6 +4639,8 @@ def _transcribe_file_task(filepath, ws):
                 state.sentence_info = []
                 state.speaker_count = 0
                 save_recording_meta(filepath, text=result, engine="Qwen3")
+                if not (result or "").strip():
+                    _empty_transcript_advisory(filepath)
                 state.push_from_thread("transcript_ready", result)
                 state.push_from_thread("status", "就绪")
                 state.push_from_thread("log", {"message": f"Qwen3-ASR 转写完成，共{len(result)}字"})
@@ -4521,6 +4703,8 @@ def _transcribe_file_task(filepath, ws):
                     })
                     state.push_from_thread("status", "就绪")
                     spk_info = f"，识别{state.speaker_count}位说话人" if state.speaker_count > 0 else ""
+                    if not (state.transcript_text or "").strip() and not state.sentence_info:
+                        _empty_transcript_advisory(filepath)
                     state.push_from_thread("log", {"message": f"转写完成，共{len(state.transcript_text)}字{spk_info}"})
                 else:
                     state.push_from_thread("status", "就绪")
@@ -4538,6 +4722,8 @@ def _transcribe_file_task(filepath, ws):
                     state.sentence_info = []
                     state.speaker_count = 0
                     save_recording_meta(filepath, text=result, engine="FunASR")
+                    if not (result or "").strip():
+                        _empty_transcript_advisory(filepath)
                     state.push_from_thread("transcript_ready", result)
                     state.push_from_thread("status", "就绪")
                     state.push_from_thread("log", {"message": f"转写完成，共{len(result)}字"})
@@ -4595,7 +4781,7 @@ def _transcribe_file_task(filepath, ws):
             speaker_count = int(result.get("speaker_count") or 0)
             if not text:
                 state.push_from_thread("status", "就绪")
-                state.push_from_thread("log", {"message": f"{engine_label}未识别到有效语音（可能是静音音频）"})
+                _empty_transcript_advisory(filepath)
                 return
             state.set_transcript(text)
             state.sentence_info = sentence_info
