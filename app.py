@@ -3308,6 +3308,25 @@ def create_app():
             applog.warning("版本检查失败（忽略）：%s", e)
             return JSONResponse({"update_available": False})
 
+    # REST: 由后端用系统默认浏览器打开 Release 下载页。
+    # Tauri WebView 里 target=_blank 外链不会打开系统浏览器，必须走后端 webbrowser。
+    @app.post("/api/update/open")
+    async def api_update_open(body: dict | None = None):
+        if _update_check is None:
+            return JSONResponse({"ok": False, "reason": "disabled"}, status_code=503)
+        url = (body or {}).get("url") or _update_check.RELEASES_PAGE
+        import asyncio
+        import functools
+        try:
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(
+                None, functools.partial(_update_check.open_release_url, url))
+            status = 200 if res.get("ok") else 400
+            return JSONResponse(res, status_code=status)
+        except Exception as e:
+            applog.warning("打开下载页失败（忽略）：%s", e)
+            return JSONResponse({"ok": False, "reason": "error"}, status_code=500)
+
     # REST: list audio devices
     @app.get("/api/devices")
     async def list_devices():

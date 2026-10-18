@@ -644,10 +644,10 @@ html, body {
         <div class="logo-version" id="logoVersion">v3.1.0</div>
       </div>
     </div>
-    <a id="updateBanner" target="_blank" rel="noopener"
+    <a id="updateBanner" href="#" onclick="return openUpdateRelease(event)"
        style="display:none;margin:2px 12px 6px;padding:6px 10px;border-radius:8px;
               background:#ecfdf5;color:#047857;font-size:12px;text-decoration:none;
-              border:1px solid #a7f3d0;"></a>
+              border:1px solid #a7f3d0;cursor:pointer;"></a>
 
     <div class="status-section">
       <div class="status-row">
@@ -2397,12 +2397,38 @@ async function checkUpdate() {
       const el = document.getElementById('updateBanner');
       if (el) {
         el.textContent = '⬆ 有新版本 ' + (info.latest_version || '') + '，点击下载';
-        el.href = info.release_url || '#';
+        el.dataset.releaseUrl = info.release_url || '';
         el.style.display = '';
       }
       appendLog('检测到新版本 ' + (info.latest_version || '') + '，可前往更新（当前版本仍可正常使用）');
     }
   } catch (e) { /* 离线/限流时静默 */ }
+}
+
+// 桌面壳（Tauri WebView）里 target=_blank 外链不会打开系统浏览器，
+// 改由后端 webbrowser 调起默认浏览器跳转 Release 下载页。
+let updateOpening = false;
+async function openUpdateRelease(ev) {
+  if (ev) ev.preventDefault();
+  if (updateOpening) return false;
+  const el = document.getElementById('updateBanner');
+  const url = (el && el.dataset.releaseUrl) || '';
+  updateOpening = true;
+  try {
+    const resp = await fetch('/api/update/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
+    });
+    if (!resp.ok) {
+      appendLog('未能自动打开下载页，请手动访问 GitHub Releases 页面下载');
+    }
+  } catch (e) {
+    appendLog('未能自动打开下载页，请手动访问 GitHub Releases 页面下载');
+  } finally {
+    updateOpening = false;
+  }
+  return false;
 }
 </script>
 </body>

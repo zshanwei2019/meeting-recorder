@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import re
 import time
+from urllib.parse import urlparse
 
 # 仓库：用户自己的公开仓库
 GITHUB_REPO = "zshanwei2019/meeting-recorder"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+# 只允许跳转到本仓库 Releases 页，防止后端 open 接口被当成任意 URL/命令跳板
+RELEASE_URL_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/"
 
 REQUEST_TIMEOUT_S = 6
 # 进程内缓存有效期：2 小时（一次开机通常只查一次，留余量）
@@ -122,3 +125,41 @@ def reset_cache():
     """测试辅助：清空进程内缓存。"""
     _cache["at"] = 0.0
     _cache["result"] = None
+
+
+def is_safe_release_url(url) -> bool:
+    """校验跳转目标：必须是 https://github.com/<repo>/releases/ 下的链接。
+
+    桌面壳（Tauri WebView）里 target=_blank 外链不会打开系统浏览器，
+    改为由后端调默认浏览器；因此必须严格白名单，拒绝任意 URL。
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        u = urlparse(url.strip())
+    except Exception:
+        return False
+    if u.scheme != "https" or u.hostname != "github.com":
+        return False
+    return u.path.startswith(f"/{GITHUB_REPO}/releases/")
+
+
+def open_release_url(url, opener=None):
+    """用系统默认浏览器打开 Release 页（Tauri 壳内唯一可靠的跳转方式）。
+
+    opener 可注入（测试用）：opener(url) -> bool。默认用 webbrowser.open。
+    返回 {ok: True, url} 或 {ok: False, reason}。任何失败都不抛异常。
+    """
+    if not is_safe_release_url(url):
+        return {"ok": False, "reason": "invalid_url"}
+    url = url.strip()
+    if opener is None:
+        import webbrowser
+        opener = webbrowser.open
+    try:
+        opened = bool(opener(url))
+    except Exception:
+        return {"ok": False, "reason": "open_failed"}
+    if not opened:
+        return {"ok": False, "reason": "opener_false"}
+    return {"ok": True, "url": url}

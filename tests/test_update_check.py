@@ -118,5 +118,51 @@ uc.check_for_update("1.0.0", http_get=counting_get)  # force 刷新
 check("reset/force 后重新请求", calls["n"] == 2, str(calls["n"]))
 
 uc.reset_cache()
+
+print("\n=== 6. is_safe_release_url 白名单 ===")
+_good = "https://github.com/zshanwei2019/meeting-recorder/releases/tag/v3.4.0"
+check("合法 release tag 链接", uc.is_safe_release_url(_good) is True)
+check("合法 latest 链接", uc.is_safe_release_url(
+    "https://github.com/zshanwei2019/meeting-recorder/releases/latest") is True)
+check("前后空格容忍", uc.is_safe_release_url("  " + _good + "  ") is True)
+check("http 被拒", uc.is_safe_release_url(_good.replace("https", "http")) is False)
+check("非 github 域被拒",
+      uc.is_safe_release_url("https://evil.com/zshanwei2019/meeting-recorder/releases/x") is False)
+check("仿冒路径（evil 仓库）被拒",
+      uc.is_safe_release_url("https://github.com/evil/meeting-recorder/releases/x") is False)
+check("releases 之外的路径被拒",
+      uc.is_safe_release_url("https://github.com/zshanwei2019/meeting-recorder/issues") is False)
+check("空字符串被拒", uc.is_safe_release_url("") is False)
+check("None 被拒", uc.is_safe_release_url(None) is False)
+check("javascript: 被拒", uc.is_safe_release_url("javascript:alert(1)") is False)
+
+print("\n=== 7. open_release_url（注入 opener，不真开浏览器）===")
+seen = {}
+def fake_opener(u):
+    seen["u"] = u
+    return True
+
+r = uc.open_release_url(_good, opener=fake_opener)
+check("合法 URL 打开成功", r == {"ok": True, "url": _good}, str(r))
+check("opener 收到的是去空格后的 URL", seen.get("u") == _good, str(seen))
+
+r2 = uc.open_release_url("https://evil.com/x", opener=fake_opener)
+check("非法 URL 不调用 opener 并返回 invalid_url",
+      r2 == {"ok": False, "reason": "invalid_url"}, str(r2))
+
+def false_opener(u):
+    return False
+
+r3 = uc.open_release_url(_good, opener=false_opener)
+check("opener 返回 False -> opener_false",
+      r3 == {"ok": False, "reason": "opener_false"}, str(r3))
+
+def boom_opener(u):
+    raise RuntimeError("no browser")
+
+r4 = uc.open_release_url(_good, opener=boom_opener)
+check("opener 抛异常不传播 -> open_failed",
+      r4 == {"ok": False, "reason": "open_failed"}, str(r4))
+
 print(f"\n通过 {passed} 条，失败 {failed} 条")
 sys.exit(1 if failed else 0)
