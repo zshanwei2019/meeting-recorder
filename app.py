@@ -3327,35 +3327,53 @@ def _transcode_to_wav16k(src: Path, dst: Path) -> None:
 
     PyAV(FFmpeg) 随包发布，不依赖用户机器安装 ffmpeg；转出的 wav 可被
     FunASR / pyannote 路径（soundfile）直接读取。
+
+    注意 src 与 dst 可能是同一路径（上传 .wav 时调用方会原路径"洗一道"）：
+    Windows 因文件锁，dst 以写模式打开会抛错，调用方回退用原文件，侥幸安全；
+    POSIX（macOS/Linux）无强制锁，写打开会静默截断源文件 → 转写出残缺音频。
+    因此同路径时先转到一个临时文件，成功后再原子替换。
     """
     import numpy as np
     import av
 
-    container = av.open(str(src))
+    same_path = os.path.abspath(str(src)) == os.path.abspath(str(dst))
+    work_dst = src.with_name(src.stem + ".transcode-tmp.wav") if same_path else dst
+
     try:
-        in_stream = next((s for s in container.streams if s.type == "audio"), None)
-        if in_stream is None:
-            raise ValueError("文件里没有找到音轨")
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-        out_container = av.open(str(dst), "w")
+        container = av.open(str(src))
         try:
-            out_stream = out_container.add_stream("pcm_s16le", rate=16000)
-            out_stream.layout = "mono"  # mono 已隐含单声道；PyAV 中 channels 只读，不可赋值
-            for packet in container.demux(in_stream):
-                for frame in packet.decode():
-                    resampled = resampler.resample(frame)
-                    for rf in resampled:
-                        for opacket in out_stream.encode(rf):
-                            out_container.mux(opacket)
-            for rf in resampler.resample(None):
-                for opacket in out_stream.encode(rf):
+            in_stream = next((s for s in container.streams if s.type == "audio"), None)
+            if in_stream is None:
+                raise ValueError("文件里没有找到音轨")
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+            out_container = av.open(str(work_dst), "w")
+            try:
+                out_stream = out_container.add_stream("pcm_s16le", rate=16000)
+                out_stream.layout = "mono"  # mono 已隐含单声道；PyAV 中 channels 只读，不可赋值
+                for packet in container.demux(in_stream):
+                    for frame in packet.decode():
+                        resampled = resampler.resample(frame)
+                        for rf in resampled:
+                            for opacket in out_stream.encode(rf):
+                                out_container.mux(opacket)
+                for rf in resampler.resample(None):
+                    for opacket in out_stream.encode(rf):
+                        out_container.mux(opacket)
+                for opacket in out_stream.encode(None):
                     out_container.mux(opacket)
-            for opacket in out_stream.encode(None):
-                out_container.mux(opacket)
+            finally:
+                out_container.close()
         finally:
-            out_container.close()
-    finally:
-        container.close()
+            container.close()
+        if same_path:
+            os.replace(str(work_dst), str(dst))
+    except Exception:
+        if same_path:
+            try:
+                os.unlink(str(work_dst))
+            except OSError:
+                pass
+        raise
 
 
 # ─── FastAPI 后端 ───
@@ -5880,6 +5898,11 @@ def _main_inner(log_error):
     # When running as a sidecar for another app (e.g. Tauri), don't open browser
     if os.environ.get("ASR_SIDECAR", "0") == "1":
         print("Sidecar mode: not opening browser")
+    elif sys.platform == "darwin":
+        # macOS: 用 open 调默认浏览器（cmd/start 是 Windows 专用）
+        subprocess.Popen(["open", url])
+    elif sys.platform.startswith("linux"):
+        subprocess.Popen(["xdg-open", url])
     elif browser_cmd:
         # Open in Edge app mode (no address bar, looks like native app)
         subprocess.Popen([
