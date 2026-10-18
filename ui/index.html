@@ -98,6 +98,23 @@ html, body {
 }
 .time-display.visible { display: block; }
 
+/* 实时电平表 + 静默预警 */
+.capture-meter { display: none; margin: 8px 4px 2px; }
+.capture-meter.visible { display: block; }
+.meter-label { display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+.meter-clock { font-family: "Cascadia Code", Consolas, monospace; color: #cbd5e1; }
+.meter-track { height: 10px; border-radius: 6px; background: #1e293b;
+  overflow: hidden; border: 1px solid #334155; }
+.meter-fill { height: 100%; width: 0%;
+  background: linear-gradient(90deg, #22c55e 0%, #eab308 70%, #ef4444 100%);
+  border-radius: 6px; transition: width 90ms linear; }
+.silence-warn { display: none; margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  font-size: 11px; line-height: 1.4; color: #b91c1c;
+  background: #fef2f2; border: 1px solid #fecaca; }
+.silence-warn.visible { display: block; animation: silencePulse 1.4s ease-in-out infinite; }
+@keyframes silencePulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+
 /* Section Label */
 .section-label {
   font-size: 11px; font-weight: 700; text-transform: uppercase;
@@ -285,6 +302,12 @@ html, body {
 .realtime-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #c084fc; }
 
 /* Transcript Area */
+/* 空转写结果显著提示（静音输入 / 未识别） */
+.empty-advisory { display: none; margin: 0 0 8px; padding: 10px 12px;
+  border-radius: 8px; font-size: 13px; line-height: 1.5;
+  color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
+.empty-advisory.visible { display: block; }
+
 .transcript-wrapper {
   flex: 1;
   position: relative;
@@ -655,6 +678,14 @@ html, body {
         <span class="status-text" id="statusText">连接中...</span>
       </div>
       <div class="time-display" id="timeDisplay">00:00:00</div>
+      <!-- 实时电平表 + 静默预警（录音/实时转写时显示） -->
+      <div class="capture-meter" id="captureMeter">
+        <div class="meter-label"><span id="meterMode">录音电平</span><span id="meterClock" class="meter-clock">00:00</span></div>
+        <div class="meter-track"><div class="meter-fill" id="meterFill"></div></div>
+        <div class="silence-warn" id="silenceWarn">
+          ⚠ 未检测到声音，请检查音源 / 是否戴了耳机 / 麦克风
+        </div>
+      </div>
     </div>
 
     <div class="section-label">音源</div>
@@ -888,6 +919,7 @@ html, body {
     </div>
 
     <div class="transcript-wrapper">
+      <div class="empty-advisory" id="emptyAdvisory"></div>
       <textarea class="transcript-area" id="transcriptArea" placeholder="转写结果将显示在这里..." oninput="updateWordCount()"></textarea>
     </div>
 
@@ -1141,6 +1173,9 @@ function handleEvent(ev) {
       break;
     case 'transcript_ready':
       onTranscriptReady(ev.data);
+      break;
+    case 'transcript_empty':
+      onTranscriptEmpty(ev.data);
       break;
     case 'minutes_ready':
       document.getElementById('transcriptArea').value = ev.data.text;
@@ -1601,6 +1636,71 @@ function onRecordingChanged(recording) {
   // 实时转写运行时禁用录音按钮
   btn.disabled = isRealtime;
   btn.style.opacity = isRealtime ? '0.4' : '';
+  syncCaptureMeter();
+}
+
+// ══════════════════════════════════════════
+// 实时电平表 + 开场静默预警（约 150ms 轮询后端）
+// ══════════════════════════════════════════
+let capturePollTimer = null;
+let captureMeterActive = false;
+let silenceWarnVisible = false;
+
+function fmtClock(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+}
+
+async function pollCaptureLevel() {
+  try {
+    const r = await fetch('/api/capture/level', { cache: 'no-store' });
+    const d = await r.json();
+    const meter = document.getElementById('captureMeter');
+    const fill = document.getElementById('meterFill');
+    const warn = document.getElementById('silenceWarn');
+    if (!d.active) {
+      meter.classList.remove('visible');
+      warn.classList.remove('visible');
+      silenceWarnVisible = false;
+      fill.style.width = '0%';
+      return;
+    }
+    meter.classList.add('visible');
+    // gamma 0.6 压缩：轻微底噪也有可见读数，但静音仍接近 0
+    const lvl = Math.max(0, Math.min(1, d.level || 0));
+    fill.style.width = Math.round(Math.pow(lvl, 0.6) * 100) + '%';
+    document.getElementById('meterClock').textContent = fmtClock(d.elapsed_s);
+    if (d.silence === 'warn') {
+      silenceWarnVisible = true;
+      warn.classList.add('visible');
+    } else if (d.silence === 'clear') {
+      silenceWarnVisible = false;
+      warn.classList.remove('visible');
+    }
+    // state==='' 时维持现状：已预警就持续亮着，直到真的检测到声音（clear）
+  } catch (e) { /* 轮询偶发失败直接忽略，下一拍再试 */ }
+}
+
+function syncCaptureMeter() {
+  const active = isRecording || isRealtime;
+  document.getElementById('meterMode').textContent =
+    isRealtime ? '实时转写电平' : '录音电平';
+  if (active && !captureMeterActive) {
+    captureMeterActive = true;
+    pollCaptureLevel();
+    capturePollTimer = setInterval(pollCaptureLevel, 150);
+  } else if (!active && captureMeterActive) {
+    captureMeterActive = false;
+    if (capturePollTimer) { clearInterval(capturePollTimer); capturePollTimer = null; }
+    document.getElementById('captureMeter').classList.remove('visible');
+    document.getElementById('silenceWarn').classList.remove('visible');
+    document.getElementById('meterFill').style.width = '0%';
+    silenceWarnVisible = false;
+  }
 }
 
 function onRealtimeStatus(data) {
@@ -1672,10 +1772,12 @@ function onRealtimeStatus(data) {
   }
   // loading时禁用实时转写按钮防止重复点击，其他状态均启用
   btn.disabled = (status === 'loading');
+  syncCaptureMeter();
 }
 
 function onTranscriptPartial(data) {
   const ta = document.getElementById('transcriptArea');
+  if (data.full_text && data.full_text.trim()) hideEmptyAdvisory();
   ta.value = data.full_text || (ta.value + data.text);
   updateWordCount();
   // Auto scroll
@@ -1685,8 +1787,23 @@ function onTranscriptPartial(data) {
 // 说话人颜色（与后端SPEAKER_COLORS一致）
 const SPEAKER_COLORS = ['#4472C4', '#ED7D31', '#70AD47', '#FFC000', '#5B9BD5', '#A5A5A5', '#7030A0', '#C00000'];
 
+function onTranscriptEmpty(data) {
+  const el = document.getElementById('emptyAdvisory');
+  const msg = (data && data.message) || '未识别到语音';
+  const dur = (data && data.duration_s) ? `（录音 ${Math.round(data.duration_s)} 秒）` : '';
+  el.textContent = '⚠ ' + msg + dur;
+  el.classList.add('visible');
+  showToast('未识别到语音，请检查音源 / 耳机 / 麦克风', 'err');
+}
+
+function hideEmptyAdvisory() {
+  const el = document.getElementById('emptyAdvisory');
+  if (el) el.classList.remove('visible');
+}
+
 function onTranscriptReady(data) {
   const ta = document.getElementById('transcriptArea');
+  hideEmptyAdvisory();
 
   // 记住本次转写的录音文件名，会后处理面板打开时自动选中
   if (data && typeof data === 'object' && data.wav_name) {
