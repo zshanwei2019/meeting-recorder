@@ -1200,7 +1200,7 @@ function handleEvent(ev) {
 function applyConfig(config) {
   if (!config) return;
   window._appConfig = config;
-  const srcMap = {'system': 0, 'mic': 1, 'both': 2};
+  const srcMap = {'both': 0, 'system': 1, 'mic': 2};
   if (config.audio_source && srcMap[config.audio_source] !== undefined)
     document.getElementById('audioSource').selectedIndex = srcMap[config.audio_source];
   if (config.engine) {
