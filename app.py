@@ -2713,16 +2713,20 @@ class WhisperTranscriber:
 
 
 # ─── Qwen3-ASR 文件转写（transformers）───
-def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
+def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None, has_mps=False):
     """纯逻辑：根据能力与环境变量决定 (device, dtype_tag)，不依赖 torch。
 
-    返回 device ∈ {xpu, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
+    返回 device ∈ {xpu, mps, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
     抽成无 torch 依赖的纯函数，便于在不装重依赖的 CI 里覆盖全部分支。
 
-    选择规则（2026-10-17 本机实测）：
+    选择规则（2026-10-17 本机实测；macOS 分支 2026-10-18 加入）：
     - Intel Arc XPU（xpu 版 torch>=2.14.1 可用，2.9.1 会在 LLM 算子回退卡死）：fp16；
+    - Apple Silicon MPS（torch.backends.mps 可用）：fp16；个别算子 fp16 报错时
+      由 Qwen3ASRTranscriber 在运行期自动降级 fp32 重试（load 与 generate 两处）；
     - 否则 CPU bfloat16（比旧 fp32 快约 35 倍），老 CPU 不支持 bf16 时回退 fp32。
-    环境变量：QWEN3_ASR_DEVICE=xpu|cpu 强制设备；QWEN3_ASR_DTYPE=fp32 强制旧路径。
+    设备优先级：xpu > mps > cpu。
+    环境变量：QWEN3_ASR_DEVICE=xpu|mps|cpu 强制设备；QWEN3_ASR_DTYPE=fp32
+    最高优先，强制回退 CPU+fp32（即便同时强制了 xpu/mps，保持既有语义）。
     """
     env = os.environ if env is None else env
     forced = str(env.get("QWEN3_ASR_DEVICE", "")).strip().lower()
@@ -2730,8 +2734,12 @@ def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
         return "cpu", "fp32"
     if forced == "xpu":
         return "xpu", "fp16"
+    if forced == "mps":
+        return "mps", "fp16"
     if forced != "cpu" and has_xpu:
         return "xpu", "fp16"
+    if forced != "cpu" and has_mps:
+        return "mps", "fp16"
     return "cpu", ("bf16" if cpu_bf16_ok else "fp32")
 
 
@@ -2739,8 +2747,10 @@ def _select_qwen3_device():
     """读取 torch 实际能力并返回 (device, torch_dtype)。仅在加载模型时惰性调用。"""
     import torch
     has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    mps_backend = getattr(torch.backends, "mps", None)
+    has_mps = bool(mps_backend) and mps_backend.is_available()
     cpu_bf16_ok = _cpu_bf16_supported(torch)
-    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok)
+    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok, has_mps=has_mps)
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
              "fp32": torch.float32}[tag]
     return dev, dtype
@@ -2811,7 +2821,8 @@ class Qwen3ASRTranscriber:
     """Qwen3-ASR 后端，支持 52 语种自动检测，适合中英混合文件转写。
 
     只做文件转写，不做实时流式。transformers 原生加载。
-    设备/精度自动选择：Arc XPU -> fp16；否则 CPU bfloat16（比旧 fp32 快约 35 倍）；
+    设备/精度自动选择：Arc XPU -> fp16；Apple Silicon MPS -> fp16
+    （算子不支持时运行期自动降级 fp32 重试）；否则 CPU bfloat16（比旧 fp32 快约 35 倍）；
     可用 QWEN3_ASR_DEVICE / QWEN3_ASR_DTYPE 环境变量覆盖。详见 _select_qwen3_device。
     """
     def __init__(self):
@@ -2821,8 +2832,9 @@ class Qwen3ASRTranscriber:
         self._device = None
         self._dtype = None
         self._lock = threading.Lock()
+        self._mps_fp32_downgraded = False
 
-    def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None):
+    def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None, force_dtype=None):
         if self._model is not None and self._model_name == model_name:
             return True
         with self._lock:
@@ -2832,17 +2844,36 @@ class Qwen3ASRTranscriber:
                 import torch
                 from transformers import AutoProcessor, AutoModelForMultimodalLM
                 device, dtype = _select_qwen3_device()
+                if force_dtype is not None:
+                    dtype = force_dtype
                 dtype_tag = "fp16" if dtype == torch.float16 else (
                     "bf16" if dtype == torch.bfloat16 else "fp32")
                 if status_callback:
                     status_callback("loading", f"加载 Qwen3-ASR {model_name.split('/')[-1]}（{device}/{dtype_tag}，首次需下载）...")
                 self._processor = AutoProcessor.from_pretrained(model_name)
-                self._model = AutoModelForMultimodalLM.from_pretrained(
-                    model_name,
-                    dtype=dtype,
-                ).to(device).eval()
+                try:
+                    self._model = AutoModelForMultimodalLM.from_pretrained(
+                        model_name,
+                        dtype=dtype,
+                    ).to(device).eval()
+                except Exception:
+                    # MPS 上个别算子可能不支持 fp16：加载期失败自动回退 fp32 再试一次
+                    if device == "mps" and dtype == torch.float16:
+                        if status_callback:
+                            status_callback("loading", "MPS fp16 加载失败，回退 fp32 重试...")
+                        dtype = torch.float32
+                        dtype_tag = "fp32"
+                        self._mps_fp32_downgraded = True
+                        self._model = AutoModelForMultimodalLM.from_pretrained(
+                            model_name,
+                            dtype=dtype,
+                        ).to(device).eval()
+                    else:
+                        raise
                 if device == "xpu":
                     torch.xpu.synchronize()
+                elif device == "mps":
+                    torch.mps.synchronize()
                 self._device = device
                 self._dtype = dtype
                 self._model_name = model_name
@@ -2883,12 +2914,29 @@ class Qwen3ASRTranscriber:
                 output_ids = self._model.generate(**inputs, max_new_tokens=1024)
             if self._device == "xpu":
                 torch.xpu.synchronize()
+            elif self._device == "mps":
+                torch.mps.synchronize()
             generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
             text = self._processor.decode(
                 generated_ids, return_format="transcription_only"
             )[0]
             return text.strip() if text else ""
         except Exception as e:
+            # MPS fp16 在生成期才暴露的算子不支持：自动降级 fp32 重载并重试一次
+            if (self._device == "mps" and self._dtype is not None
+                    and self._dtype == torch.float16
+                    and not self._mps_fp32_downgraded):
+                print(f"[Qwen3-ASR] MPS fp16 生成失败（{e}），降级 fp32 重试", flush=True)
+                self._mps_fp32_downgraded = True
+                self._model = None
+                self._processor = None
+                if status_callback:
+                    status_callback("loading", "MPS fp16 算子不支持，降级 fp32 重试...")
+                if self.load(self._model_name, status_callback,
+                             force_dtype=torch.float32):
+                    return self.transcribe(
+                        filepath, model_name=self._model_name,
+                        status_callback=status_callback, hot_words=hot_words)
             if status_callback:
                 status_callback("error", f"Qwen3-ASR 转写失败: {str(e)}")
             return None
@@ -3075,6 +3123,18 @@ class MeetingMonitor:
         "voovmeeting.exe": "腾讯会议VooV",
     }
 
+    # macOS 进程关键字（小写子串匹配 ps 的 comm 全路径，如
+    # /Applications/WeMeet.app/Contents/MacOS/WeMeet）。放宽为子串而非写死
+    # 可执行名，兼容 .app bundle 与中文目录名。
+    MEETING_PROCESS_KEYWORDS_DARWIN = {
+        "wemeet": "腾讯会议",
+        "voov": "腾讯会议VooV",
+        "dingtalk": "钉钉",
+        "lark": "飞书",
+        "zoom.us": "Zoom",
+        "microsoft teams": "Microsoft Teams",
+    }
+
     def __init__(self):
         self._monitoring = False
         self._thread = None
@@ -3085,10 +3145,22 @@ class MeetingMonitor:
         self._on_stop_callback = None
         self._on_status_callback = None
 
-    def _check_meeting_running(self):
-        """检查是否有会议软件在运行"""
+    def _list_running_processes(self):
+        """枚举运行中进程名（小写集合）。按平台分派；失败返回 None。
+
+        Windows: tasklist CSV 的可执行文件名（wemeet.exe）。
+        macOS/Linux: ps -ax -o comm= 的全路径（/Applications/WeMeet.app/...）。
+        """
         try:
             import subprocess
+            if sys.platform == "darwin" or sys.platform.startswith("linux"):
+                result = subprocess.run(
+                    ["ps", "-ax", "-o", "comm="],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode != 0:
+                    return None
+                return set(l.strip().lower() for l in result.stdout.splitlines() if l.strip())
             result = subprocess.run(
                 ["tasklist.exe", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=5
@@ -3104,14 +3176,33 @@ class MeetingMonitor:
                 if parts:
                     proc_name = parts[0].strip('"').lower()
                     running_processes.add(proc_name)
-
-            for proc, name in self.MEETING_PROCESSES.items():
-                if proc.lower() in running_processes:
-                    return name
-            return None
+            return running_processes
         except Exception as e:
-            print(f"[MeetingMonitor] check error: {e}")
+            print(f"[MeetingMonitor] list processes error: {e}")
             return None
+
+    def _match_meeting_process(self, running_processes):
+        """纯匹配：从小写进程名集合中识别会议软件，返回显示名或 None。
+
+        macOS/Linux 走关键字子串（comm 是全路径）；Windows 走精确名集合。
+        抽成纯函数便于 CI 用合成进程列表覆盖各平台分支。
+        """
+        if not running_processes:
+            return None
+        if sys.platform == "darwin" or sys.platform.startswith("linux"):
+            for proc_path in running_processes:
+                for kw, name in self.MEETING_PROCESS_KEYWORDS_DARWIN.items():
+                    if kw in proc_path:
+                        return name
+            return None
+        for proc, name in self.MEETING_PROCESSES.items():
+            if proc.lower() in running_processes:
+                return name
+        return None
+
+    def _check_meeting_running(self):
+        """检查是否有会议软件在运行"""
+        return self._match_meeting_process(self._list_running_processes())
 
     def start_monitoring(self, on_start, on_stop, on_status=None):
         """启动监控"""

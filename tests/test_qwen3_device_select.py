@@ -53,6 +53,26 @@ check("强制 xpu（即便探测无 XPU，尊重用户）-> xpu/fp16",
 check("大小写/空白容错",
       choice(True, True, QWEN3_ASR_DEVICE=" CPU ") == ("cpu", "bf16"))
 
+print("\n=== 2b. Apple Silicon MPS（has_mps 参数，默认 False 不影响旧分支）===")
+def choice_mps(has_xpu, bf16_ok, has_mps, **env):
+    return app._qwen3_device_choice(has_xpu, bf16_ok, env=env, has_mps=has_mps)
+
+check("有 MPS 无 XPU -> mps/fp16",
+      choice_mps(False, True, True) == ("mps", "fp16"), choice_mps(False, True, True))
+check("XPU 优先于 MPS",
+      choice_mps(True, True, True) == ("xpu", "fp16"), choice_mps(True, True, True))
+check("has_mps=False 时行为与旧版一致 -> cpu/bf16",
+      choice_mps(False, True, False) == ("cpu", "bf16"), choice_mps(False, True, False))
+check("强制 cpu 覆盖 MPS 自动选择",
+      choice_mps(False, True, True, QWEN3_ASR_DEVICE="cpu") == ("cpu", "bf16"))
+check("强制 mps（即便探测无 MPS，尊重用户）-> mps/fp16",
+      choice_mps(False, True, False, QWEN3_ASR_DEVICE="mps") == ("mps", "fp16"))
+check("dtype=fp32 最高优先：有 MPS 也回退 cpu/fp32",
+      choice_mps(False, True, True, QWEN3_ASR_DTYPE="fp32") == ("cpu", "fp32"))
+check("dtype=fp32 + 强制 mps 仍回退 cpu/fp32（保持既有语义）",
+      choice_mps(False, True, True, QWEN3_ASR_DEVICE="mps", QWEN3_ASR_DTYPE="fp32")
+      == ("cpu", "fp32"))
+
 print("\n=== 3. QWEN3_ASR_DTYPE=fp32 覆盖一切 ===")
 check("有 XPU 且强制 xpu，但 dtype=fp32 -> cpu/fp32",
       choice(True, True, QWEN3_ASR_DEVICE="xpu", QWEN3_ASR_DTYPE="fp32")
@@ -81,24 +101,34 @@ try:
 except Exception:
     torch_ok = False
 if torch_ok:
-    # 用 monkeypatch 掉能力探测，验证 _select_qwen3_device 的 dtype 映射
-    for hx, bo, expect in [(False, True, torch.bfloat16),
-                           (False, False, torch.float32),
-                           (True, True, torch.float16)]:
+    # 用 monkeypatch 掉能力探测，验证 _select_qwen3_device 的 dtype 映射。
+    # 注意 Mac 上 MPS 真实可用：旧分支用例必须把 mps 一并钉死，否则本机跑出 mps/fp16。
+    mps_backend = getattr(torch.backends, "mps", None)
+    orig_mps = getattr(mps_backend, "is_available", None) if mps_backend else None
+    for hx, bo, hm, expect_dev, expect in [
+            (False, True, False, "cpu", torch.bfloat16),
+            (False, False, False, "cpu", torch.float32),
+            (True, True, False, "xpu", torch.float16),
+            (False, True, True, "mps", torch.float16)]:
         app._CPU_BF16_OK = bo
         orig = getattr(torch.xpu, "is_available", None) if hasattr(torch, "xpu") else None
         if hasattr(torch, "xpu"):
             torch.xpu.is_available = lambda hx=hx: hx
+        if mps_backend is not None:
+            mps_backend.is_available = lambda hm=hm: hm
         os.environ.pop("QWEN3_ASR_DEVICE", None)
         os.environ.pop("QWEN3_ASR_DTYPE", None)
         try:
             dev, dtype = app._select_qwen3_device()
             tag = {torch.float16: "fp16", torch.bfloat16: "bf16",
                    torch.float32: "fp32"}[dtype]
-            check(f"映射 {dev}/{tag} 正确", dtype == expect, (dev, dtype))
+            check(f"映射 {dev}/{tag} 正确", dev == expect_dev and dtype == expect,
+                  (dev, dtype))
         finally:
             if orig is not None:
                 torch.xpu.is_available = orig
+            if orig_mps is not None:
+                mps_backend.is_available = orig_mps
     app._CPU_BF16_OK = None
 else:
     print("  (skip: CI 精简环境无 torch —— 真实 dtype 映射由纯函数覆盖)")
@@ -115,6 +145,10 @@ check("transcribe 把 inputs 搬到 device/dtype",
       "inputs.to(self._device, self._dtype)" in src)
 check("XPU 路径有 synchronize（加载与生成各一次）",
       src.count("torch.xpu.synchronize()") >= 2)
+check("MPS 路径有 synchronize（加载与生成各一次）",
+      src.count("torch.mps.synchronize()") >= 2)
+check("MPS fp16 运行期自动降级 fp32 机制存在",
+      "_mps_fp32_downgraded" in src and "force_dtype" in src)
 check("实例保存 _device/_dtype",
       "self._device = device" in src and "self._dtype = dtype" in src)
 check("解码绕开 torchcodec：存在 _load_audio_for_qwen3",
