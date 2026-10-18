@@ -753,6 +753,54 @@ _LEVEL_HOLD = 0.80            # 电平表慢衰减系数（每 150ms）
 _LEVEL_DECAY = 0.20           # 单块峰值随时间衰减底数
 
 
+# ── 音源设备匹配（模块级纯函数，CI 无声卡环境可测）─────────────────────────
+# Windows：声卡「立体声混音」/ WASAPI loopback / Voicemeeter；
+# macOS：BlackHole / Soundflower 虚拟声卡（系统无内建回录设备）。
+_LOOPBACK_KEYWORDS = ['stereo mix', 'what u hear', 'loopback', 'virtual', 'vb-audio',
+                      'voicemeeter', 'stereo input', '立体声混音', '混音',
+                      'blackhole', 'soundflower']
+
+_MIC_BUILTIN_KEYWORDS = ('microphone', 'macbook', 'built-in', 'internal')
+
+
+def _is_loopback_name(name):
+    nl = name.lower()
+    return any(kw in nl for kw in _LOOPBACK_KEYWORDS)
+
+
+def _find_loopback_device(devices):
+    """在设备列表中找系统回录设备（纯函数）。devices 为 list_devices() 的字典列表。"""
+    for dev in devices:
+        if _is_loopback_name(dev['name']):
+            return dev
+    return None
+
+
+def _find_mic_device(devices, default_input_id=None):
+    """找最佳麦克风（纯函数）。
+
+    优先级：中文「麦克风阵列」(>=48k) > 中文「麦克风」 > 英文/内建名
+    （MacBook Air Microphone / Built-in Microphone 等，macOS 英文 locale
+    没有中文设备名，旧逻辑在这里找不到任何麦克风）> 系统默认输入设备兜底
+    （排除回录设备，防止 BlackHole 被当成麦克风）。
+    """
+    for dev in devices:
+        if '麦克风阵列' in dev['name'] and dev['sample_rate'] >= 48000 and dev['channels'] <= 4:
+            return dev
+    for dev in devices:
+        if '麦克风' in dev['name'] and dev['channels'] <= 4:
+            return dev
+    for dev in devices:
+        nl = dev['name'].lower()
+        if any(kw in nl for kw in _MIC_BUILTIN_KEYWORDS) and dev['channels'] <= 4:
+            return dev
+    if default_input_id is not None and default_input_id >= 0:
+        for dev in devices:
+            if dev['id'] == default_input_id and not _is_loopback_name(dev['name']):
+                return dev
+    return None
+
+
 class AudioRecorder:
     """使用 sounddevice 录制音频"""
     def __init__(self):
@@ -854,25 +902,14 @@ class AudioRecorder:
         # ── 查找设备 ──
         devices = self.list_devices()
 
-        # 查找立体声混音设备
-        loopback_dev = None
-        for dev in devices:
-            name_lower = dev['name'].lower()
-            if any(kw in name_lower for kw in ['stereo mix', 'what u hear', 'loopback', 'virtual', 'vb-audio', 'voicemeeter', 'stereo input', '立体声混音', '混音']):
-                loopback_dev = dev
-                break
-
-        # 查找最佳麦克风设备
-        mic_dev = None
-        for dev in devices:
-            if '麦克风阵列' in dev['name'] and dev['sample_rate'] >= 48000 and dev['channels'] <= 4:
-                mic_dev = dev
-                break
-        if not mic_dev:
-            for dev in devices:
-                if '麦克风' in dev['name'] and dev['channels'] <= 4:
-                    mic_dev = dev
-                    break
+        # 回录设备（Windows 立体声混音 / macOS BlackHole 等）与麦克风统一走
+        # 模块级纯函数，普通录音与实时转写共用同一解析结果（#50 教训）。
+        loopback_dev = _find_loopback_device(devices)
+        try:
+            _default_in = int(self.sd.default.device[0])
+        except Exception:
+            _default_in = None
+        mic_dev = _find_mic_device(devices, default_input_id=_default_in)
 
         # ── 根据source选择设备 ──
         if source == "both" and loopback_dev and mic_dev:
