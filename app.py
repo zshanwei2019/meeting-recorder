@@ -3787,6 +3787,10 @@ def create_app():
                 return
             state.is_realtime = True
             engine = state.config.get("engine", "FunASR")
+            # 实时转写音源：以前只认已保存配置，前端下拉改了没保存就被忽略，
+            # 导致选“系统+麦克风”实际仍按纯系统声采集。现在与普通录音一致，
+            # 显式以前端当前选择为准，未传才回退配置。
+            rt_source = msg.get("data", {}).get("source") or state.config.get("audio_source", "mic")
             if engine in ("Whisper", "Qwen3") or engine in ("aliyun", "volc", "tencent"):
                 if engine in ("aliyun", "volc", "tencent"):
                     engine_label = _cloud_asr.CLOUD_ENGINE_LABELS.get(engine, engine) if _cloud_asr else engine
@@ -3801,7 +3805,7 @@ def create_app():
             # 启动实时转写线程
             state._realtime_thread = threading.Thread(
                 target=_realtime_transcribe_task,
-                args=(ws, engine),
+                args=(ws, engine, rt_source),
                 daemon=True
             )
             state._realtime_thread.start()
@@ -4822,14 +4826,19 @@ def _transcribe_file_task(filepath, ws):
                 "realtime_status", {"status": "stopped", "message": ""})
 
 
-def _realtime_transcribe_task(ws, engine="FunASR"):
-    """后台线程：实时录音+转写"""
+def _realtime_transcribe_task(ws, engine="FunASR", source=None):
+    """后台线程：实时录音+转写
+
+    source: 前端当前选择的音源（system/mic/both），由 start_realtime 显式传入；
+    为 None 时回退已保存配置。
+    """
     def push(event_type, data=None):
         state.push_from_thread(event_type, data)
 
     try:
-        # 启动录音
-        source = state.config.get("audio_source", "mic")
+        # 启动录音：以前端当前选择为准，避免下拉改了没保存就被忽略
+        if not source:
+            source = state.config.get("audio_source", "mic")
         recording_filepath = None  # 录音文件路径（用于说话人分离）
 
         if engine == "xfyun":
