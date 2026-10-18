@@ -689,7 +689,7 @@ html, body {
     </div>
 
     <div class="section-label">音源</div>
-    <select class="source-select" id="audioSource">
+    <select class="source-select" id="audioSource" onchange="saveConfig()">
       <option value="both" selected>系统 + 麦克风</option>
       <option value="system">系统音频</option>
       <option value="mic">麦克风</option>
@@ -1399,7 +1399,9 @@ function toggleRealtime() {
       sendAction('stop_recording');
       setTimeout(() => { sendAction('start_realtime'); }, 500);
     } else {
-      sendAction('start_realtime');
+      // 实时转写也显式带上当前音源选择，和普通录音保持一致（不依赖已保存配置）
+      const rtSource = document.getElementById('audioSource').value;
+      sendAction('start_realtime', { source: rtSource });
     }
   }
 }
