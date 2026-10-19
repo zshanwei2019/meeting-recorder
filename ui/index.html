@@ -570,6 +570,8 @@ html, body {
 }
 .pm-retrans-btn:hover { background: rgba(99,102,241,0.28); color: #e0e7ff; }
 .pm-retrans-btn:disabled { opacity: 0.5; cursor: default; }
+/* 实时转写中标签（录音库列表） */
+.pm-live-tag { color: #a855f7; }
 /* 重转进行中：脉冲高亮 + 转圈，状态由服务端 /api/transcribe/status 轮询驱动 */
 .pm-retrans-btn.busy {
   opacity: 1; cursor: default; color: #c7d2fe;
@@ -1952,6 +1954,13 @@ async function pmPollTranscribeStatus() {
     if (!resp.ok) return;
     const st = await resp.json();
     pmApplyTranscribeStatus(st);
+    // 实时会话阶段（录制中→分离中→结束）变化时刷新一次列表，让状态标签跟上；
+    // 轮询中途不刷，避免打断滚动/选中。
+    const liveKey = (st.live_wav_name || '') + '|' + (st.live_stage || '');
+    if (liveKey !== (window._pmLastLiveKey || '')) {
+      window._pmLastLiveKey = liveKey;
+      pmLoadRecordings();
+    }
   } catch (e) { /* 瞬时网络问题忽略，下轮再拉 */ }
 }
 
@@ -2279,18 +2288,29 @@ async function pmLoadRecordings() {
   } else {
     listEl.innerHTML = pmRecordings.map(r => {
       const spk = r.speaker_count > 0 ? ` · ${r.speaker_count}位说话人` : '';
-      const done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
-      const busy = pmActiveTranscribe && pmActiveTranscribe.wav_name === r.wav_name;
+      let done;
+      if (r.live_stage === 'recording') {
+        done = ' · <span class="pm-live-tag">实时转写中</span>';
+      } else if (r.live_stage === 'diarizing') {
+        done = ' · <span style="color:#a855f7;">转写完成·分离中</span>';
+      } else if (r.draft) {
+        done = ' · <span style="color:#f59e0b;">草稿·上次未完成</span>';
+      } else {
+        done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
+      }
+      const durTxt = r.live_stage ? '录制中' : pmFmtDur(r.duration);
+      const selCls = (r.id === pmCurrentId) ? ' active' : '';
+      const busy = (pmActiveTranscribe && pmActiveTranscribe.wav_name === r.wav_name) || !!r.live_stage;
       const busyAttr = busy ? ' disabled' : '';
       const busyCls = busy ? ' busy' : '';
       const busyLabel = busy ? '<span class="pm-spin">⟳</span>&nbsp;重转中' : '重转';
-      return `<div class="pm-item" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
+      return `<div class="pm-item${selCls}" data-id="${pmEscape(r.id)}" onclick="pmSelectRecording('${pmEscape(r.id)}')">
         <div class="pm-item-row">
           <div class="pm-item-main">
-            <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(pmFmtDur(r.duration))}${done}</div>
+            <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(durTxt)}${done}</div>
             <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(engineLabel(r.engine))}${spk}</div>
           </div>
-          <button class="pm-retrans-btn${busyCls}" data-wav="${pmEscape(r.wav_name)}" title="用当前设置（热词/大模型/说话人分离）重新转写"${busyAttr} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${busyLabel}</button>
+          <button class="pm-retrans-btn${busyCls}" data-wav="${pmEscape(r.wav_name)}" title="用当前设置（热词/大模型/说话人分离）重新转写"${busyAttr} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${r.live_stage ? (r.live_stage === 'diarizing' ? '分离中' : '录制中') : busyLabel}</button>
         </div>
       </div>`;
     }).join('');

@@ -235,8 +235,44 @@ def _recording_entry(wav_path):
         "engine": meta.get("engine", ""),
         "speaker_count": meta.get("speaker_count", 0),
         "has_transcript": meta.get("has_transcript", False),
+        "draft": bool(meta.get("draft", False)),
         "text_preview": (meta.get("text", "") or "")[:120],
     }
+
+
+def _save_realtime_draft(wav_path, text, engine="FunASR"):
+    """实时转写进行中把当前文本写到 WAV 同名 .meta.json（崩溃/重启不丢稿）。
+
+    与最终落档的区别：不读 WAV（文件正被写入器占用，且 data chunk 在 close
+    时才回填，期间读到的时长是 0），duration 写 0、标 draft=true；
+    转写/分离正常结束后 save_recording_meta 会整体覆盖掉草稿。
+    原子写（临时文件 + os.replace），避免轮询列表读到半截 JSON。
+    """
+    try:
+        p = Path(wav_path)
+        mp = _meta_path_for_wav(p)
+        try:
+            stt = p.stat()
+            size, created = stt.st_size, stt.st_ctime
+        except OSError:
+            size, created = 0, time.time()
+        meta = {
+            "id": p.stem,
+            "wav_name": p.name,
+            "created": created,
+            "duration": 0,
+            "size": size,
+            "engine": engine,
+            "speaker_count": 0,
+            "text": text or "",
+            "has_transcript": bool((text or "").strip()),
+            "draft": True,
+        }
+        tmp = mp.with_suffix(".meta.json.tmp")
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, mp)
+    except Exception as e:
+        print(f"[recordings] 实时草稿保存失败: {e}")
 
 
 def list_recordings():
@@ -246,6 +282,13 @@ def list_recordings():
         entry = _recording_entry(wav)
         if entry:
             items.append(entry)
+    # 标记当前实时会话：这条录音的 meta 还没最终落档（分离可能要十几分钟），
+    # 不能让它显示成“未转写”——文字其实已经在出/已出。
+    live_name = getattr(state, "live_wav_name", None)
+    if live_name:
+        for entry in items:
+            if entry["wav_name"] == live_name:
+                entry["live_stage"] = getattr(state, "live_stage", "") or "recording"
     items.sort(key=lambda x: x.get("created", 0), reverse=True)
     return items
 
@@ -1262,6 +1305,11 @@ class AudioRecorder:
                 Path(path).unlink()
             except Exception:
                 pass
+            # 正常不会有草稿（循环还没跑起来）；以防万一一并清掉同名 meta
+            try:
+                _meta_path_for_wav(Path(path)).unlink()
+            except Exception:
+                pass
 
     def _take_pending_frames(self):
         """原子取走 _frames 里已积压的块。
@@ -1424,6 +1472,12 @@ class AudioRecorder:
     @property
     def is_recording(self):
         return self._recording
+
+    @property
+    def wav_path(self):
+        """当前边录边写的 WAV 路径（未在录音/已停止时为 None）。"""
+        with self._wav_lock:
+            return str(self._wav_path) if self._wav_path else None
 
 
 # ─── FunASR 实时转写 ───
@@ -1682,6 +1736,9 @@ class FunASRTranscriber:
                 text = item.get("text", "")
                 text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', text).strip()
                 sentence_info = item.get("sentence_info", [])
+                # FunASR 字级时间戳转写在字与字之间带空格，渲染前压掉
+                text = _normalize_funasr_char_spacing(text)
+                _normalize_sentence_info_spacing(sentence_info)
                 # 构建结构化结果
                 structured = {
                     "text": text,
@@ -1725,6 +1782,10 @@ class FunASRTranscriber:
         item = result[0]
         text = re.sub(r'<\s*\|[^>]*?\|\s*>', '', item.get("text", "")).strip()
         raw_sents = item.get("sentence_info", []) or []
+        # FunASR 字级时间戳输出逐字带空格（“我 们”），统一压掉；
+        # 必须在按 timestamp 逐字归说话人之前做，保证中文字与时间戳对齐
+        text = _normalize_funasr_char_spacing(text)
+        _normalize_sentence_info_spacing(raw_sents)
 
         # 3.5) ASR 完成，立即释放 FunASR 模型内存，给 pyannote 腾空间
         if status_callback:
@@ -1861,6 +1922,35 @@ def _speaker_at(ms, tracks_ms, last_id):
     if best is not None:
         return best[1], True
     return last_id, False
+
+
+# 句中需要压掉周边空白的“表意/全角字符”区间：
+# CJK 统一表意及扩展 A/兼容、CJK 标点、全角符号、平假名片假名、谚文音节。
+_CJK_RUN = r'\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef\u3040-\u30ff\uac00-\ud7af'
+_CJK_SPACE_RE = re.compile(rf'\s*([{_CJK_RUN}])\s*')
+
+
+def _normalize_funasr_char_spacing(text):
+    """压掉 FunASR 字级时间戳转写里 token 之间的空格。
+
+    开启 sentence_timestamp/pred_timestamp 时，FunASR 按 token 拼句，中文
+    每个字之间都会带一个空格（“我 们 去 年”），英文/数字则可能本身是
+    多字母 token（“RFID”）。这里只删除 CJK/全角字符两侧的空白，因此
+    “我 们”->“我们”、“通 过 AI 的 形 式”->“通过AI的形式”，而纯拉丁
+    短语内部的空格不受影响。
+    """
+    if not text:
+        return text
+    return _CJK_SPACE_RE.sub(r'\1', text).strip()
+
+
+def _normalize_sentence_info_spacing(sentence_info):
+    """批量规整 sentence_info 里 text/sentence 字段的字间空格（原地改并返回）。"""
+    for s in sentence_info or []:
+        for key in ("text", "sentence"):
+            if s.get(key):
+                s[key] = _normalize_funasr_char_spacing(s[key])
+    return sentence_info
 
 
 def _assign_speakers_to_sentences(sentence_info, diarization_tracks):
@@ -3196,6 +3286,10 @@ class AppState:
         self.transcribing_wav = None    # 正在转写的文件名（basename），无任务时 None
         self.transcribing_start = None  # time.time() 起点，用于已用时长
         self.transcribing_stage = ""    # 人类可读阶段，如“说话人分离中…”
+        # 实时转写会话状态：录音一开始就登记 wav 名，分离跑完才清，
+        # 供录音库列表显示“实时转写中/转写完成·分离中”而不是误导性的“未转写”。
+        self.live_wav_name = None       # 当前实时会话的 wav basename
+        self.live_stage = ""            # recording（录音/实时转写中）| diarizing（分离中）
         # 云端文件转写取消信号：每个云端任务启动时新建一个 threading.Event，
         # /api/transcribe/cancel 置位，透传到 cloud_asr 轮询循环让其尽快停下。
         self.cloud_cancel_event = None
@@ -3596,6 +3690,9 @@ def create_app():
             "wav_name": getattr(state, "transcribing_wav", None) if active else None,
             "stage": (getattr(state, "transcribing_stage", "") or "转写中…") if active else "",
             "elapsed_s": elapsed,
+            # 实时会话（录音/分离中）：让录音库列表显示准确状态而不是“未转写”
+            "live_wav_name": getattr(state, "live_wav_name", None),
+            "live_stage": getattr(state, "live_stage", "") or "",
         })
 
     # 录音/实时转写中的实时电平 + 静默守护状态（前端约每 150ms 轮询）。
@@ -4893,12 +4990,21 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                 state.is_realtime = False
                 return
             push("realtime_status", {"status": "recording", "message": "讯飞实时转写中"})
+            state.live_wav_name = Path(state.recorder.wav_path).name if state.recorder.wav_path else None
+            state.live_stage = "recording"
 
-            # 等待停止
+            # 等待停止（同时候稿，崩溃不丢文字）
+            _xf_draft_last = 0.0
             while state.is_realtime:
                 time.sleep(0.5)
+                now = time.time()
+                if now - _xf_draft_last >= 5:
+                    _xf_draft_last = now
+                    wp = state.recorder.wav_path
+                    if wp:
+                        _save_realtime_draft(wp, state.transcript_text or "", engine="讯飞")
 
-            # 停止录音，保存文件
+            # 停止录音，保存文件（讯飞路径不走离线说话人分离）
             recording_filepath = state.recorder.stop()
 
         else:
@@ -4939,6 +5045,8 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                 state.is_realtime = False
                 return
             push("realtime_status", {"status": "recording", "message": "FunASR实时转写中"})
+            state.live_wav_name = Path(state.recorder.wav_path).name if state.recorder.wav_path else None
+            state.live_stage = "recording"
 
             # 启动录音后再查一次：理论上 stop 会调 recorder.stop，
             # 但若 stop 在 recorder.start 之前刚跑完，这里 is_realtime 已 False，
@@ -4948,6 +5056,8 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                     state.recorder.stop()
                 except Exception:
                     pass
+                state.live_wav_name = None
+                state.live_stage = ""
                 push("realtime_status", {"status": "stopped", "message": "实时转写已停止"})
                 push("status", "就绪")
                 return
@@ -4990,6 +5100,18 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                     push("transcript_partial", {"full_text": display_text})
                 except Exception as e:
                     push("log", {"message": f"标点恢复错误: {str(e)}"})
+
+            # 实时文本随录随存：进程崩溃/被杀掉后，重开应用还能从草稿恢复文字。
+            # 限流 5s 一次，原子写；正常结束时被最终 meta 整体覆盖。
+            _draft_last = [0.0]
+            def _maybe_save_draft():
+                now = time.time()
+                if now - _draft_last[0] < 5:
+                    return
+                _draft_last[0] = now
+                wp = state.recorder.wav_path
+                if wp:
+                    _save_realtime_draft(wp, display_text or raw_text)
 
             # 实时热词：流式模型不吃 hotword 参数，只能在文本层纠
             hot_words = state.config.get("hot_words", "")
@@ -5035,6 +5157,7 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                         if (raw_text and raw_text != last_punc_text
                                 and now - last_text_time >= pause_threshold):
                             _punctuate_inline()
+                    _maybe_save_draft()
                     continue
 
                 try:
@@ -5072,6 +5195,7 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                             and now - last_text_time >= pause_threshold
                             and len(audio_buffer) < chunk_samples):
                         _punctuate_inline()
+                    _maybe_save_draft()
                 except Exception as e:
                     push("log", {"message": f"FunASR处理错误: {str(e)}"})
 
@@ -5130,6 +5254,16 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
 
         # 如果开启了说话人分离，对录音文件做离线说话人分离
         speaker_diary = state.config.get("speaker_diarization", False)
+
+        # 录音已停、最终 meta（含分离结果）还要等十几分钟。先把实时文字立即
+        # 落一次草稿：分离期间列表显示“转写完成·分离中”而不是“未转写”，
+        # 且此刻崩溃文字也已保住。最终 save_recording_meta 会覆盖草稿。
+        if recording_filepath:
+            _save_realtime_draft(
+                recording_filepath, state.transcript_text or "",
+                engine=("讯飞" if engine == "xfyun" else engine))
+        if speaker_diary and recording_filepath and engine == "FunASR":
+            state.live_stage = "diarizing"
         diarization_result = None  # 保留分离结果供落 meta / 声纹自动匹配用
         _auto_labels, _auto_rendered = {}, ""  # 声纹自动匹配结果（随 meta 一起落库）
         if speaker_diary and recording_filepath and engine == "FunASR":
@@ -5205,8 +5339,14 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
         if not was_user_stopped or speaker_diary:
             push("realtime_status", {"status": "stopped"})
         push("status", "就绪")
+        state.live_wav_name = None
+        state.live_stage = ""
 
     except Exception as e:
+        # 崩溃也把实时会话标记清掉，避免列表长期挂“实时转写中”；
+        # 文字已随草稿落盘，重启后可以打开/重转恢复。
+        state.live_wav_name = None
+        state.live_stage = ""
         push("realtime_status", {"status": "error", "message": f"实时转写失败: {str(e)}"})
         push("status", "就绪")
         state.is_realtime = False
