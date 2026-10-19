@@ -860,6 +860,10 @@ html, body {
         录音结束自动转写
       </label>
       <label class="checkbox-row">
+        <input type="checkbox" id="autoRefineTranscribe" checked>
+        实时转写后自动高精度精转（更准，多花几分钟；开说话人分离时无需重复）
+      </label>
+      <label class="checkbox-row">
         <input type="checkbox" id="speakerDiarization" onchange="onSpeakerDiarChange()">
         说话人分离（识别不同说话人）
       </label>
@@ -1296,6 +1300,7 @@ function applyConfig(config) {
     if (pIdx !== undefined) document.getElementById('llmProvider').selectedIndex = pIdx;
   }
   if (config.auto_transcribe === false) document.getElementById('autoTranscribe').checked = false;
+  if (config.auto_refine_transcribe === false) document.getElementById('autoRefineTranscribe').checked = false;
   if (config.speaker_diarization === true) {
     document.getElementById('speakerDiarization').checked = true;
     document.getElementById('spkNumRow').style.display = 'block';
@@ -1355,6 +1360,7 @@ function saveConfig() {
     cos_bucket: document.getElementById('cosBucket').value,
     cos_region: document.getElementById('cosRegion').value,
     auto_transcribe: document.getElementById('autoTranscribe').checked,
+    auto_refine_transcribe: document.getElementById('autoRefineTranscribe').checked,
     speaker_diarization: document.getElementById('speakerDiarization').checked,
     preset_spk_num: parseInt(document.getElementById('presetSpkNum').value) || 0,
     diarization_backend: document.getElementById('diarBackend').value,
@@ -2293,12 +2299,15 @@ async function pmLoadRecordings() {
         done = ' · <span class="pm-live-tag">实时转写中</span>';
       } else if (r.live_stage === 'diarizing') {
         done = ' · <span style="color:#a855f7;">转写完成·分离中</span>';
+      } else if (r.live_stage === 'refining') {
+        done = ' · <span style="color:#a855f7;">实时稿完成·精转中</span>';
       } else if (r.draft) {
         done = ' · <span style="color:#f59e0b;">草稿·上次未完成</span>';
       } else {
         done = r.has_transcript ? '' : ' · <span style="color:#f59e0b;">未转写</span>';
       }
-      const durTxt = r.live_stage ? '录制中' : pmFmtDur(r.duration);
+      // 录制中 WAV 尚未封口、时长读出来是 0；分离/精转阶段文件已关，时长有效
+      const durTxt = r.live_stage === 'recording' ? '录制中' : pmFmtDur(r.duration);
       const selCls = (r.id === pmCurrentId) ? ' active' : '';
       const busy = (pmActiveTranscribe && pmActiveTranscribe.wav_name === r.wav_name) || !!r.live_stage;
       const busyAttr = busy ? ' disabled' : '';
@@ -2310,7 +2319,7 @@ async function pmLoadRecordings() {
             <div class="pm-item-title">${pmEscape(pmFmtTime(r.created))} · ${pmEscape(durTxt)}${done}</div>
             <div class="pm-item-sub">${pmEscape(r.wav_name)} · ${pmEscape(engineLabel(r.engine))}${spk}</div>
           </div>
-          <button class="pm-retrans-btn${busyCls}" data-wav="${pmEscape(r.wav_name)}" title="用当前设置（热词/大模型/说话人分离）重新转写"${busyAttr} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${r.live_stage ? (r.live_stage === 'diarizing' ? '分离中' : '录制中') : busyLabel}</button>
+          <button class="pm-retrans-btn${busyCls}" data-wav="${pmEscape(r.wav_name)}" title="用当前设置（热词/大模型/说话人分离）重新转写"${busyAttr} onclick="event.stopPropagation(); pmRetranscribe('${pmEscape(r.wav_name)}', this)">${r.live_stage ? ({diarizing: '分离中', refining: '精转中'}[r.live_stage] || '录制中') : busyLabel}</button>
         </div>
       </div>`;
     }).join('');

@@ -34,6 +34,10 @@ check("中文逗号/顿号/分号/空格混用",
       parse("西工智财，南通、ERP； 回款"),
       ["西工智财", "南通", "ERP", "回款"])
 check("换行分隔", parse("甲方\n乙方"), ["甲方", "乙方"])
+check("竖线分隔（设置界面提示的分隔符）",
+      parse("AS9100D|RFID|西工智财"), ["AS9100D", "RFID", "西工智财"])
+check("全角竖线分隔", parse("RFID｜APP"), ["RFID", "APP"])
+check("竖线与逗号混用", parse("RFID,AS9100D|修磨"), ["RFID", "AS9100D", "修磨"])
 check("去重且保序", parse("A,A,B"), ["A", "B"])
 check("接受列表输入", parse(["X", " Y ", "X"]), ["X", "Y"])
 
