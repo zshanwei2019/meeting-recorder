@@ -701,6 +701,10 @@ DEFAULT_CONFIG = {
     "cos_region": "ap-beijing",
     "cloud_tmp_prefix": "asr-temp",
     "auto_transcribe": True,
+    # 实时转写结束后，自动用文件大模型（paraformer-large-vad-punc）把
+    # 整段录音精转一遍替换流式稿。开说话人分离时分离链路本身就是大模型
+    # 转写，无需重复；该开关只在纯文本实时转写后生效。
+    "auto_refine_transcribe": True,
     "xfyun_app_id": "",
     "xfyun_api_key": "",
     "xfyun_api_secret": "",
@@ -1502,13 +1506,17 @@ class FunASRTranscriber:
 
     @staticmethod
     def _parse_hot_words(raw):
-        """把配置里的热词字符串解析为列表。支持逗号/顿号/空格/换行分隔。"""
+        """把配置里的热词字符串解析为列表。
+
+        支持 | / 逗号 / 顿号 / 分号 / 空格 / 换行分隔（设置界面提示用 |，
+        旧版解析器漏了 |，会把整串当成一个热词——必须一起修）。
+        """
         if not raw:
             return []
         if isinstance(raw, (list, tuple)):
             items = [str(w).strip() for w in raw]
         else:
-            items = re.split(r"[,，、;；\s\n]+", str(raw))
+            items = re.split(r"[|｜,，、;；\s\n]+", str(raw))
         seen, out = set(), []
         for w in items:
             w = w.strip()
@@ -5311,8 +5319,39 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                 push("log", {"message": f"说话人分离出错: {str(e)}，仅输出纯文本转写结果"})
                 push("transcript_ready", state.transcript_text)
         else:
-            # 未开启说话人分离或无录音文件，发送纯文本结果
+            # 未开启说话人分离：先发送实时流式稿（用户停止后立刻能看到）
             push("transcript_ready", state.transcript_text)
+            # 自动精转：流式模型为低延迟牺牲了准确率（中英混排/术语明显偏弱），
+            # 录音结束后用文件大模型 paraformer-large-vad-punc 整段重跑一遍替换。
+            # 讯飞实时稿不覆盖；分离模式本身走的就是大模型，无需重跑。
+            if (engine == "FunASR" and recording_filepath
+                    and state.config.get("auto_refine_transcribe", True)):
+                state.live_stage = "refining"
+                try:
+                    push("status", "精转中")
+                    push("log", {"message": "实时转写结束，正在用高精度模型精转全文…"})
+
+                    def _refine_status_cb(st, msg):
+                        if st in ("loading", "transcribing"):
+                            push("log", {"message": msg or "精转中…"})
+
+                    refined = state.funasr.transcribe_file(
+                        recording_filepath,
+                        status_callback=_refine_status_cb,
+                        hot_words=state.config.get("hot_words", ""),
+                    )
+                    if refined is not None and refined.strip():
+                        state.set_transcript(refined)
+                        state.sentence_info = []
+                        state.speaker_count = 0
+                        push("transcript_ready", refined)
+                        push("log", {"message": f"精转完成，共{len(refined)}字（已替换实时稿）"})
+                    elif refined is None:
+                        push("log", {"message": "精转失败，保留实时转写稿"})
+                except Exception as e:
+                    push("log", {"message": f"精转出错，保留实时稿：{e}"})
+                finally:
+                    push("status", "就绪")
 
         # 录音库存档：把本次转写文本/引擎/时长写到 WAV 同名 .meta.json
         if recording_filepath:
