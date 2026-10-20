@@ -674,10 +674,57 @@ def _resolve_file_model(name):
     return _FILE_MODEL_ALIASES.get(str(name).strip().lower(), name)
 
 
+# ─── 语种自动路由（自动模式）───
+# 中文（含少量英文术语，如 AS9100D/RFID）走 Paraformer（中文最准、吃热词）；
+# 纯英文 / 大段中英混合走 Qwen3-ASR（52 语种，CPU 上也快）。
+# 阈值按「中文字符占中日韩+拉丁字母的比例」判定，纯函数便于单测。
+LANG_ZH_RATIO = 0.60       # 中文占比 ≥ 此值 → 中文
+LANG_OTHER_RATIO = 0.25    # 中文占比 ≤ 此值 → 英文/其它；之间为中英混合
+ENGINE_AUTO = "auto"
+
+
+def classify_script(text):
+    """按文字（非声学）判定脚本构成，返回 zh/latin/mixed/empty。
+
+    输入通常是用多语种模型对录音开头一小段转出的文本。只统计中日韩汉字与
+    拉丁字母（忽略标点/数字/空白），数字型号（9100D 之类）不参与，避免
+    “AS9100D”这类术语把中文会议误判成英文。
+    """
+    if not text:
+        return "empty"
+    cjk = 0
+    latin = 0
+    for ch in text:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:  # CJK 统一汉字
+            cjk += 1
+        elif ("a" <= ch.lower() <= "z") and ch.isalpha():
+            latin += 1
+    total = cjk + latin
+    if total == 0:
+        return "empty"
+    zh_ratio = cjk / total
+    if zh_ratio >= LANG_ZH_RATIO:
+        return "zh"
+    if zh_ratio <= LANG_OTHER_RATIO:
+        return "latin"
+    return "mixed"
+
+
+def route_engine_for_script(kind):
+    """脚本分类 → 引擎。
+
+    只有明确是拉丁/英文（latin）才走 Qwen3；中文、中英混合（以中文为主、
+    要吃热词）、以及无法判定（开头静音等）一律走 FunASR Paraformer，
+    避免把中文为主的会议误送给英文模型。
+    """
+    return "Qwen3" if kind == "latin" else "FunASR"
+
+
 # ─── 默认配置 ───
 DEFAULT_CONFIG = {
     "audio_source": "both",
-    "engine": "FunASR",
+    "engine": ENGINE_AUTO,
     "funasr_model": FILE_MODEL_PARAFORMER_LARGE,
     "whisper_model": WHISPER_DEFAULT_MODEL,
     "qwen3_model": QWEN3_DEFAULT_MODEL,
@@ -1820,6 +1867,37 @@ class FunASRTranscriber:
             "cluster_embeddings": spk_embeddings,
         }
 
+    def diarize_english_words(self, filepath, words, preset_spk_num=None,
+                              status_callback=None, diarization_config=None):
+        """英文/拉丁语种的说话人分离：ASR 用外部多语种模型的词级时间戳，
+        说话人分段仍复用 pyannote，再按词中点归说话人。
+
+        words: [(start_s, end_s, word), ...]（faster-whisper word_timestamps）。
+        返回与 _transcribe_with_pyannote 同构的 dict（含 cluster_embeddings）。
+        """
+        diarization_config = diarization_config or {}
+        if not words:
+            return {"text": "", "sentence_info": [], "speaker_count": 0}
+        if not hasattr(self, "_pyannote") or self._pyannote is None:
+            self._pyannote = PyannoteDiarizer()
+        token = _resolve_hf_token(diarization_config.get("hf_token"))
+        self._pyannote.load(
+            model_name=diarization_config.get("pyannote_model") or PYANNOTE_DEFAULT_MODEL,
+            hf_token=token, status_callback=status_callback)
+        tracks, cluster_embs = self._pyannote.diarize(
+            filepath, num_speakers=preset_spk_num,
+            status_callback=status_callback)
+        sentence_info, label_map = _assign_speakers_to_words(words, tracks)
+        speaker_count = len(label_map) if label_map else 0
+        spk_embeddings = _pm_map_cluster_embeddings_to_spk(cluster_embs, label_map)
+        text = "\n".join(s.get("text", "") for s in sentence_info).strip()
+        return {
+            "text": text,
+            "sentence_info": sentence_info,
+            "speaker_count": speaker_count,
+            "cluster_embeddings": spk_embeddings,
+        }
+
     def _load_diarization_model(self, status_callback=None, with_spk=True):
         """加载说话人分离pipeline（独立于file_model和stream_model）。
 
@@ -2072,6 +2150,61 @@ def _assign_speakers_to_sentences(sentence_info, diarization_tracks):
             result.append(seg)
 
     return result, label_to_id
+
+
+def _assign_speakers_to_words(words, diarization_tracks):
+    """把 pyannote 说话人段标到 Whisper 词级时间戳上（英文/拉丁语种用）。
+
+    入参:
+      words: [(start_s, end_s, word), ...]（秒，faster-whisper word_timestamps）
+      diarization_tracks: [(start_s, end_s, label), ...]（秒）
+    返回:
+      (sentence_info, label_to_id)，sentence_info 为同一说话人连续词合并成的段：
+      [{text, start(ms), end(ms), spk(int), timestamp:[[s_ms,e_ms],...]}]。
+    """
+    label_to_id = {}
+    next_id = [0]
+
+    def _id_for(label):
+        if label not in label_to_id:
+            label_to_id[label] = next_id[0]
+            next_id[0] += 1
+        return label_to_id[label]
+
+    tracks_ms = [(int(s * 1000), int(e * 1000), _id_for(label))
+                 for s, e, label in diarization_tracks]
+
+    result = []
+    cur = None  # {spk, words:[(w,s,e)], start, end}
+    last_id = 0
+    for ws, we, word in words:
+        mid = int((ws + we) / 2 * 1000)
+        sid, hit = _speaker_at(mid, tracks_ms, last_id)
+        if hit:
+            last_id = sid
+        if cur is None:
+            cur = {"spk": sid, "words": [(word, int(ws*1000), int(we*1000))]}
+        elif sid == cur["spk"]:
+            cur["words"].append((word, int(ws*1000), int(we*1000)))
+        else:
+            result.append(_words_to_sentence(cur))
+            cur = {"spk": sid, "words": [(word, int(ws*1000), int(we*1000))]}
+    if cur:
+        result.append(_words_to_sentence(cur))
+    return result, label_to_id
+
+
+def _words_to_sentence(run):
+    """同一说话人一串词 → 前端需要的 sentence_info 项（空格拼英文词）。"""
+    toks = run["words"]
+    text = " ".join(w for w, _s, _e in toks).strip()
+    return {
+        "text": text,
+        "start": toks[0][1],
+        "end": toks[-1][2],
+        "spk": run["spk"],
+        "timestamp": [[s, e] for _w, s, e in toks],
+    }
 
 
 def _segment_embedding_from_feat(emb_feat, seg_s, seg_e):
@@ -2777,28 +2910,73 @@ class WhisperTranscriber:
                 return False
 
     def transcribe(self, filepath, model_name=None, status_callback=None, hot_words=None):
+        text, _words, _lang = self.transcribe_ex(
+            filepath, model_name=model_name,
+            status_callback=status_callback, hot_words=hot_words,
+            word_timestamps=False)
+        return text
+
+    def transcribe_ex(self, filepath, model_name=None, status_callback=None,
+                      hot_words=None, word_timestamps=False, clip_seconds=None):
+        """转写，返回 (text, words, lang)。
+
+        words: [(start_s, end_s, word), ...]，仅 word_timestamps=True 时非空。
+        lang: faster-whisper 检测到的语种代码（如 'en'/'zh'），无法检测为 None。
+        clip_seconds: 只转写开头 N 秒（语种探测用）。
+        """
         if not self.load(model_name or self._model_name or WHISPER_DEFAULT_MODEL, status_callback):
-            return None
+            return None, [], None
         try:
             if status_callback:
                 status_callback("transcribing", "Whisper 转写中（中英混合自动识别）...")
-            segments, info = self._model.transcribe(
-                filepath,
+            kw = dict(
                 beam_size=5,
                 vad_filter=True,
-                # hot_words 通过 initial_prompt 传入，提升专有名词识别率
                 initial_prompt=hot_words if hot_words else None,
+                word_timestamps=bool(word_timestamps),
             )
-            parts = []
+            if clip_seconds:
+                kw["clip_timestamps"] = "0,{}".format(int(clip_seconds))
+            segments, info = self._model.transcribe(filepath, **kw)
+            parts, words = [], []
             for seg in segments:
-                text = seg.text.strip()
-                if text:
-                    parts.append(text)
-            return "".join(parts) if self._is_chinese_dominant(parts) else " ".join(parts)
+                t = seg.text.strip()
+                if t:
+                    parts.append(t)
+                if word_timestamps:
+                    for w in getattr(seg, "words", None) or []:
+                        ww = (w.word or "").strip()
+                        if ww:
+                            words.append((float(w.start), float(w.end), ww))
+            text = "".join(parts) if self._is_chinese_dominant(parts) else " ".join(parts)
+            lang = getattr(info, "language", None)
+            return text, words, lang
         except Exception as e:
             if status_callback:
                 status_callback("error", f"Whisper 转写失败: {str(e)}")
-            return None
+            return None, [], None
+
+    def detect_language(self, filepath, model_name="small", clip_seconds=60,
+                        status_callback=None):
+        """用多语种模型对开头一段探测语种，返回 (kind, head_text)。
+
+        kind ∈ {zh, latin, mixed, unknown}，结合 whisper 语种标签与脚本比例。
+        探测失败返回 (unknown, "")，由调用方按安全侧（多语种）处理。
+        """
+        try:
+            head, _words, lang = self.transcribe_ex(
+                filepath, model_name=model_name,
+                status_callback=status_callback,
+                word_timestamps=False, clip_seconds=clip_seconds)
+        except Exception:
+            return "unknown", ""
+        if not head:
+            return "unknown", ""
+        kind = classify_script(head)
+        # whisper 明确判为中文时纠正为 zh；明确非中文且脚本判 zh 时交回脚本结果
+        if lang == "zh":
+            kind = "zh"
+        return kind, head
 
     @staticmethod
     def _is_chinese_dominant(parts):
@@ -3905,7 +4083,9 @@ def create_app():
                 await state.push_event_sync(ws, "status", "就绪")
                 state.is_realtime = False
                 return
-            await state.push_event_sync(ws, "realtime_status", {"status": "loading", "message": f"正在启动{engine}..."})
+            # 自动模式实时阶段用 FunASR 流式（低延迟），停后再按语种分流精转/分离
+            _rt_launch_label = "FunASR 流式" if engine == ENGINE_AUTO else engine
+            await state.push_event_sync(ws, "realtime_status", {"status": "loading", "message": f"正在启动{_rt_launch_label}..."})
             await state.push_event_sync(ws, "status", "加载中")
             # 启动实时转写线程
             state._realtime_thread = threading.Thread(
@@ -4708,6 +4888,26 @@ def _transcribe_file_task(filepath, ws):
     """后台线程：转写录音文件"""
     try:
         engine = state.config.get("engine", "FunASR")
+        # 自动模式：用多语种小模型探测开头 60s 的脚本，决定走中文还是英文链路。
+        # 分离由后续 FunASR 分支里的 english 标志切到 Whisper 词级 + pyannote。
+        english = False
+        if engine == ENGINE_AUTO:
+            try:
+                state.push_from_thread("log", {"message": "自动识别语种（先听开头一小段）…"})
+                def _probe_cb(st, msg):
+                    if st in ("loading", "transcribing") and msg:
+                        state.push_from_thread("log", {"message": msg})
+                kind, _head = state.whisper.detect_language(
+                    filepath, model_name="small", clip_seconds=60,
+                    status_callback=_probe_cb)
+                english = (kind == "latin")
+                state.push_from_thread("log", {"message":
+                    ("检测到英文/拉丁语种，改用多语种模型转写" if english
+                     else "检测到中文（或中英混合），使用中文 Paraformer")})
+            except Exception as _e:
+                applog.warning("auto 语种探测失败，回退中文：%s", _e)
+                english = False
+            engine = "FunASR"  # 复用其分离/普通分支，english 标志控制 ASR 选型
         if engine == "Whisper":
             status_cb = _file_asr_status_cb
 
@@ -4766,10 +4966,36 @@ def _transcribe_file_task(filepath, ws):
             if speaker_diary:
                 # 说话人分离模式
                 state.push_from_thread("log", {"message": "正在加载说话人分离模型..."})
-                result = state.funasr.transcribe_file_with_diarization(
-                    filepath, status_callback=status_cb, preset_spk_num=preset_spk,
-                    hot_words=hot_words, diarization_config=state.config
-                )
+                if english:
+                    # 英文/拉丁语种：中文 FunASR 出不了可用时间戳，改用 Whisper
+                    # 词级时间戳出文本，pyannote 仍负责“谁说了哪段”，再按词归说话人。
+                    state.push_from_thread("log", {"message": "英文模式：Whisper 词级转写 + pyannote 说话人分离..."})
+                    _t, _words, _lang = state.whisper.transcribe_ex(
+                        filepath, model_name="medium",
+                        status_callback=status_cb, hot_words=hot_words,
+                        word_timestamps=True)
+                    if _words:
+                        try:
+                            result = state.funasr.diarize_english_words(
+                                filepath, _words, preset_spk_num=preset_spk,
+                                status_callback=status_cb,
+                                diarization_config=state.config)
+                        except Exception as _de:
+                            state.push_from_thread("log", {"message": f"英文说话人分离失败（{_de}），改为纯英文转写"})
+                            _plain = state.qwen3.transcribe(
+                                filepath, model_name=state.config.get("qwen3_model", QWEN3_DEFAULT_MODEL),
+                                status_callback=status_cb, hot_words=hot_words)
+                            result = {"text": _plain or "", "sentence_info": [], "speaker_count": 0}
+                    else:
+                        state.push_from_thread("log", {"message": "Whisper 词级转写失败，回退中文分离链路"})
+                        result = state.funasr.transcribe_file_with_diarization(
+                            filepath, status_callback=status_cb, preset_spk_num=preset_spk,
+                            hot_words=hot_words, diarization_config=state.config)
+                else:
+                    result = state.funasr.transcribe_file_with_diarization(
+                        filepath, status_callback=status_cb, preset_spk_num=preset_spk,
+                        hot_words=hot_words, diarization_config=state.config
+                    )
                 if result is not None:
                     state.set_transcript(result.get("text", ""))
                     state.sentence_info = result.get("sentence_info", [])
@@ -4796,7 +5022,7 @@ def _transcribe_file_task(filepath, ws):
                     save_recording_meta(
                         filepath,
                         text=_meta_text,
-                        engine="FunASR",
+                        engine=("Whisper" if english else "FunASR"),
                         sentence_info=state.sentence_info,
                         speaker_count=state.speaker_count,
                         extra=_extra or None,
@@ -4820,17 +5046,27 @@ def _transcribe_file_task(filepath, ws):
                     state.push_from_thread("log", {"message": "说话人分离转写失败"})
             else:
                 # 普通转写模式
-                state.push_from_thread("log", {"message": "正在加载FunASR模型..."})
-                file_model = state.config.get("funasr_model")
-                result = state.funasr.transcribe_file(
-                    filepath, status_callback=status_cb, hot_words=hot_words,
-                    model_name=file_model,
-                )
+                if english:
+                    # 自动模式探测为纯英文：用 Qwen3-ASR（多语种，CPU 上也快）
+                    qwen3_model = state.config.get("qwen3_model", QWEN3_DEFAULT_MODEL)
+                    state.push_from_thread("log", {"message": f"英文模式：使用 Qwen3-ASR {qwen3_model.split('/')[-1]} 转写..."})
+                    result = state.qwen3.transcribe(
+                        filepath, model_name=qwen3_model,
+                        status_callback=status_cb, hot_words=hot_words)
+                    _eng_label = "Qwen3"
+                else:
+                    state.push_from_thread("log", {"message": "正在加载FunASR模型..."})
+                    file_model = state.config.get("funasr_model")
+                    result = state.funasr.transcribe_file(
+                        filepath, status_callback=status_cb, hot_words=hot_words,
+                        model_name=file_model,
+                    )
+                    _eng_label = "FunASR"
                 if result is not None:
                     state.set_transcript(result)
                     state.sentence_info = []
                     state.speaker_count = 0
-                    save_recording_meta(filepath, text=result, engine="FunASR")
+                    save_recording_meta(filepath, text=result, engine=_eng_label)
                     if not (result or "").strip():
                         _empty_transcript_advisory(filepath)
                     state.push_from_thread("transcript_ready", result)
@@ -5263,6 +5499,26 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
         # 如果开启了说话人分离，对录音文件做离线说话人分离
         speaker_diary = state.config.get("speaker_diarization", False)
 
+        # 自动模式：实时阶段沿用 FunASR 流式（低延迟），停止后再按整段录音的
+        # 语种决定分离/精转用哪个 ASR（中文 Paraformer，纯英文多语种模型）。
+        auto_mode = (engine == ENGINE_AUTO)
+        funasrt = engine in ("FunASR", ENGINE_AUTO)
+        english = False
+        final_engine_label = engine
+        if auto_mode and recording_filepath:
+            try:
+                push("log", {"message": "自动识别语种（先听开头一小段）…"})
+                kind, _head = state.whisper.detect_language(
+                    recording_filepath, model_name="small", clip_seconds=60,
+                    status_callback=lambda st, msg: None)
+                english = (kind == "latin")
+                push("log", {"message":
+                    ("检测为英文会议，改用多语种模型出稿" if english
+                     else "检测为中文/中英混合会议，使用中文 Paraformer")})
+            except Exception as _e:
+                applog.warning("auto 语种探测失败，回退中文：%s", _e)
+                english = False
+
         # 录音已停、最终 meta（含分离结果）还要等十几分钟。先把实时文字立即
         # 落一次草稿：分离期间列表显示“转写完成·分离中”而不是“未转写”，
         # 且此刻崩溃文字也已保住。最终 save_recording_meta 会覆盖草稿。
@@ -5270,11 +5526,11 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
             _save_realtime_draft(
                 recording_filepath, state.transcript_text or "",
                 engine=("讯飞" if engine == "xfyun" else engine))
-        if speaker_diary and recording_filepath and engine == "FunASR":
+        if speaker_diary and recording_filepath and funasrt:
             state.live_stage = "diarizing"
         diarization_result = None  # 保留分离结果供落 meta / 声纹自动匹配用
         _auto_labels, _auto_rendered = {}, ""  # 声纹自动匹配结果（随 meta 一起落库）
-        if speaker_diary and recording_filepath and engine == "FunASR":
+        if speaker_diary and recording_filepath and funasrt:
             push("realtime_status", {"status": "diarizing", "message": "正在做说话人分离..."})
             push("status", "说话人分离中")
             push("log", {"message": "实时转写结束，正在对录音做说话人分离..."})
@@ -5282,10 +5538,36 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                 preset_spk = state.config.get("preset_spk_num", 0) or None
                 def diarization_status_cb(status, msg):
                     push("realtime_status", {"status": status, "message": msg})
-                result = state.funasr.transcribe_file_with_diarization(
-                    recording_filepath, status_callback=diarization_status_cb, preset_spk_num=preset_spk,
-                    diarization_config=state.config
-                )
+                if english:
+                    # 英文：Whisper 词级时间戳 + pyannote 分段（中文模型出不了英文时间戳）
+                    push("log", {"message": "英文模式：Whisper 词级转写 + pyannote 说话人分离..."})
+                    _t, _words, _lang = state.whisper.transcribe_ex(
+                        recording_filepath, model_name="medium",
+                        status_callback=diarization_status_cb,
+                        hot_words=state.config.get("hot_words", ""),
+                        word_timestamps=True)
+                    final_engine_label = "Whisper"
+                    if _words:
+                        try:
+                            result = state.funasr.diarize_english_words(
+                                recording_filepath, _words, preset_spk_num=preset_spk,
+                                status_callback=diarization_status_cb,
+                                diarization_config=state.config)
+                        except Exception as _de:
+                            push("log", {"message": f"英文说话人分离失败（{_de}），改为纯英文转写"})
+                            result = {"text": _t or "", "sentence_info": [], "speaker_count": 0}
+                    else:
+                        push("log", {"message": "Whisper 词级转写失败，回退中文分离链路"})
+                        result = state.funasr.transcribe_file_with_diarization(
+                            recording_filepath, status_callback=diarization_status_cb,
+                            preset_spk_num=preset_spk, diarization_config=state.config)
+                        final_engine_label = "FunASR"
+                else:
+                    result = state.funasr.transcribe_file_with_diarization(
+                        recording_filepath, status_callback=diarization_status_cb, preset_spk_num=preset_spk,
+                        diarization_config=state.config
+                    )
+                    final_engine_label = "FunASR"
                 if result is not None:
                     diarization_result = result
                     state.sentence_info = result.get("sentence_info", [])
@@ -5322,24 +5604,36 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
             # 未开启说话人分离：先发送实时流式稿（用户停止后立刻能看到）
             push("transcript_ready", state.transcript_text)
             # 自动精转：流式模型为低延迟牺牲了准确率（中英混排/术语明显偏弱），
-            # 录音结束后用文件大模型 paraformer-large-vad-punc 整段重跑一遍替换。
+            # 录音结束后用文件大模型整段重跑一遍替换流式稿。
             # 讯飞实时稿不覆盖；分离模式本身走的就是大模型，无需重跑。
-            if (engine == "FunASR" and recording_filepath
+            # 自动模式探测为纯英文时，用 Qwen3-ASR（多语种）而不是中文 Paraformer。
+            if (funasrt and recording_filepath
                     and state.config.get("auto_refine_transcribe", True)):
                 state.live_stage = "refining"
                 try:
                     push("status", "精转中")
-                    push("log", {"message": "实时转写结束，正在用高精度模型精转全文…"})
-
-                    def _refine_status_cb(st, msg):
-                        if st in ("loading", "transcribing"):
-                            push("log", {"message": msg or "精转中…"})
-
-                    refined = state.funasr.transcribe_file(
-                        recording_filepath,
-                        status_callback=_refine_status_cb,
-                        hot_words=state.config.get("hot_words", ""),
-                    )
+                    if english:
+                        push("log", {"message": "英文会议：正在用 Qwen3-ASR 高精度转写全文…"})
+                        _qm = state.config.get("qwen3_model", QWEN3_DEFAULT_MODEL)
+                        def _refine_status_cb(st, msg):
+                            if st in ("loading", "transcribing"):
+                                push("log", {"message": msg or "精转中…"})
+                        refined = state.qwen3.transcribe(
+                            recording_filepath, model_name=_qm,
+                            status_callback=_refine_status_cb,
+                            hot_words=state.config.get("hot_words", ""))
+                        final_engine_label = "Qwen3"
+                    else:
+                        push("log", {"message": "实时转写结束，正在用高精度模型精转全文…"})
+                        def _refine_status_cb(st, msg):
+                            if st in ("loading", "transcribing"):
+                                push("log", {"message": msg or "精转中…"})
+                        refined = state.funasr.transcribe_file(
+                            recording_filepath,
+                            status_callback=_refine_status_cb,
+                            hot_words=state.config.get("hot_words", ""),
+                        )
+                        final_engine_label = "FunASR"
                     if refined is not None and refined.strip():
                         state.set_transcript(refined)
                         state.sentence_info = []
@@ -5365,7 +5659,7 @@ def _realtime_transcribe_task(ws, engine="FunASR", source=None):
                 save_recording_meta(
                     recording_filepath,
                     text=_auto_rendered or state.transcript_text or "",
-                    engine="讯飞" if engine == "xfyun" else engine,
+                    engine=("讯飞" if engine == "xfyun" else final_engine_label),
                     sentence_info=list(state.sentence_info or []) if speaker_diary else None,
                     speaker_count=state.speaker_count,
                     extra=_extra or None,

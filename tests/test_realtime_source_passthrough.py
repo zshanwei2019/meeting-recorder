@@ -83,7 +83,7 @@ def get_ws_endpoint():
     raise AssertionError("/ws 路由未找到")
 
 
-def drive_start_realtime(payload_source, saved_source):
+def drive_start_realtime(payload_source, saved_source, saved_engine="FunASR"):
     """返回捕获到的后台线程 (target, args)。"""
     endpoint = get_ws_endpoint()
     st = app.state
@@ -91,9 +91,11 @@ def drive_start_realtime(payload_source, saved_source):
     orig_rec_thread = st._realtime_thread
     orig_rt = st.is_realtime
     orig_saved = st.config.get("audio_source")
+    orig_engine = st.config.get("engine")
     CapturedThread.instances = []
     CapturedThread.last = None
     st.config["audio_source"] = saved_source
+    st.config["engine"] = saved_engine
     st.is_realtime = False
     st._realtime_thread = None
     data = {"source": payload_source} if payload_source is not None else {}
@@ -112,6 +114,10 @@ def drive_start_realtime(payload_source, saved_source):
             st.config.pop("audio_source", None)
         else:
             st.config["audio_source"] = orig_saved
+        if orig_engine is None:
+            st.config.pop("engine", None)
+        else:
+            st.config["engine"] = orig_engine
     cap = CapturedThread.last
     assert cap is not None, "start_realtime 没有启动后台线程"
     return cap.target, cap.args
@@ -122,6 +128,11 @@ target, args = drive_start_realtime("both", saved_source="system")
 check("后台任务函数是 _realtime_transcribe_task", target is app._realtime_transcribe_task, target)
 check("透传 engine=FunASR", len(args) >= 2 and args[1] == "FunASR", args)
 check("透传 source=both（前端当前选择，不被过期配置覆盖）", len(args) >= 3 and args[2] == "both", args)
+
+# 1b) 自动模式同样能启动实时线程（实时阶段走 FunASR 流式，停后再按语种分流）
+target_a, args_a = drive_start_realtime("both", saved_source="system", saved_engine="auto")
+check("auto 模式启动实时线程并透传 engine=auto",
+      target_a is app._realtime_transcribe_task and args_a[1] == "auto", args_a)
 
 # 2) 前端选 mic → 透传 mic
 target, args = drive_start_realtime("mic", saved_source="system")
