@@ -847,6 +847,54 @@ _LEVEL_HOLD = 0.80            # 电平表慢衰减系数（每 150ms）
 _LEVEL_DECAY = 0.20           # 单块峰值随时间衰减底数
 
 
+# ── 音源设备匹配（模块级纯函数，CI 无声卡环境可测）─────────────────────────
+# Windows：声卡「立体声混音」/ WASAPI loopback / Voicemeeter；
+# macOS：BlackHole / Soundflower 虚拟声卡（系统无内建回录设备）。
+_LOOPBACK_KEYWORDS = ['stereo mix', 'what u hear', 'loopback', 'virtual', 'vb-audio',
+                      'voicemeeter', 'stereo input', '立体声混音', '混音',
+                      'blackhole', 'soundflower']
+
+_MIC_BUILTIN_KEYWORDS = ('microphone', 'macbook', 'built-in', 'internal')
+
+
+def _is_loopback_name(name):
+    nl = name.lower()
+    return any(kw in nl for kw in _LOOPBACK_KEYWORDS)
+
+
+def _find_loopback_device(devices):
+    """在设备列表中找系统回录设备（纯函数）。devices 为 list_devices() 的字典列表。"""
+    for dev in devices:
+        if _is_loopback_name(dev['name']):
+            return dev
+    return None
+
+
+def _find_mic_device(devices, default_input_id=None):
+    """找最佳麦克风（纯函数）。
+
+    优先级：中文「麦克风阵列」(>=48k) > 中文「麦克风」 > 英文/内建名
+    （MacBook Air Microphone / Built-in Microphone 等，macOS 英文 locale
+    没有中文设备名，旧逻辑在这里找不到任何麦克风）> 系统默认输入设备兜底
+    （排除回录设备，防止 BlackHole 被当成麦克风）。
+    """
+    for dev in devices:
+        if '麦克风阵列' in dev['name'] and dev['sample_rate'] >= 48000 and dev['channels'] <= 4:
+            return dev
+    for dev in devices:
+        if '麦克风' in dev['name'] and dev['channels'] <= 4:
+            return dev
+    for dev in devices:
+        nl = dev['name'].lower()
+        if any(kw in nl for kw in _MIC_BUILTIN_KEYWORDS) and dev['channels'] <= 4:
+            return dev
+    if default_input_id is not None and default_input_id >= 0:
+        for dev in devices:
+            if dev['id'] == default_input_id and not _is_loopback_name(dev['name']):
+                return dev
+    return None
+
+
 class AudioRecorder:
     """使用 sounddevice 录制音频"""
     def __init__(self):
@@ -948,25 +996,14 @@ class AudioRecorder:
         # ── 查找设备 ──
         devices = self.list_devices()
 
-        # 查找立体声混音设备
-        loopback_dev = None
-        for dev in devices:
-            name_lower = dev['name'].lower()
-            if any(kw in name_lower for kw in ['stereo mix', 'what u hear', 'loopback', 'virtual', 'vb-audio', 'voicemeeter', 'stereo input', '立体声混音', '混音']):
-                loopback_dev = dev
-                break
-
-        # 查找最佳麦克风设备
-        mic_dev = None
-        for dev in devices:
-            if '麦克风阵列' in dev['name'] and dev['sample_rate'] >= 48000 and dev['channels'] <= 4:
-                mic_dev = dev
-                break
-        if not mic_dev:
-            for dev in devices:
-                if '麦克风' in dev['name'] and dev['channels'] <= 4:
-                    mic_dev = dev
-                    break
+        # 回录设备（Windows 立体声混音 / macOS BlackHole 等）与麦克风统一走
+        # 模块级纯函数，普通录音与实时转写共用同一解析结果（#50 教训）。
+        loopback_dev = _find_loopback_device(devices)
+        try:
+            _default_in = int(self.sd.default.device[0])
+        except Exception:
+            _default_in = None
+        mic_dev = _find_mic_device(devices, default_input_id=_default_in)
 
         # ── 根据source选择设备 ──
         if source == "both" and loopback_dev and mic_dev:
@@ -2989,16 +3026,20 @@ class WhisperTranscriber:
 
 
 # ─── Qwen3-ASR 文件转写（transformers）───
-def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
+def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None, has_mps=False):
     """纯逻辑：根据能力与环境变量决定 (device, dtype_tag)，不依赖 torch。
 
-    返回 device ∈ {xpu, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
+    返回 device ∈ {xpu, mps, cpu}，dtype_tag ∈ {fp16, bf16, fp32}。
     抽成无 torch 依赖的纯函数，便于在不装重依赖的 CI 里覆盖全部分支。
 
-    选择规则（2026-10-17 本机实测）：
+    选择规则（2026-10-17 本机实测；macOS 分支 2026-10-18 加入）：
     - Intel Arc XPU（xpu 版 torch>=2.14.1 可用，2.9.1 会在 LLM 算子回退卡死）：fp16；
+    - Apple Silicon MPS（torch.backends.mps 可用）：fp16；个别算子 fp16 报错时
+      由 Qwen3ASRTranscriber 在运行期自动降级 fp32 重试（load 与 generate 两处）；
     - 否则 CPU bfloat16（比旧 fp32 快约 35 倍），老 CPU 不支持 bf16 时回退 fp32。
-    环境变量：QWEN3_ASR_DEVICE=xpu|cpu 强制设备；QWEN3_ASR_DTYPE=fp32 强制旧路径。
+    设备优先级：xpu > mps > cpu。
+    环境变量：QWEN3_ASR_DEVICE=xpu|mps|cpu 强制设备；QWEN3_ASR_DTYPE=fp32
+    最高优先，强制回退 CPU+fp32（即便同时强制了 xpu/mps，保持既有语义）。
     """
     env = os.environ if env is None else env
     forced = str(env.get("QWEN3_ASR_DEVICE", "")).strip().lower()
@@ -3006,8 +3047,12 @@ def _qwen3_device_choice(has_xpu, cpu_bf16_ok, env=None):
         return "cpu", "fp32"
     if forced == "xpu":
         return "xpu", "fp16"
+    if forced == "mps":
+        return "mps", "fp16"
     if forced != "cpu" and has_xpu:
         return "xpu", "fp16"
+    if forced != "cpu" and has_mps:
+        return "mps", "fp16"
     return "cpu", ("bf16" if cpu_bf16_ok else "fp32")
 
 
@@ -3015,8 +3060,10 @@ def _select_qwen3_device():
     """读取 torch 实际能力并返回 (device, torch_dtype)。仅在加载模型时惰性调用。"""
     import torch
     has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    mps_backend = getattr(torch.backends, "mps", None)
+    has_mps = bool(mps_backend) and mps_backend.is_available()
     cpu_bf16_ok = _cpu_bf16_supported(torch)
-    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok)
+    dev, tag = _qwen3_device_choice(has_xpu, cpu_bf16_ok, has_mps=has_mps)
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
              "fp32": torch.float32}[tag]
     return dev, dtype
@@ -3087,7 +3134,8 @@ class Qwen3ASRTranscriber:
     """Qwen3-ASR 后端，支持 52 语种自动检测，适合中英混合文件转写。
 
     只做文件转写，不做实时流式。transformers 原生加载。
-    设备/精度自动选择：Arc XPU -> fp16；否则 CPU bfloat16（比旧 fp32 快约 35 倍）；
+    设备/精度自动选择：Arc XPU -> fp16；Apple Silicon MPS -> fp16
+    （算子不支持时运行期自动降级 fp32 重试）；否则 CPU bfloat16（比旧 fp32 快约 35 倍）；
     可用 QWEN3_ASR_DEVICE / QWEN3_ASR_DTYPE 环境变量覆盖。详见 _select_qwen3_device。
     """
     def __init__(self):
@@ -3097,8 +3145,9 @@ class Qwen3ASRTranscriber:
         self._device = None
         self._dtype = None
         self._lock = threading.Lock()
+        self._mps_fp32_downgraded = False
 
-    def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None):
+    def load(self, model_name=QWEN3_DEFAULT_MODEL, status_callback=None, force_dtype=None):
         if self._model is not None and self._model_name == model_name:
             return True
         with self._lock:
@@ -3108,17 +3157,36 @@ class Qwen3ASRTranscriber:
                 import torch
                 from transformers import AutoProcessor, AutoModelForMultimodalLM
                 device, dtype = _select_qwen3_device()
+                if force_dtype is not None:
+                    dtype = force_dtype
                 dtype_tag = "fp16" if dtype == torch.float16 else (
                     "bf16" if dtype == torch.bfloat16 else "fp32")
                 if status_callback:
                     status_callback("loading", f"加载 Qwen3-ASR {model_name.split('/')[-1]}（{device}/{dtype_tag}，首次需下载）...")
                 self._processor = AutoProcessor.from_pretrained(model_name)
-                self._model = AutoModelForMultimodalLM.from_pretrained(
-                    model_name,
-                    dtype=dtype,
-                ).to(device).eval()
+                try:
+                    self._model = AutoModelForMultimodalLM.from_pretrained(
+                        model_name,
+                        dtype=dtype,
+                    ).to(device).eval()
+                except Exception:
+                    # MPS 上个别算子可能不支持 fp16：加载期失败自动回退 fp32 再试一次
+                    if device == "mps" and dtype == torch.float16:
+                        if status_callback:
+                            status_callback("loading", "MPS fp16 加载失败，回退 fp32 重试...")
+                        dtype = torch.float32
+                        dtype_tag = "fp32"
+                        self._mps_fp32_downgraded = True
+                        self._model = AutoModelForMultimodalLM.from_pretrained(
+                            model_name,
+                            dtype=dtype,
+                        ).to(device).eval()
+                    else:
+                        raise
                 if device == "xpu":
                     torch.xpu.synchronize()
+                elif device == "mps":
+                    torch.mps.synchronize()
                 self._device = device
                 self._dtype = dtype
                 self._model_name = model_name
@@ -3159,12 +3227,29 @@ class Qwen3ASRTranscriber:
                 output_ids = self._model.generate(**inputs, max_new_tokens=1024)
             if self._device == "xpu":
                 torch.xpu.synchronize()
+            elif self._device == "mps":
+                torch.mps.synchronize()
             generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
             text = self._processor.decode(
                 generated_ids, return_format="transcription_only"
             )[0]
             return text.strip() if text else ""
         except Exception as e:
+            # MPS fp16 在生成期才暴露的算子不支持：自动降级 fp32 重载并重试一次
+            if (self._device == "mps" and self._dtype is not None
+                    and self._dtype == torch.float16
+                    and not self._mps_fp32_downgraded):
+                print(f"[Qwen3-ASR] MPS fp16 生成失败（{e}），降级 fp32 重试", flush=True)
+                self._mps_fp32_downgraded = True
+                self._model = None
+                self._processor = None
+                if status_callback:
+                    status_callback("loading", "MPS fp16 算子不支持，降级 fp32 重试...")
+                if self.load(self._model_name, status_callback,
+                             force_dtype=torch.float32):
+                    return self.transcribe(
+                        filepath, model_name=self._model_name,
+                        status_callback=status_callback, hot_words=hot_words)
             if status_callback:
                 status_callback("error", f"Qwen3-ASR 转写失败: {str(e)}")
             return None
@@ -3351,6 +3436,18 @@ class MeetingMonitor:
         "voovmeeting.exe": "腾讯会议VooV",
     }
 
+    # macOS 进程关键字（小写子串匹配 ps 的 comm 全路径，如
+    # /Applications/WeMeet.app/Contents/MacOS/WeMeet）。放宽为子串而非写死
+    # 可执行名，兼容 .app bundle 与中文目录名。
+    MEETING_PROCESS_KEYWORDS_DARWIN = {
+        "wemeet": "腾讯会议",
+        "voov": "腾讯会议VooV",
+        "dingtalk": "钉钉",
+        "lark": "飞书",
+        "zoom.us": "Zoom",
+        "microsoft teams": "Microsoft Teams",
+    }
+
     def __init__(self):
         self._monitoring = False
         self._thread = None
@@ -3361,10 +3458,22 @@ class MeetingMonitor:
         self._on_stop_callback = None
         self._on_status_callback = None
 
-    def _check_meeting_running(self):
-        """检查是否有会议软件在运行"""
+    def _list_running_processes(self):
+        """枚举运行中进程名（小写集合）。按平台分派；失败返回 None。
+
+        Windows: tasklist CSV 的可执行文件名（wemeet.exe）。
+        macOS/Linux: ps -ax -o comm= 的全路径（/Applications/WeMeet.app/...）。
+        """
         try:
             import subprocess
+            if sys.platform == "darwin" or sys.platform.startswith("linux"):
+                result = subprocess.run(
+                    ["ps", "-ax", "-o", "comm="],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode != 0:
+                    return None
+                return set(l.strip().lower() for l in result.stdout.splitlines() if l.strip())
             result = subprocess.run(
                 ["tasklist.exe", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=5
@@ -3380,14 +3489,33 @@ class MeetingMonitor:
                 if parts:
                     proc_name = parts[0].strip('"').lower()
                     running_processes.add(proc_name)
-
-            for proc, name in self.MEETING_PROCESSES.items():
-                if proc.lower() in running_processes:
-                    return name
-            return None
+            return running_processes
         except Exception as e:
-            print(f"[MeetingMonitor] check error: {e}")
+            print(f"[MeetingMonitor] list processes error: {e}")
             return None
+
+    def _match_meeting_process(self, running_processes):
+        """纯匹配：从小写进程名集合中识别会议软件，返回显示名或 None。
+
+        macOS/Linux 走关键字子串（comm 是全路径）；Windows 走精确名集合。
+        抽成纯函数便于 CI 用合成进程列表覆盖各平台分支。
+        """
+        if not running_processes:
+            return None
+        if sys.platform == "darwin" or sys.platform.startswith("linux"):
+            for proc_path in running_processes:
+                for kw, name in self.MEETING_PROCESS_KEYWORDS_DARWIN.items():
+                    if kw in proc_path:
+                        return name
+            return None
+        for proc, name in self.MEETING_PROCESSES.items():
+            if proc.lower() in running_processes:
+                return name
+        return None
+
+    def _check_meeting_running(self):
+        """检查是否有会议软件在运行"""
+        return self._match_meeting_process(self._list_running_processes())
 
     def start_monitoring(self, on_start, on_stop, on_status=None):
         """启动监控"""
@@ -3607,35 +3735,53 @@ def _transcode_to_wav16k(src: Path, dst: Path) -> None:
 
     PyAV(FFmpeg) 随包发布，不依赖用户机器安装 ffmpeg；转出的 wav 可被
     FunASR / pyannote 路径（soundfile）直接读取。
+
+    注意 src 与 dst 可能是同一路径（上传 .wav 时调用方会原路径"洗一道"）：
+    Windows 因文件锁，dst 以写模式打开会抛错，调用方回退用原文件，侥幸安全；
+    POSIX（macOS/Linux）无强制锁，写打开会静默截断源文件 → 转写出残缺音频。
+    因此同路径时先转到一个临时文件，成功后再原子替换。
     """
     import numpy as np
     import av
 
-    container = av.open(str(src))
+    same_path = os.path.abspath(str(src)) == os.path.abspath(str(dst))
+    work_dst = src.with_name(src.stem + ".transcode-tmp.wav") if same_path else dst
+
     try:
-        in_stream = next((s for s in container.streams if s.type == "audio"), None)
-        if in_stream is None:
-            raise ValueError("文件里没有找到音轨")
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-        out_container = av.open(str(dst), "w")
+        container = av.open(str(src))
         try:
-            out_stream = out_container.add_stream("pcm_s16le", rate=16000)
-            out_stream.layout = "mono"  # mono 已隐含单声道；PyAV 中 channels 只读，不可赋值
-            for packet in container.demux(in_stream):
-                for frame in packet.decode():
-                    resampled = resampler.resample(frame)
-                    for rf in resampled:
-                        for opacket in out_stream.encode(rf):
-                            out_container.mux(opacket)
-            for rf in resampler.resample(None):
-                for opacket in out_stream.encode(rf):
+            in_stream = next((s for s in container.streams if s.type == "audio"), None)
+            if in_stream is None:
+                raise ValueError("文件里没有找到音轨")
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+            out_container = av.open(str(work_dst), "w")
+            try:
+                out_stream = out_container.add_stream("pcm_s16le", rate=16000)
+                out_stream.layout = "mono"  # mono 已隐含单声道；PyAV 中 channels 只读，不可赋值
+                for packet in container.demux(in_stream):
+                    for frame in packet.decode():
+                        resampled = resampler.resample(frame)
+                        for rf in resampled:
+                            for opacket in out_stream.encode(rf):
+                                out_container.mux(opacket)
+                for rf in resampler.resample(None):
+                    for opacket in out_stream.encode(rf):
+                        out_container.mux(opacket)
+                for opacket in out_stream.encode(None):
                     out_container.mux(opacket)
-            for opacket in out_stream.encode(None):
-                out_container.mux(opacket)
+            finally:
+                out_container.close()
         finally:
-            out_container.close()
-    finally:
-        container.close()
+            container.close()
+        if same_path:
+            os.replace(str(work_dst), str(dst))
+    except Exception:
+        if same_path:
+            try:
+                os.unlink(str(work_dst))
+            except OSError:
+                pass
+        raise
 
 
 # ─── FastAPI 后端 ───
@@ -6353,6 +6499,11 @@ def _main_inner(log_error):
     # When running as a sidecar for another app (e.g. Tauri), don't open browser
     if os.environ.get("ASR_SIDECAR", "0") == "1":
         print("Sidecar mode: not opening browser")
+    elif sys.platform == "darwin":
+        # macOS: 用 open 调默认浏览器（cmd/start 是 Windows 专用）
+        subprocess.Popen(["open", url])
+    elif sys.platform.startswith("linux"):
+        subprocess.Popen(["xdg-open", url])
     elif browser_cmd:
         # Open in Edge app mode (no address bar, looks like native app)
         subprocess.Popen([
