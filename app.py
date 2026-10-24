@@ -846,6 +846,21 @@ _LEVEL_WARMUP_S = 5.0         # 开始采集后多少秒仍无声才预警（给
 _LEVEL_HOLD = 0.80            # 电平表慢衰减系数（每 150ms）
 _LEVEL_DECAY = 0.20           # 单块峰值随时间衰减底数
 
+# ── 采集看门狗（僵尸流检测 / 自动重开）──
+# 背景：WASAPI 流可能在默认设备切换（蓝牙连/断、耳机插拔）后变成
+# “僵尸流”——不报错、不再回调，程序一直以为在录，落盘 WAV 停长。
+# 判据有二，任一满足即判定采集中断：
+#   A. 音频块长时间完全不到达（正常 0.3s/块，3s 不到必异常）；
+#   B. 块在到达但持续 8s 峰值低于数字底噪（实测本机安静房间麦阵
+#      底噪峰值 0.17，真实环境远高于 0.001；0.001 以下只可能是
+#      设备被换/流接到空端点，不是“没人说话”）。
+_CAPTURE_STALE_NO_DATA_S = 3.0   # 判据 A：多久没收到任何音频块
+_CAPTURE_STALE_DIGITAL_S = 8.0   # 判据 B：持续数字静音多久
+_CAPTURE_DIGITAL_FLOOR = 0.001   # 峰值低于此视为数字静音（-60dBFS）
+_CAPTURE_WARMUP_S = 10.0         # 开机宽限：期间只判 A，不判 B
+_CAPTURE_MAX_RESTARTS = 2        # 每段录音最多自动重开次数
+_CAPTURE_RESTART_GAP_S = 5.0     # 两次重开尝试之间的最小间隔
+
 
 # ── 音源设备匹配（模块级纯函数，CI 无声卡环境可测）─────────────────────────
 # Windows：声卡「立体声混音」/ WASAPI loopback / Voicemeeter；
@@ -938,6 +953,22 @@ class AudioRecorder:
         self._cap_max_peak = 0.0      # 本次采集以来的全局峰值
         self._cap_voiced = False      # 本次采集是否出现过有效电平块
         self._silence_warned = False  # 本轮静默预警是否已发出
+        # ── 采集看门狗（僵尸流检测 / 自动重开）──
+        self._source = "system"       # 本次音源，看门狗重开时复用
+        self._capture_gen = 0         # 采集代次：teardown 时 +1，旧混音线程据此退出
+        self._cap_sys_rate = 16000    # both 模式系统腿采样率（回调读取）
+        self._cap_mic_rate = 16000    # both 模式麦克风腿采样率
+        self._cap_target_rate = 16000 # both 混音统一采样率
+        self._watchdog_thread = None
+        self._watchdog_stop = None
+        self._restart_lock = threading.Lock()
+        self._restart_count = 0       # 本段录音已自动重开次数
+        self._last_restart_ts = 0.0
+        self._capture_open_ts = None  # 最近一次流打开时间
+        self._last_chunk_ts = None    # 最近一个音频块到达时间（任何电平）
+        self._last_loud_ts = None     # 最近一个高于数字底噪的块到达时间
+        self._capture_fault = ""      # "" | "restarting" | "dead"
+        self._last_restart_reason = ""
 
     def _import_deps(self):
         if self.sd is None:
@@ -993,196 +1024,306 @@ class AudioRecorder:
         self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self._writer_thread.start()
 
-        # ── 查找设备 ──
-        devices = self.list_devices()
+        # ── 打开采集流（both 失败会自动回退麦克风单流）──
+        self._capture_gen += 1
+        self._capture_open_ts = time.time()
+        self._last_chunk_ts = None
+        self._last_loud_ts = None
+        self._restart_count = 0
+        self._last_restart_ts = 0.0
+        self._capture_fault = ""
+        self._last_restart_reason = ""
+        self._source = source
+        try:
+            self._open_capture(source)
+        except Exception:
+            self._recording = False
+            # 录音根本没起来，删掉刚建的空壳 WAV，不留垃圾文件
+            self._discard_wav_writer()
+            raise
 
-        # 回录设备（Windows 立体声混音 / macOS BlackHole 等）与麦克风统一走
-        # 模块级纯函数，普通录音与实时转写共用同一解析结果（#50 教训）。
+        # ── 采集看门狗：僵尸流检测 + 自动重开（不动 WAV/转写链路）──
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="capture-watchdog", daemon=True)
+        self._watchdog_thread.start()
+        return True
+
+    # ── 设备选择 / 采集流开关（start 与看门狗重开共用） ──
+
+    def _pick_devices(self):
+        """返回 (回录设备, 最佳麦克风设备)，找不到为 None。
+
+        委托模块级纯函数（#51 macOS 移植）：回录识别覆盖 Windows 立体声混音 /
+        macOS BlackHole；麦克风支持中文阵列/麦克风、英文内置名，并排除回录设备。
+        普通录音与实时转写共用同一解析结果（#50 教训）。
+        """
+        devices = self.list_devices()
         loopback_dev = _find_loopback_device(devices)
         try:
-            _default_in = int(self.sd.default.device[0])
+            default_in = int(self.sd.default.device[0])
         except Exception:
-            _default_in = None
-        mic_dev = _find_mic_device(devices, default_input_id=_default_in)
+            default_in = None
+        mic_dev = _find_mic_device(devices, default_input_id=default_in)
+        return loopback_dev, mic_dev
 
-        # ── 根据source选择设备 ──
+    def _single_stream_callback(self, indata, frames, time_info, status):
+        if not self._recording or self._paused:
+            return
+        audio_data = indata.copy()
+        self._append_frame(audio_data)
+        pcm = self._resample_to_16k_mono(audio_data)
+        self._enqueue_pcm(pcm)
+        if self._callback:
+            try:
+                self._callback(pcm)
+            except Exception:
+                pass
+
+    def _sys_stream_callback(self, gen, indata, frames, time_info, status):
+        if not self._recording or self._paused or gen != self._capture_gen:
+            return
+        mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
+        rate = self._cap_sys_rate
+        target = self._cap_target_rate
+        if rate != target:
+            mono = self._resample_linear_f32(mono, int(len(mono) * target / rate))
+        with self._lock:
+            buf = self._mix_buffer.setdefault('sys', self.np.array([], dtype=self.np.float32))
+            self._mix_buffer['sys'] = self.np.concatenate([buf, mono])
+
+    def _mic_stream_callback(self, gen, indata, frames, time_info, status):
+        if not self._recording or self._paused or gen != self._capture_gen:
+            return
+        mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
+        rate = self._cap_mic_rate
+        target = self._cap_target_rate
+        if rate != target:
+            mono = self._resample_linear_f32(mono, int(len(mono) * target / rate))
+        with self._lock:
+            buf = self._mix_buffer.setdefault('mic', self.np.array([], dtype=self.np.float32))
+            self._mix_buffer['mic'] = self.np.concatenate([buf, mono])
+
+    def _mix_worker(self, gen):
+        import time as _time
+        while self._recording and gen == self._capture_gen:
+            _time.sleep(0.3)  # 每300ms混一次
+            if self._paused:
+                continue
+            with self._lock:
+                sys_buf = self._mix_buffer.get('sys', self.np.array([], dtype=self.np.float32))
+                mic_buf = self._mix_buffer.get('mic', self.np.array([], dtype=self.np.float32))
+                if len(sys_buf) == 0 and len(mic_buf) == 0:
+                    continue
+                mixed, new_sys, new_mic = self._drain_mix_buffers(sys_buf, mic_buf)
+                self._mix_buffer['sys'] = new_sys
+                self._mix_buffer['mic'] = new_mic
+            if len(mixed) == 0:
+                continue
+            # 保存原始帧（由落盘线程增量写入 WAV，不再攒整场）
+            self._append_frame(mixed.reshape(-1, 1))
+            target = self._cap_target_rate
+            # 重采样到16kHz送队列
+            if target != 16000:
+                mixed_16k = self._resample_linear_f32(mixed, int(len(mixed) * 16000 / target))
+            else:
+                mixed_16k = mixed
+            pcm = self._float_to_pcm16(mixed_16k)
+            self._enqueue_pcm(pcm)
+            if self._callback:
+                try:
+                    self._callback(pcm)
+                except Exception:
+                    pass
+
+    def _close_streams(self):
+        """关闭采集流并停掉旧混音线程。bump 代次让旧回调/混音线程立即失效。"""
+        self._capture_gen += 1
+        for attr in ("_stream", "_stream2"):
+            s = getattr(self, attr, None)
+            if s is not None:
+                try:
+                    s.stop()
+                    s.close()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        th = self._mix_thread
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=2.0)
+            except Exception:
+                pass
+        self._mix_thread = None
+
+    def _open_single_stream(self, device_id, channels, sample_rate):
+        """打开单采集流（mic / system / both 回退），失败抛异常。"""
+        self._actual_sample_rate = sample_rate
+        self._actual_channels = channels
+        self._stream = self.sd.InputStream(
+            device=device_id,
+            channels=channels,
+            samplerate=sample_rate,
+            dtype='float32',
+            blocksize=int(sample_rate * 0.3),
+            callback=self._single_stream_callback,
+        )
+        self._stream.start()
+
+    def _open_capture(self, source):
+        """按音源打开采集流。成功返回 True；彻底打不开抛异常。
+        不碰 WAV 写入器和转写队列——看门狗重开时这两者必须连续。"""
+        self._capture_open_ts = time.time()
+        self._last_chunk_ts = None
+        self._last_loud_ts = None
+        loopback_dev, mic_dev = self._pick_devices()
+
+        # ── both：立体声混音 + 麦克风双流 ──
         if source == "both" and loopback_dev and mic_dev:
-            # 混合模式：同时开立体声混音 + 麦克风
             sys_id = loopback_dev['id']
             sys_ch = min(loopback_dev['channels'], 2)
             sys_rate = int(loopback_dev['sample_rate'])
             mic_id = mic_dev['id']
             mic_ch = min(mic_dev['channels'], 2)
             mic_rate = int(mic_dev['sample_rate'])
-
-            # 统一采样率（取两者中较高的，另一个重采样）
             target_rate = max(sys_rate, mic_rate)
+            gen = self._capture_gen
+            self._cap_sys_rate = sys_rate
+            self._cap_mic_rate = mic_rate
+            self._cap_target_rate = target_rate
             self._actual_sample_rate = target_rate
             self._actual_channels = 1  # 混合后输出单声道
-
-            def sys_callback(indata, frames, time_info, status):
-                if not self._recording or self._paused: return
-                mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
-                # 重采样到target_rate
-                if sys_rate != target_rate:
-                    ratio = target_rate / sys_rate
-                    new_len = int(len(mono) * ratio)
-                    mono = self._resample_linear_f32(mono, new_len)
-                with self._lock:
-                    buf = self._mix_buffer.setdefault('sys', self.np.array([], dtype=self.np.float32))
-                    self._mix_buffer['sys'] = self.np.concatenate([buf, mono])
-
-            def mic_callback(indata, frames, time_info, status):
-                if not self._recording or self._paused: return
-                mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
-                if mic_rate != target_rate:
-                    ratio = target_rate / mic_rate
-                    new_len = int(len(mono) * ratio)
-                    mono = self._resample_linear_f32(mono, new_len)
-                with self._lock:
-                    buf = self._mix_buffer.setdefault('mic', self.np.array([], dtype=self.np.float32))
-                    self._mix_buffer['mic'] = self.np.concatenate([buf, mono])
-
-            # 混音线程：定期从两个buffer取数据叠加
-            def mix_worker():
-                import time as _time
-                while self._recording:
-                    _time.sleep(0.3)  # 每300ms混一次
-                    if self._paused:
-                        continue
-                    with self._lock:
-                        sys_buf = self._mix_buffer.get('sys', self.np.array([], dtype=self.np.float32))
-                        mic_buf = self._mix_buffer.get('mic', self.np.array([], dtype=self.np.float32))
-                        if len(sys_buf) == 0 and len(mic_buf) == 0:
-                            continue
-                        mixed, new_sys, new_mic = self._drain_mix_buffers(sys_buf, mic_buf)
-                        self._mix_buffer['sys'] = new_sys
-                        self._mix_buffer['mic'] = new_mic
-                    if len(mixed) == 0:
-                        continue
-                    # 保存原始帧（由落盘线程增量写入 WAV，不再攒整场）
-                    self._append_frame(mixed.reshape(-1, 1))
-                    # 重采样到16kHz送队列
-                    if target_rate != 16000:
-                        ratio = 16000 / target_rate
-                        new_len = int(len(mixed) * ratio)
-                        mixed_16k = self._resample_linear_f32(mixed, new_len)
-                    else:
-                        mixed_16k = mixed
-                    pcm = self._float_to_pcm16(mixed_16k)
-                    self._enqueue_pcm(pcm)
-                    if self._callback:
-                        try: self._callback(pcm)
-                        except: pass
-
             try:
-                self._stream = self.sd.InputStream(device=sys_id, channels=sys_ch, samplerate=sys_rate, dtype='float32', blocksize=int(sys_rate*0.3), callback=sys_callback)
-                self._stream2 = self.sd.InputStream(device=mic_id, channels=mic_ch, samplerate=mic_rate, dtype='float32', blocksize=int(mic_rate*0.3), callback=mic_callback)
+                self._stream = self.sd.InputStream(
+                    device=sys_id, channels=sys_ch, samplerate=sys_rate,
+                    dtype='float32', blocksize=int(sys_rate * 0.3),
+                    callback=lambda *a: self._sys_stream_callback(gen, *a))
+                self._stream2 = self.sd.InputStream(
+                    device=mic_id, channels=mic_ch, samplerate=mic_rate,
+                    dtype='float32', blocksize=int(mic_rate * 0.3),
+                    callback=lambda *a: self._mic_stream_callback(gen, *a))
                 self._stream.start()
                 self._stream2.start()
-                self._mix_thread = threading.Thread(target=mix_worker, daemon=True)
+                self._mix_buffer = {}
+                self._mix_thread = threading.Thread(
+                    target=self._mix_worker, args=(gen,), daemon=True)
                 self._mix_thread.start()
                 return True
-            except Exception as e:
-                # 混合模式失败，回退到单独麦克风
-                if self._stream:
-                    try: self._stream.stop(); self._stream.close()
-                    except: pass
-                if self._stream2:
-                    try: self._stream2.stop(); self._stream2.close()
-                    except: pass
-                self._stream = None
-                self._stream2 = None
-                # 回退到麦克风模式
-                if mic_dev:
-                    device_id = mic_dev['id']
-                    device_channels = min(mic_dev['channels'], 2)
-                    device_sample_rate = int(mic_dev['sample_rate'])
-                else:
-                    device_id = self.sd.default.device[0]
-                    device_channels = self._channels
-                    device_sample_rate = self._sample_rate
-                self._actual_sample_rate = device_sample_rate
-                self._actual_channels = device_channels
+            except Exception:
+                # 混合模式失败，回退到麦克风单流
+                self._close_streams()
 
-        elif source == "mic":
-            # 纯麦克风模式
-            if mic_dev:
-                device_id = mic_dev['id']
-                device_channels = min(mic_dev['channels'], 2)
-                device_sample_rate = int(mic_dev['sample_rate'])
-            else:
-                device_id = self.sd.default.device[0]
-                device_channels = self._channels
-                device_sample_rate = self._sample_rate
-            self._actual_sample_rate = device_sample_rate
-            self._actual_channels = device_channels
-
+        # ── 单流设备选择（mic / system / both 回退） ──
+        if source == "system" and loopback_dev:
+            device_id = loopback_dev['id']
+            device_channels = min(loopback_dev['channels'], 2)
+            device_sample_rate = int(loopback_dev['sample_rate'])
+        elif mic_dev:
+            # mic 模式、system 但无混音设备、both 混音腿打开失败，都用麦
+            device_id = mic_dev['id']
+            device_channels = min(mic_dev['channels'], 2)
+            device_sample_rate = int(mic_dev['sample_rate'])
         else:
-            # 系统音频模式
-            if loopback_dev:
-                device_id = loopback_dev['id']
-                device_channels = min(loopback_dev['channels'], 2)
-                device_sample_rate = int(loopback_dev['sample_rate'])
-            elif mic_dev:
-                device_id = mic_dev['id']
-                device_channels = min(mic_dev['channels'], 2)
-                device_sample_rate = int(mic_dev['sample_rate'])
-            else:
-                device_id = self.sd.default.device[0]
-                device_channels = self._channels
-                device_sample_rate = self._sample_rate
-            self._actual_sample_rate = device_sample_rate
-            self._actual_channels = device_channels
-
-        # ── 单流模式（mic / system / both回退） ──
-        def audio_callback(indata, frames, time_info, status):
-            if not self._recording or self._paused:
-                return
-            audio_data = indata.copy()
-            self._append_frame(audio_data)
-            pcm = self._resample_to_16k_mono(audio_data)
-            self._enqueue_pcm(pcm)
-            if self._callback:
-                try:
-                    self._callback(pcm)
-                except:
-                    pass
+            device_id = self.sd.default.device[0]
+            device_channels = self._channels
+            device_sample_rate = self._sample_rate
 
         try:
-            self._stream = self.sd.InputStream(
-                device=device_id,
-                channels=device_channels,
-                samplerate=device_sample_rate,
-                dtype='float32',
-                blocksize=int(device_sample_rate * 0.3),
-                callback=audio_callback,
-            )
-            self._stream.start()
+            self._open_single_stream(device_id, device_channels, device_sample_rate)
             return True
-        except Exception as e:
-            # 回退到默认设备
+        except Exception:
+            # 回退到系统默认设备
+            self._close_streams()
+            self._open_single_stream(
+                self.sd.default.device[0], self._channels, self._sample_rate)
+            return True
+
+    # ── 采集看门狗（僵尸流检测 / 自动重开） ──
+
+    @staticmethod
+    def _classify_capture(now, open_ts, last_chunk, last_loud, paused,
+                          warmup=_CAPTURE_WARMUP_S,
+                          no_data=_CAPTURE_STALE_NO_DATA_S,
+                          digital=_CAPTURE_STALE_DIGITAL_S):
+        """纯函数判定，便于单测。返回 None（正常/暂停）或原因字符串。"""
+        if paused or open_ts is None:
+            return None
+        open_age = now - open_ts
+        if last_chunk is None:
+            if open_age > no_data:
+                return "no-data"
+        elif now - last_chunk > no_data:
+            return "no-data"
+        if open_age >= warmup:
+            ref = last_loud if last_loud is not None else open_ts
+            if now - ref > digital:
+                return "digital-silence"
+        return None
+
+    def capture_health(self):
+        """供 /api/capture/level 带出的看门狗状态。"""
+        with self._level_lock:
+            return {
+                "capture_fault": self._capture_fault,
+                "fault_reason": self._last_restart_reason if self._capture_fault else "",
+                "restarts": self._restart_count,
+            }
+
+    def _restart_capture(self, reason, now=None):
+        """重开采集流。冷却期内等待；超过上限标记 dead（只提示不打断录音）。"""
+        if not self._restart_lock.acquire(blocking=False):
+            return
+        try:
+            if not self._recording or self._capture_fault == "dead":
+                return
+            now = now or time.time()
+            if self._restart_count >= _CAPTURE_MAX_RESTARTS:
+                self._capture_fault = "dead"
+                self._last_restart_reason = reason
+                print(f"[recorder] 采集流中断（{reason}），自动重开次数已用尽，"
+                      f"请停止后重新录音", flush=True)
+                return
+            if self._last_restart_ts and now - self._last_restart_ts < _CAPTURE_RESTART_GAP_S:
+                return  # 冷却期，等下一拍再判
+            self._restart_count += 1
+            self._last_restart_ts = now
+            self._capture_fault = "restarting"
+            self._last_restart_reason = reason
+            print(f"[recorder] 检测到采集流中断（{reason}），重开音频流 "
+                  f"（第 {self._restart_count}/{_CAPTURE_MAX_RESTARTS} 次）", flush=True)
             try:
-                device_id = self.sd.default.device[0]
-                device_sample_rate = self._sample_rate
-                device_channels = self._channels
-                self._actual_sample_rate = device_sample_rate
-                self._actual_channels = device_channels
-                self._stream = self.sd.InputStream(
-                    device=device_id,
-                    channels=device_channels,
-                    samplerate=device_sample_rate,
-                    dtype='float32',
-                    blocksize=int(device_sample_rate * 0.3),
-                    callback=audio_callback,
-                )
-                self._stream.start()
-                return True
-            except Exception as e2:
-                self._recording = False
-                # 录音根本没起来，删掉刚建的空壳 WAV，不留垃圾文件
-                self._discard_wav_writer()
-                raise e2
+                self._close_streams()
+                self._open_capture(self._source)
+            except Exception:
+                traceback.print_exc()
+                self._capture_fault = "dead"
+        finally:
+            self._restart_lock.release()
+
+    def _watchdog_tick(self, now=None):
+        if not self._recording or self._paused:
+            return
+        now = now or time.time()
+        with self._level_lock:
+            if self._capture_fault == "dead":
+                return
+            if self._capture_fault == "restarting":
+                # 重开后的验证窗口：给新流一个 warmup 出数据；窗口内不重判，
+                # 过了窗口仍无数据/仍数字静音，则允许再次计数重开。
+                if now - self._last_restart_ts < _CAPTURE_WARMUP_S:
+                    return
+            reason = self._classify_capture(
+                now, self._capture_open_ts,
+                self._last_chunk_ts, self._last_loud_ts, self._paused)
+        if reason:
+            self._restart_capture(reason, now=now)
+
+    def _watchdog_loop(self):
+        while not self._watchdog_stop.wait(1.0):
+            try:
+                self._watchdog_tick()
+            except Exception:
+                traceback.print_exc()
 
     def _float_to_pcm16(self, samples):
         """float32 [-1,1] → 16bit PCM bytes
@@ -1275,7 +1416,18 @@ class AudioRecorder:
             return
         with self._level_lock:
             self._last_chunk_peak = peak
-            self._last_level_ts = time.time()
+            now = time.time()
+            self._last_level_ts = now
+            # 看门狗信号：任何块都刷新“数据到达”；高于数字底噪才刷新“有声”。
+            # 回调本身无异常不代表流活着——僵尸流根本不回调，而接到空端点
+            # 时回调持续送零，两个信号必须分开。
+            self._last_chunk_ts = now
+            if peak >= _CAPTURE_DIGITAL_FLOOR:
+                self._last_loud_ts = now
+                # 看门狗重开后重新收到真实音频 → 恢复，清故障态
+                if self._capture_fault == "restarting":
+                    self._capture_fault = "recovered"
+                    print("[recorder] 音频流已自动恢复", flush=True)
             if peak > self._cap_max_peak:
                 self._cap_max_peak = peak
             # 任一块 RMS 越过“非静默”线即记为有声；阈值故意放得很宽（-50dB），
@@ -1477,6 +1629,11 @@ class AudioRecorder:
     def resume(self):
         """恢复录音。"""
         self._paused = False
+        # 暂停期间回调不产数据，恢复时重置看门狗计时，避免误判断流
+        with self._level_lock:
+            self._capture_open_ts = time.time()
+            self._last_chunk_ts = None
+            self._last_loud_ts = None
 
     def is_paused(self):
         return self._paused
@@ -1496,24 +1653,25 @@ class AudioRecorder:
         # 先置位：混音线程与落盘线程都以它作为退出条件
         self._recording = False
         self._paused = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        if self._stream2:
-            self._stream2.stop()
-            self._stream2.close()
-            self._stream2 = None
-
-        # 必须先 join 混音线程：它也往 _frames 里写，不等它退出就可能在
-        # 关文件之后才产出数据（丢尾巴）。超时取比 0.3s 循环间隔宽裕的值。
-        for th in (self._mix_thread, self._writer_thread):
-            if th is not None and th.is_alive():
-                try:
-                    th.join(timeout=3.0)
-                except Exception:
-                    pass
-        self._mix_thread = None
+        # 先停看门狗，避免收尾期间触发重开
+        if self._watchdog_stop is not None:
+            self._watchdog_stop.set()
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            try:
+                self._watchdog_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        self._watchdog_thread = None
+        self._watchdog_stop = None
+        # 关流 + join 旧混音线程（bump 代次，旧回调立即失效）
+        self._close_streams()
+        # 只等落盘线程（混音线程已在 _close_streams 里 join）
+        th = self._writer_thread
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=3.0)
+            except Exception:
+                pass
         self._writer_thread = None
 
         # 把最后没来得及落盘的尾巴写完
@@ -4044,12 +4202,16 @@ def create_app():
             rec.mark_silence_warned()
         elif sstate == "clear":
             rec.mark_silence_cleared()
+        health = rec.capture_health() if hasattr(rec, "capture_health") else {}
         return JSONResponse({
             "active": True,
             "level": round(level, 4),
             "elapsed_s": float(snap.get("elapsed", 0.0)),
             "silence": sstate,
             "max_peak": float(snap.get("max_peak", 0.0)),
+            "capture_fault": health.get("capture_fault", ""),
+            "fault_reason": health.get("fault_reason", ""),
+            "restarts": int(health.get("restarts", 0)),
         })
 
     @app.get("/api/recordings/{name}/meta")

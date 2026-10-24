@@ -114,6 +114,13 @@ html, body {
   background: #fef2f2; border: 1px solid #fecaca; }
 .silence-warn.visible { display: block; animation: silencePulse 1.4s ease-in-out infinite; }
 @keyframes silencePulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+.capture-fault { display: none; margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  font-size: 11px; line-height: 1.4; }
+.capture-fault.visible { display: block; }
+.capture-fault.restarting { color: #92400e; background: #fffbeb; border: 1px solid #fde68a;
+  animation: silencePulse 1.4s ease-in-out infinite; }
+.capture-fault.dead { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca;
+  animation: silencePulse 1.4s ease-in-out infinite; }
 
 /* Section Label */
 .section-label {
@@ -687,6 +694,7 @@ html, body {
         <div class="silence-warn" id="silenceWarn">
           ⚠ 未检测到声音，请检查音源 / 是否戴了耳机 / 麦克风
         </div>
+        <div class="capture-fault" id="captureFault"></div>
       </div>
     </div>
 
@@ -1672,6 +1680,8 @@ function onRecordingChanged(recording) {
 let capturePollTimer = null;
 let captureMeterActive = false;
 let silenceWarnVisible = false;
+let captureFaultShown = false;   // 防止同一个故障重复 toast
+let captureFaultState = '';      // 上一拍的故障态，用于跳变检测
 
 function fmtClock(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
@@ -1689,10 +1699,15 @@ async function pollCaptureLevel() {
     const meter = document.getElementById('captureMeter');
     const fill = document.getElementById('meterFill');
     const warn = document.getElementById('silenceWarn');
+    const fault = document.getElementById('captureFault');
     if (!d.active) {
       meter.classList.remove('visible');
       warn.classList.remove('visible');
+      fault.classList.remove('visible', 'restarting', 'dead');
+      fault.textContent = '';
       silenceWarnVisible = false;
+      captureFaultShown = false;
+      captureFaultState = '';
       fill.style.width = '0%';
       return;
     }
@@ -1709,6 +1724,35 @@ async function pollCaptureLevel() {
       warn.classList.remove('visible');
     }
     // state==='' 时维持现状：已预警就持续亮着，直到真的检测到声音（clear）
+
+    // ── 采集看门狗：僵尸流自动重开 / 无法恢复提示 ──
+    const cf = d.capture_fault || '';
+    if (cf !== captureFaultState) {
+      if (cf === 'restarting') {
+        fault.className = 'capture-fault visible restarting';
+        fault.textContent = '⚠ 音频流中断，正在自动重开…（第 ' + (d.restarts || 1) + ' 次）';
+        if (captureFaultState !== 'restarting') {
+          showToast('检测到音频流中断，正在自动重开', 'err', 6000);
+          captureFaultShown = true;
+        }
+      } else if (cf === 'dead') {
+        fault.className = 'capture-fault visible dead';
+        fault.textContent = '⚠ 音频流已中断且自动恢复失败，请停止后重新开始录音';
+        if (captureFaultState !== 'dead') {
+          showToast('音频流自动恢复失败，请重新录音', 'err', 12000);
+        }
+      } else if (cf === 'recovered' && captureFaultState === 'restarting') {
+        fault.className = 'capture-fault visible restarting';
+        fault.textContent = '✓ 音频流已自动恢复';
+        showToast('音频流已自动恢复', 'ok', 5000);
+        setTimeout(() => {
+          if (captureFaultState === 'recovered') {
+            fault.classList.remove('visible', 'restarting', 'dead');
+          }
+        }, 4000);
+      }
+      captureFaultState = cf;
+    }
   } catch (e) { /* 轮询偶发失败直接忽略，下一拍再试 */ }
 }
 
@@ -1725,8 +1769,13 @@ function syncCaptureMeter() {
     if (capturePollTimer) { clearInterval(capturePollTimer); capturePollTimer = null; }
     document.getElementById('captureMeter').classList.remove('visible');
     document.getElementById('silenceWarn').classList.remove('visible');
+    const fault = document.getElementById('captureFault');
+    fault.classList.remove('visible', 'restarting', 'dead');
+    fault.textContent = '';
     document.getElementById('meterFill').style.width = '0%';
     silenceWarnVisible = false;
+    captureFaultShown = false;
+    captureFaultState = '';
   }
 }
 
