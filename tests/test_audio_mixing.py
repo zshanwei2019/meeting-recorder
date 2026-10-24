@@ -146,17 +146,21 @@ check("全类只剩 1 处裸转换（即 _float_to_pcm16 内部）", raw, 1)
 check_true("那一处紧跟在 clip 之后",
            "clipped = self.np.clip(samples, -1.0, 1.0)" in src
            and "(clipped * 32767).astype" in src)
-# 三个原调用点：_resample_to_16k_mono / mix_worker / stop
+# 三个原调用点：_resample_to_16k_mono / _mix_worker / 单流回调
 check("_float_to_pcm16 被 3 处调用 + 1 处定义", src.count("_float_to_pcm16"), 4)
 
-mix_src = src[src.index("def mix_worker"):]
-mix_src = mix_src[:mix_src.index("\n            try:")]
+# _mix_worker 现在是类方法（看门狗重开采集流时要复用），按方法边界截取
+_start = src.index("def _mix_worker")
+_end = src.index("\n    def ", _start + 1)
+mix_src = src[_start:_end]
 check_true("mix_worker 不再自行回写缓冲切片",
            "self._mix_buffer['sys'] = sys_buf[mix_len:]" not in mix_src)
 check_true("mix_worker 改为调用 _drain_mix_buffers",
            "_drain_mix_buffers" in mix_src)
 check_true("mix_worker 对空输出提前跳过（避免 append 空帧）",
            "if len(mixed) == 0:" in mix_src)
+check_true("mix_worker 绑定采集代次（看门狗重开后旧线程必须退出）",
+           "gen == self._capture_gen" in mix_src)
 
 
 print()
