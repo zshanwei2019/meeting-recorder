@@ -174,6 +174,12 @@ impl Sidecar {
                 .stderr(Stdio::null())
                 .status();
         }
+        // Unix：向 sidecar 整个进程组发 SIGKILL（负 pid = killpg，组在
+        // spawn_sidecar 里用 process_group(0) 建立，孙进程同在组内）。
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -264,12 +270,20 @@ fn locate_sidecar(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 /// 永久阻塞（表现为模型已加载占数 GB 内存却 0 CPU、无结果、短音频因输出少
 /// 侥幸不触发）。写 NUL 永不阻塞。
 fn spawn_sidecar(exe: &std::path::Path) -> std::io::Result<Child> {
-    Command::new(exe)
-        .env("ASR_SIDECAR", "1")
+    let mut cmd = Command::new(exe);
+    cmd.env("ASR_SIDECAR", "1")
         .current_dir(exe.parent().unwrap_or_else(|| std::path::Path::new(".")))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    // Unix：sidecar 放入独立进程组（pgid = 子进程 pid）。PyInstaller onefile 的
+    // 引导进程→服务孙进程不脱离该组，退出时按组 SIGKILL 即可整树回收，
+    // 与 Windows Job Object 的 KILL_ON_JOB_CLOSE 等价。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
 }
 
 /// 对服务发一个最小 HTTP GET，能连上且返回任意响应即视为就绪。

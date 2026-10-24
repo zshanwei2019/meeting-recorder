@@ -10,6 +10,8 @@ import sys
 import subprocess
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+_IS_DARWIN = sys.platform == 'darwin'
+
 # 打包前自动生成版本信息（固化 git commit/日期），version.py 会 import _build_info，
 # PyInstaller 跟随 import 自动打进 onefile；_version.py 同时作为数据文件兏底。
 try:
@@ -107,15 +109,18 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='asr-server',
+    # macOS：可执行名也固定为 asr-server.exe —— Unix 不看扩展名，这样 Rust 壳
+    # 定位逻辑和 tauri.conf.json 的 resources 映射全平台零改动；UPX 不支持
+    # macOS arm64 必须关掉；icon 仅对 .app bundle 有意义（由 Tauri 侧处理）。
+    name='asr-server.exe' if _IS_DARWIN else 'asr-server',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=not _IS_DARWIN,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,
-    icon='app_icon.ico',
+    icon=None if _IS_DARWIN else 'app_icon.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
